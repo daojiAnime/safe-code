@@ -184,6 +184,7 @@ if ((window.chrome?.webview && location.host === 'safe-code.local') || window.__
     async function runMaintenanceCard(selector,action){const card=$(selector);const caption=card.querySelector('span');const text=caption.textContent;card.disabled=true;caption.textContent='正在连接…';try{await action();}catch(e){showAppMessage(e.message);}finally{card.disabled=false;caption.textContent=text;}}
     $('#desktop-card').onclick=()=>runMaintenanceCard('#desktop-card',async()=>{const res=await native('desktop');if(res?.message)await showAppMessage(res.message,{title:res.title||'远程桌面'});});
     $('#terminal-card').onclick=()=>runMaintenanceCard('#terminal-card',async()=>{const result=await native('terminal');const server=result?.server||result;if(server?.osId)applyServer(server);if(result?.message)await showAppMessage(result.message,{title:result.title||'SSH 终端'});});
+    if($('#terminal-disconnect'))$('#terminal-disconnect').onclick=async()=>{const btn=$('#terminal-disconnect');const prev=btn.textContent;btn.disabled=true;btn.textContent='正在关闭…';try{const res=await native('terminal.disconnect');await showAppMessage(res?.message||'已关闭远程会话。',{title:res?.title||'关闭会话'});}catch(e){showAppMessage(e.message);}finally{btn.disabled=false;btn.textContent=prev;}};
     let advancedOperation=null;let displayedOperation=null;const operationHistory=new Map();
     function appendOperationLog(line){
       if(!advancedOperation)return;advancedOperation.lines.push(line);if(advancedOperation.lines.length>300)advancedOperation.lines.shift();

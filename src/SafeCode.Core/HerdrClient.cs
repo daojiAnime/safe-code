@@ -174,6 +174,43 @@ public static partial class HerdrClient
         return addExit == 0;
     }
 
+    public static async Task<bool> RemoveSavedMachineAsync(
+        string herdrExecutable,
+        string sshAlias,
+        string remoteSession = "safe-code",
+        CancellationToken ct = default)
+    {
+        var (listExit, listStdout, _) = await RunHerdrCliAsync(herdrExecutable, ["machine", "list", "--json"], TimeSpan.FromSeconds(10), ct);
+        if (listExit != 0 || string.IsNullOrWhiteSpace(listStdout))
+            return false;
+
+        List<HerdrSavedMachine> machines;
+        try
+        {
+            machines = JsonSerializer.Deserialize<List<HerdrSavedMachine>>(listStdout, JsonDefaults.Options) ?? [];
+        }
+        catch
+        {
+            return false;
+        }
+
+        var targets = machines.Where(m =>
+            string.Equals(m.Target, sshAlias, StringComparison.Ordinal) &&
+            string.Equals(m.Session, remoteSession, StringComparison.Ordinal)).ToList();
+
+        if (targets.Count == 0)
+            return false;
+
+        bool allOk = true;
+        foreach (var item in targets)
+        {
+            var (rmExit, _, _) = await RunHerdrCliAsync(herdrExecutable, ["machine", "remove", item.Id], TimeSpan.FromSeconds(10), ct);
+            if (rmExit != 0)
+                allOk = false;
+        }
+        return allOk;
+    }
+
     private static async Task<(int ExitCode, string Stdout, string Stderr)> RunHerdrCliAsync(
         string executable,
         IReadOnlyList<string> args,

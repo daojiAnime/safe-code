@@ -685,8 +685,6 @@ internal sealed class SafeCodeWebHost : IDisposable
                     pendingHostTrust = null;
                     cachedTunnelHost = current.Host + ":" + current.Port;
                     vault.SaveEncrypted("login.enc", settings);
-                    if (server.Statuses.GetValueOrDefault("ssh") && server.HerdrReady)
-                        _ = TrySyncHerdrMachineAsync(current, server, lifetime.Token);
                     return new { ready = true, server };
                 }
                 catch (HostTrustRequiredException error)
@@ -796,6 +794,9 @@ internal sealed class SafeCodeWebHost : IDisposable
 
             case "terminal":
                 return await OpenRemoteTerminalAsync(RequireSession(), lifetime.Token);
+
+            case "terminal.disconnect":
+                return await CloseRemoteTerminalAsync(RequireSession(), lifetime.Token);
 
             case "cloud.install":
                 if (deploying) throw new InvalidOperationException("已有任务正在执行，请等待完成。");
@@ -1216,6 +1217,40 @@ internal sealed class SafeCodeWebHost : IDisposable
             server = currentSession.Server,
             title = "持久终端连接就绪",
             message = "工作密钥已配置并验证通过。可在终端执行以下命令进入持久会话：\n\n" + launchCommand
+        };
+    }
+
+    private async Task<object> CloseRemoteTerminalAsync(SshSession currentSession, CancellationToken ct)
+    {
+        string sshAlias = HerdrClient.BuildAlias(currentSession.Host, currentSession.Port);
+        string? localHerdr = HerdrClient.FindLocalExecutable();
+        bool removedLocal = false;
+        if (!string.IsNullOrEmpty(localHerdr))
+        {
+            removedLocal = await HerdrClient.RemoveSavedMachineAsync(localHerdr, sshAlias, "safe-code", ct);
+        }
+
+        string? workspaceUser = currentSession.Server?.Username;
+        if (!string.IsNullOrWhiteSpace(workspaceUser))
+        {
+            try
+            {
+                string prefix = currentSession.Server?.IsRoot == true ? "" : "sudo -n ";
+                string userQuoted = SshSession.Quote(workspaceUser);
+                string stopCmd = prefix + "runuser -u " + userQuoted + " -- sh -lc 'if [ -x \"$HOME/.local/bin/herdr\" ]; then \"$HOME/.local/bin/herdr\" session stop safe-code >/dev/null 2>&1 || true; fi; tmux kill-session -t safe-code >/dev/null 2>&1 || true'";
+                await currentSession.ExecuteTextAsync(stopCmd, ct);
+            }
+            catch
+            {
+                // Ignore if remote session is already stopped.
+            }
+        }
+
+        return new
+        {
+            removedLocal,
+            title = "远程会话已关闭",
+            message = "已从本机 Herdr 侧边栏移除该远程机器，并停止远端 safe-code 持久终端会话。"
         };
     }
 
