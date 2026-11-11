@@ -43,14 +43,39 @@ class Debian13Tests(unittest.TestCase):
                 ran.append(args)
                 if args==['locale','-a']:return subprocess.CompletedProcess(args,0,'C\nC.utf8\nja_JP.utf8\n','')
                 return subprocess.CompletedProcess(args,0,'','')
-            with patch.object(agent,'Path',local_path),patch.object(agent,'STATE',state),patch.object(agent,'account',return_value={'username':'workspace'}),patch.object(agent,'home',return_value=base/'home/workspace'),patch.object(agent,'user_files'),patch.object(agent,'apt'),patch.object(agent,'log'),patch.object(agent,'setup_xsession'),patch.object(agent,'stream',side_effect=lambda a,env=None:streamed.append(a)),patch.object(agent,'run',side_effect=fake_run):
+            with patch.object(agent,'Path',local_path),patch.object(agent,'STATE',state),patch.object(agent,'account',return_value={'username':'workspace'}),patch.object(agent,'home',return_value=base/'home/workspace'),patch.object(agent,'user_files'),patch.object(agent,'apt'),patch.object(agent,'log'),patch.object(agent,'ensure_fish'),patch.object(agent,'setup_xsession'),patch.object(agent,'stream',side_effect=lambda a,env=None:streamed.append(a)),patch.object(agent,'run',side_effect=fake_run):
                 agent.setup_locale({'timezone':'Asia/Tokyo','locale':'ja_JP.UTF-8'})
                 self.assertIn('\nja_JP.UTF-8 UTF-8\n','\n'+(base/'etc/locale.gen').read_text())
                 self.assertEqual(streamed,[['locale-gen']])
                 self.assertEqual(agent.read_system_locale(),'ja_JP.UTF-8')
                 self.assertTrue(agent.locale_generated('ja_JP.UTF-8'))
 
-    def test_setup_ssh_configures_herdr_with_tmux_fallback(self):
+    def test_ensure_fish_sets_login_shell_and_fish_conf(self):
+        written={}
+        ran=[]
+        class FakePwd:
+            pw_shell='/bin/bash'
+            pw_dir='/home/workspace'
+        with tempfile.TemporaryDirectory() as tmp:
+            state=Path(tmp)
+            (state/'localization.json').write_text(json.dumps({'timezone':'Asia/Seoul','locale':'en_US.UTF-8'}))
+            with patch.object(agent,'STATE',state), \
+                 patch.object(agent,'apt'), \
+                 patch.object(agent,'resolve_fish',return_value='/usr/bin/fish'), \
+                 patch.object(agent,'read_config',return_value={'username':'workspace'}), \
+                 patch.object(agent.pwd,'getpwnam',return_value=FakePwd()), \
+                 patch.object(agent,'Path',side_effect=lambda p: state if p is state else (Path(__file__) if str(p)=='/usr/bin/fish' else Path(p))), \
+                 patch.object(agent,'run',side_effect=lambda args,*a,**k:(ran.append(args),subprocess.CompletedProcess(args,0,'',''))[1]), \
+                 patch.object(agent,'user_write',side_effect=lambda rel,content,mode=0o644:written.setdefault(rel,(content,mode))):
+                fish_bin=agent.ensure_fish()
+                self.assertEqual(fish_bin,'/usr/bin/fish')
+                self.assertIn(['usermod','-s','/usr/bin/fish','workspace'],ran)
+                self.assertIn('.config/fish/conf.d/safe-code.fish',written)
+                conf=written['.config/fish/conf.d/safe-code.fish'][0]
+                self.assertIn('set -gx LANG en_US.UTF-8',conf)
+                self.assertIn('fish_add_path -g -p "$HOME/.local/bin" /opt/safe-code/node/bin',conf)
+
+    def test_setup_ssh_configures_herdr_with_fish_and_tmux_fallback(self):
         written={}
         appended=[]
         def fake_user_write(rel,content,mode=0o644):
@@ -59,17 +84,21 @@ class Debian13Tests(unittest.TestCase):
             if op=='append_unique':appended.append((rel,kwargs.get('content')))
         with patch.object(agent,'account',return_value={'username':'workspace'}), \
              patch.object(agent,'home',return_value=Path('/home/workspace')), \
+             patch.object(agent,'ensure_fish',return_value='/usr/bin/fish'), \
              patch.object(agent,'version',return_value='herdr 0.9.5'), \
              patch.object(agent,'user_read',return_value=''), \
              patch.object(agent,'user_write',side_effect=fake_user_write), \
              patch.object(agent,'user_files',side_effect=fake_user_files), \
+             patch.object(agent,'run',return_value=subprocess.CompletedProcess([],0,'','')), \
              patch.object(agent,'log'):
             pub='ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQC7 safe-code-0123456789abcdef'
             agent.setup_ssh({'publicKey':pub})
             self.assertIn('.config/herdr/config.toml',written)
+            self.assertIn('default_shell = "/usr/bin/fish"',written['.config/herdr/config.toml'][0])
             self.assertIn('shell_mode = "login"',written['.config/herdr/config.toml'][0])
             self.assertIn('.local/bin/safe-code-terminal',written)
             script=written['.local/bin/safe-code-terminal'][0]
+            self.assertIn('export SHELL=/usr/bin/fish',script)
             self.assertIn('exec "$HOME/.local/bin/herdr" --session safe-code',script)
             self.assertIn('exec tmux new-session -A -s safe-code',script)
             self.assertTrue(any(r=='.ssh/authorized_keys' for r,_ in appended))

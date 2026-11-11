@@ -226,6 +226,33 @@ def inspect():
       'cloudReady':active('safe-code-cloudcli'),'mountReady':package_installed('davfs2'),
       'ipPolicy':policy,'activeJobs':active_jobs() if os.geteuid()==0 else []}
 
+def resolve_fish():
+    return shutil.which('fish') or '/usr/bin/fish'
+
+def ensure_fish():
+    apt(['fish'])
+    fish_bin=resolve_fish()
+    a=read_config()
+    if not a:return fish_bin
+    entry=pwd.getpwnam(a['username'])
+    if Path(fish_bin).exists() and entry.pw_shell!=fish_bin:
+        run(['usermod','-s',fish_bin,a['username']])
+    locale='en_US.UTF-8'
+    if (STATE/'localization.json').exists():
+        locale=json.loads((STATE/'localization.json').read_text()).get('locale') or locale
+    elif read_system_locale():
+        locale=read_system_locale()
+    fish_conf=(
+        'set -g fish_greeting ""\n'
+        'set -gx LANG '+locale+'\n'
+        'fish_add_path -g -p "$HOME/.local/bin" /opt/safe-code/node/bin\n'
+        'if command -q starship\n'
+        '    starship init fish | source\n'
+        'end\n'
+    )
+    user_write('.config/fish/conf.d/safe-code.fish',fish_conf,0o644)
+    return fish_bin
+
 def setup_account(options):
     existing=read_config()
     user=options.get('username') or (existing['username'] if existing else 'workspace')
@@ -248,19 +275,24 @@ def setup_account(options):
                 run(['chpasswd'],stdin=user+':'+password+'\n')
             run(['hostnamectl','set-hostname',hostname])
             write(STATE/'account.json',json.dumps({'username':user,'password':password or existing['password'],'hostname':hostname}),0o600)
+            ensure_fish()
             log('工作账户设置已应用。');return
     if run(['id',user],False).returncode==0:raise RuntimeError('此用户已存在，拒绝覆盖其密码。请选择新工作用户名。')
     if existing and Path('/etc/systemd/system/safe-code-cloudcli.service').exists():
         run(['systemctl','disable','--now','safe-code-cloudcli'])
         log('旧工作用户的 CloudCLI 已停止；可为新用户重新安装。')
+    apt(['fish'])
+    fish_bin=resolve_fish()
+    login_shell=fish_bin if Path(fish_bin).exists() else '/bin/bash'
     password=password or secrets.token_urlsafe(20)
-    run(['useradd','-m','-s','/bin/bash',user])
+    run(['useradd','-m','-s',login_shell,user])
     run(['chpasswd'],stdin=user+':'+password+'\n')
     write(STATE/'account.json',json.dumps({'username':user,'password':password,'hostname':hostname}),0o600)
     user_write('workspace/.keep','')
+    ensure_fish()
     if package_installed('xfce4-session'):setup_xsession()
     run(['hostnamectl','set-hostname',hostname or 'safe-'+secrets.token_hex(4)])
-    log('工作账户、机器名称与项目目录已创建。')
+    log('工作账户、机器名称与项目目录已创建（默认启用 fish shell）。')
 
 def list_directories(options):
     a=account();entry=pwd.getpwnam(a['username'])
@@ -320,6 +352,7 @@ def setup_locale(options):
     user_files('append_unique','.profile',content='export LANG='+locale,mode=0o644)
     user_files('append_unique','.bashrc',content='export LANG='+locale,mode=0o644)
     user_files('append_unique','.bashrc',content="alias ll='ls -alF'",mode=0o644)
+    ensure_fish()
     if shutil.which('xdg-user-dirs-update'):
         run(['runuser','-u',a['username'],'--','env','-i','HOME='+str(home()),'PATH=/usr/bin:/bin','LANG='+locale,'LC_ALL='+locale,'xdg-user-dirs-update','--force'],False)
     setup_xsession()
@@ -378,6 +411,7 @@ def setup_input(options):
 
 def ensure_herdr():
     a=account();h=home()
+    fish_bin=ensure_fish()
     herdr_bin=h/'.local/bin/herdr'
     ver=version(herdr_bin)
     if not ver:
@@ -393,8 +427,16 @@ def ensure_herdr():
     user_files('append_unique','.profile',content=path_line,mode=0o644)
     user_files('append_unique','.bashrc',content=path_line,mode=0o644)
     if ver:
-        if not user_read('.config/herdr/config.toml'):
-            user_write('.config/herdr/config.toml','onboarding = false\n\n[terminal]\nshell_mode = "login"\nnew_cwd = "~/workspace"\n',0o644)
+        existing_cfg=user_read('.config/herdr/config.toml')
+        if not existing_cfg:
+            user_write('.config/herdr/config.toml','onboarding = false\n\n[terminal]\ndefault_shell = "'+fish_bin+'"\nshell_mode = "login"\nnew_cwd = "~/workspace"\n',0o644)
+        elif 'default_shell' not in existing_cfg:
+            if '[terminal]' in existing_cfg:
+                updated_cfg=existing_cfg.replace('[terminal]','[terminal]\ndefault_shell = "'+fish_bin+'"',1)
+            else:
+                updated_cfg=existing_cfg.rstrip()+'\n\n[terminal]\ndefault_shell = "'+fish_bin+'"\n'
+            user_write('.config/herdr/config.toml',updated_cfg,0o644)
+        run(['runuser','-u',a['username'],'--','env','-i','HOME='+str(h),'PATH='+str(h/'.local/bin')+':/usr/local/bin:/usr/bin:/bin','LANG=C.UTF-8',str(herdr_bin),'--session','safe-code','server','reload-config'],False)
         if (h/'.local/bin/claude').exists():
             run(['runuser','-u',a['username'],'--','env','-i','HOME='+str(h),'PATH='+str(h/'.local/bin')+':/usr/local/bin:/usr/bin:/bin','LANG=C.UTF-8',str(herdr_bin),'integration','install','claude'],False)
         log('Herdr 已就绪：'+ver)
@@ -421,6 +463,7 @@ def setup_ssh(options):
     terminal_script=(
         '#!/bin/sh\n'
         'export PATH="$HOME/.local/bin:/opt/safe-code/node/bin:$PATH"\n'
+        '[ -x /usr/bin/fish ] && export SHELL=/usr/bin/fish\n'
         'cd "$HOME/workspace"\n'
         'if [ -x "$HOME/.local/bin/herdr" ]; then\n'
         '  exec "$HOME/.local/bin/herdr" --session safe-code\n'
