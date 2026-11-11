@@ -58,8 +58,26 @@ public sealed class WindowsClients : IDisposable
     public async Task OpenTerminalAsync(SshSession session, CancellationToken ct)
     {
         if (session.Server?.Statuses.GetValueOrDefault("account") != true) throw new InvalidOperationException("请先部署工作用户。");
-        await session.DeployAsync("ssh", null, ct: ct); await session.VerifyWorkspaceKeyAsync(ct);
+        var updatedServer = await session.DeployAsync("ssh", null, ct: ct); await session.VerifyWorkspaceKeyAsync(ct);
         var account = await session.RequestAsync<AccountInfo>("account_info", null, ct);
+        string sshAlias = HerdrClient.EnsureManagedSshAlias(session, account.Username);
+        string? localHerdr = HerdrClient.FindLocalExecutable();
+        if (!string.IsNullOrEmpty(localHerdr) && updatedServer.HerdrReady)
+        {
+            string preferredLabel = !string.IsNullOrWhiteSpace(updatedServer.Hostname) ? updatedServer.Hostname : session.Host;
+            bool merged = await HerdrClient.EnsureMachineSavedAsync(localHerdr, sshAlias, preferredLabel, "safe-code", ct);
+            var herdrStart = new ProcessStartInfo(localHerdr) { UseShellExecute = true };
+            if (!merged)
+            {
+                herdrStart.ArgumentList.Add("--remote");
+                herdrStart.ArgumentList.Add(sshAlias);
+                herdrStart.ArgumentList.Add("--session");
+                herdrStart.ArgumentList.Add("safe-code");
+            }
+            var herdrProc = Process.Start(herdrStart) ?? throw new IOException("无法启动本机 Herdr 客户端。");
+            terminals.Add(herdrProc);
+            return;
+        }
         string ssh=NativeSshPath();
         string[] args=[..SshOptions(session,account.Username,true),".local/bin/safe-code-terminal"];
         var start=new ProcessStartInfo(ssh){UseShellExecute=true};

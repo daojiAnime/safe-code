@@ -28,6 +28,8 @@ public sealed class ServerInfo
     public string SystemLocale { get; set; } = "";
     public bool IpPolicyHealthy { get; set; }
     public string ClaudeVersion { get; set; } = "";
+    public string HerdrVersion { get; set; } = "";
+    public bool HerdrReady { get; set; }
     public bool DesktopReady { get; set; }
     public bool CloudReady { get; set; }
     public bool MountReady { get; set; }
@@ -43,8 +45,8 @@ public static class DeploymentCatalog
         new("desktop", "安装虚拟桌面", "安装 XFCE 与 xrdp，通过加密隧道访问。"),
         new("chrome", "安装 Chrome", "使用 Google 官方软件源安装浏览器。"),
         new("input", "安装中文输入法", "安装拼音输入法与中文字体。"),
-        new("claude", "安装 Claude Code", "安装官方原生程序、Git 和 tmux。"),
-        new("ssh", "配置 SSH 安全通道", "配置工作用户密钥与持久终端会话。")
+        new("claude", "安装 Claude Code", "安装官方原生程序、Git、Herdr 和 tmux。"),
+        new("ssh", "配置 SSH 安全通道", "配置工作用户密钥与 Herdr 持久终端会话。")
     ];
     public static LocaleSettings? MatchLocale(string country, string? city) => country.ToLowerInvariant() switch
     {

@@ -42,12 +42,14 @@ function showScreen(name) {
   appWindow.classList.toggle('wide',name==='workspace');
 }
 function stopWork(){for(const timer of advancedTimers)clearTimeout(timer);advancedTimers.clear();if(ipQueryController)ipQueryController.abort();clearTimeout(connectionTimer);runToken++;busy=false;}
-function exit(){stopWork();$('#login-form').reset();appWindow.hidden=true;$('#restore-window').hidden=true;$('#ip-policy-dialog').close();$('#localization-dialog').close();$('#mount-dialog').close();$('#maintenance-result').close();$('#result-body').replaceChildren();$('#client-window').close();$('#client-frame').removeAttribute('src');document.title='Safe Code · 已退出';}
-$('#close').onclick=exit;
+function exit(){stopWork();$('#login-form').reset();appWindow.hidden=true;if($('#restore-window'))$('#restore-window').hidden=true;$('#ip-policy-dialog').close();$('#localization-dialog').close();$('#mount-dialog').close();$('#maintenance-result').close();$('#result-body').replaceChildren();$('#client-window').close();$('#client-frame').removeAttribute('src');document.title='Safe Code · 已退出';}
+if($('#close'))$('#close').onclick=exit;
 $('#exit').onclick=exit;
-$('#minimize').onclick=()=>{appWindow.hidden=true;$('#restore-window').hidden=false;};
-$('#restore-window').onclick=()=>{appWindow.hidden=false;$('#restore-window').hidden=true;};
-$('#maximize').onclick=()=>{
+if($('#minimize')&&$('#restore-window')){
+  $('#minimize').onclick=()=>{appWindow.hidden=true;$('#restore-window').hidden=false;};
+  $('#restore-window').onclick=()=>{appWindow.hidden=false;$('#restore-window').hidden=true;};
+}
+if($('#maximize'))$('#maximize').onclick=()=>{
   const expanded=appWindow.classList.toggle('maximized');
   $('#maximize').setAttribute('aria-label',expanded?'还原窗口':'最大化');
   $('#maximize').title=expanded?'还原窗口':'最大化';

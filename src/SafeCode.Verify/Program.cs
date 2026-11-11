@@ -36,7 +36,7 @@ if(args.Length>1&&args[0]=="trust-fixture"){
     string directory=Read("directory");var store=new HostTrustStore(directory);var settings=new ConnectionSettings("127.0.0.1","fixture","fixture-only",c.GetProperty("port").GetInt32());
     store.Accept(new("other.example",22,"SHA256:other"));
     async Task<HostKeyInfo> NeedTrust(){using var s=new SshSession(directory);try{await s.ConnectAsync(settings,_=>false);throw new Exception("unconfirmed key accepted");}catch(HostTrustRequiredException e){return e.Key;}}
-    async Task Approved(){using var s=new SshSession(directory);try{await s.ConnectAsync(settings,_=>throw new Exception("approved key prompted again"));throw new Exception("fixture did not reject Debian");}catch(UnsupportedOsException){}}
+    async Task Approved(){using var s=new SshSession(directory);try{await s.ConnectAsync(settings,_=>throw new Exception("approved key prompted again"));throw new Exception("fixture did not reject non-Debian-13");}catch(UnsupportedOsException){}}
     var first=await NeedTrust();if(first.PreviousFingerprint!=null||first.Fingerprint!=Read("first"))throw new Exception("first key mismatch");store.Accept(first);await Approved();
     File.WriteAllText(Read("mode"),"second");var changed=await NeedTrust();if(changed.PreviousFingerprint!=first.Fingerprint||changed.Fingerprint!=Read("second"))throw new Exception("changed key not identified");
     if(store.Describe(settings.Host,settings.Port,first.Fingerprint).PreviousFingerprint!=first.Fingerprint)throw new Exception("decline changed stored trust");

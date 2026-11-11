@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
-"""Safe Code Ubuntu 部署端。仅由客户端显式请求运行；不包含服务凭据。"""
-import base64,contextlib,fcntl,hashlib,ipaddress,json,os,pwd,re,secrets,shlex,shutil,subprocess,sys,time,tempfile
+"""Safe Code Debian 13 部署端。仅由客户端显式请求运行；不包含服务凭据。"""
+import base64,contextlib,fcntl,hashlib,ipaddress,json,os,pwd,re,secrets,shlex,shutil,socket,subprocess,sys,time,tempfile,urllib.request
 from pathlib import Path
+for _sbin in ['/usr/local/sbin','/usr/local/bin','/usr/sbin','/usr/bin','/sbin','/bin']:
+    if _sbin not in os.environ.get('PATH','').split(':'):
+        os.environ['PATH']=(os.environ.get('PATH','')+':'+_sbin).lstrip(':')
 STATE=Path('/var/lib/safe-code')
 REDACTIONS=[]
 JOB_DIR=None
@@ -14,10 +17,16 @@ def os_info():
             k,v=line.split('=',1);data[k]=v.strip('"')
     return data
 
-def require_ubuntu():
+def is_debian_13(info):
+    if info.get('ID')!='debian':return False
+    ver=info.get('VERSION_ID','').strip()
+    if ver=='13' or ver.startswith('13.'):return True
+    return not ver and info.get('VERSION_CODENAME','').strip()=='trixie'
+
+def require_debian_13():
     info=os_info()
-    if info.get('ID')!='ubuntu':
-        raise RuntimeError('无法安装环境：仅支持 Ubuntu，当前系统为 '+info.get('PRETTY_NAME','未知系统'))
+    if not is_debian_13(info):
+        raise RuntimeError('无法安装环境：仅支持 Debian 13，当前系统为 '+info.get('PRETTY_NAME','未知系统'))
     return info
 
 def result(value):
@@ -157,6 +166,20 @@ def version(path):
         return line if code==0 else ''
     finally:process.stdout.close()
 
+def read_system_locale():
+    for path in [Path('/etc/locale.conf'),Path('/etc/default/locale')]:
+        if path.exists():
+            match=re.search(r'(?m)^LANG="?([^\s"]+)',path.read_text())
+            if match:return match[1]
+    return ''
+
+def locale_generated(locale):
+    if not locale:return False
+    norm=lambda s:re.sub(r'[^a-z0-9]','',s.lower())
+    target=norm(locale)
+    out=run(['locale','-a'],False).stdout
+    return any(norm(line.strip())==target for line in out.splitlines())
+
 def inspect():
     info=os_info();a=read_config() if os.geteuid()==0 else None
     account_ok=bool(a and run(['id',a['username']],False).returncode==0)
@@ -164,11 +187,12 @@ def inspect():
     xrdp=Path('/etc/xrdp/xrdp.ini')
     loopback=xrdp.exists() and 'port=tcp://127.0.0.1:3389' in xrdp.read_text()
     locale_state=STATE/'localization.json'
+    system_locale=read_system_locale()
     localized=False
     if locale_state.exists():
         desired=json.loads(locale_state.read_text())
         timezone=run(['timedatectl','show','-p','Timezone','--value'],False).stdout.strip()
-        localized=timezone==desired.get('timezone') and Path('/etc/default/locale').exists() and desired.get('locale','') in Path('/etc/default/locale').read_text() and all(package_installed(p) for p in locale_packages(desired.get('locale','')))
+        localized=timezone==desired.get('timezone') and system_locale==desired.get('locale','') and locale_generated(desired.get('locale','')) and all(package_installed(p) for p in locale_packages(desired.get('locale','')))
     pub=user_read('.ssh/authorized_keys') if account_ok else ''
     statuses={
       'account':account_ok and bool(a.get('hostname')) and a['hostname']==os.uname().nodename,
@@ -190,14 +214,15 @@ def inspect():
     if policy and shutil.which('nft'):
         import network
         healthy=network.healthy(policy)
-    language=Path('/etc/default/locale').read_text() if Path('/etc/default/locale').exists() else ''
-    match=re.search(r'(?m)^LANG="?([^\s"]+)',language)
-    return {'osId':info.get('ID',''),'osName':info.get('PRETTY_NAME',''),'osVersion':info.get('VERSION_ID',''),
+    os_version=info.get('VERSION_ID','').strip() or ('13' if info.get('VERSION_CODENAME','').strip()=='trixie' else '')
+    return {'osId':info.get('ID',''),'osName':info.get('PRETTY_NAME',''),'osVersion':os_version,
       'architecture':os.uname().machine,'memoryBytes':mem,'diskFreeBytes':disk.free,'cpuCount':os.cpu_count(),
       'hostname':os.uname().nodename, 'homeDirectory':str(h), 'isRoot':os.geteuid()==0,'username':a['username'] if account_ok else '', 'statuses':statuses,
       'assignedIps':addresses,'timezone':run(['timedatectl','show','-p','Timezone','--value'],False).stdout.strip(),
-      'systemLocale':match[1] if match else '', 'ipPolicyHealthy':healthy,
-      'claudeVersion':version(h/'.local/bin/claude'),'desktopReady':statuses['desktop'],
+      'systemLocale':system_locale, 'ipPolicyHealthy':healthy,
+      'claudeVersion':version(h/'.local/bin/claude'),
+      'herdrVersion':version(h/'.local/bin/herdr'),'herdrReady':bool(version(h/'.local/bin/herdr')),
+      'desktopReady':statuses['desktop'],
       'cloudReady':active('safe-code-cloudcli'),'mountReady':package_installed('davfs2'),
       'ipPolicy':policy,'activeJobs':active_jobs() if os.geteuid()==0 else []}
 
@@ -267,19 +292,28 @@ print(json.dumps({'path':str(p),'parent':str(p.parent),'directories':sorted(item
 def locale_packages(locale):
     language=locale.split('_',1)[0]
     if not re.fullmatch('[a-z]{2}',language):raise RuntimeError('系统语言无效。')
-    if language=='zh':language='zh-hant' if locale.startswith(('zh_TW','zh_HK','zh_MO')) else 'zh-hans'
-    return ['language-pack-'+language,'language-pack-gnome-'+language]
+    return ['locales','tzdata']
 
 def setup_locale(options):
     account()
     timezone=options.get('timezone','');locale=options.get('locale','')
     if not timezone or '..' in timezone or not (Path('/usr/share/zoneinfo')/timezone).is_file():raise RuntimeError('请选择有效的 IANA 时区。')
     if not re.fullmatch('[a-z]{2}_[A-Z]{2}\\.UTF-8',locale):raise RuntimeError('请选择有效的 UTF-8 系统语言。')
-    apt(['locales','tzdata']+locale_packages(locale))
+    apt(locale_packages(locale))
     supported=Path('/usr/share/i18n/SUPPORTED').read_text()
-    if locale+' UTF-8' not in supported:raise RuntimeError('Ubuntu 不支持此 Locale。')
+    entry=locale+' UTF-8'
+    if entry not in supported:raise RuntimeError('Debian 13 不支持此 Locale。')
+    gen_path=Path('/etc/locale.gen')
+    gen_text=gen_path.read_text() if gen_path.exists() else ''
+    if not re.search(r'(?m)^[ \t]*'+re.escape(entry)+r'[ \t]*$',gen_text):
+        updated,count=re.subn(r'(?m)^#[ \t]*'+re.escape(entry)+r'[ \t]*$',entry,gen_text,count=1)
+        if count==0:updated=gen_text.rstrip()+('\n' if gen_text.strip() else '')+entry+'\n'
+        elif not updated.endswith('\n'):updated+='\n'
+        write(gen_path,updated)
     log('设置时区：'+timezone);run(['timedatectl','set-timezone',timezone])
-    log('生成语言环境：'+locale);stream(['locale-gen',locale]);run(['update-locale','LANG='+locale])
+    log('生成语言环境：'+locale);stream(['locale-gen']);run(['update-locale','LANG='+locale])
+    if Path('/etc/default/locale').exists() and not Path('/etc/default/locale').is_symlink():
+        run(['update-locale','--locale-file=/etc/default/locale','LANG='+locale],False)
     write(STATE/'localization.json',json.dumps({'timezone':timezone,'locale':locale}),0o600)
     setup_xsession()
 
@@ -291,7 +325,7 @@ def setup_xsession():
     user_write('.xsessionrc','export LANG='+locale+'\nexport XMODIFIERS="@im=fcitx"\nexport GTK_IM_MODULE=fcitx\nexport QT_IM_MODULE=fcitx\n')
 
 def setup_desktop(options):
-    account();apt(['xfce4-session','xfwm4','xfce4-panel','xfdesktop4','xfce4-settings','xfce4-terminal','thunar','dbus-x11','xrdp','xorgxrdp','xauth','x11-utils','x11-xserver-utils','xinput','xdg-user-dirs','fonts-noto-cjk'])
+    account();apt(['xfce4-session','xfwm4','xfce4-panel','xfdesktop4','xfce4-settings','xfce4-terminal','thunar','dbus-x11','libpam-systemd','ssl-cert','xrdp','xorgxrdp','xauth','x11-utils','x11-xserver-utils','xinput','xdg-user-dirs','fonts-noto-cjk'])
     config=Path('/etc/xrdp/xrdp.ini');text=config.read_text()
     new,count=re.subn(r'(?m)^port=(?:3389|tcp://[^\n]+:3389)\s*$', 'port=tcp://127.0.0.1:3389',text,count=1)
     if count!=1:raise RuntimeError('无法安全识别 xrdp 监听设置，未修改配置。')
@@ -304,13 +338,13 @@ def setup_desktop(options):
     write(config,text)
     setup_xsession();run(['usermod','-aG','ssl-cert','xrdp'])
     user_write('.config/xfce4/xfconf/xfce-perchannel-xml/xfwm4.xml','<?xml version="1.0"?><channel name="xfwm4" version="1.0"><property name="general" type="empty"><property name="use_compositing" type="bool" value="false"/></property></channel>')
-    run(['systemctl','enable','xrdp']);run(['systemctl','restart','xrdp'])
+    run(['systemctl','enable','xrdp']);run(['systemctl','restart','xrdp-sesman'],False);run(['systemctl','restart','xrdp'])
     if not active('xrdp'):raise RuntimeError('xrdp 启动失败，请检查系统日志。')
     log('XFCE 与 xrdp 已就绪。RDP 仅监听回环地址，通过 SSH 连接。')
 
 def setup_chrome(options):
     account()
-    if os.uname().machine!='x86_64':raise RuntimeError('Google Chrome 当前仅支持本安装器的 x86_64 Ubuntu。')
+    if os.uname().machine!='x86_64':raise RuntimeError('Google Chrome 当前仅支持本安装器的 x86_64 Debian 13。')
     apt(['curl','ca-certificates','gnupg'])
     key=run(['curl','-fsSL','--retry','3','https://dl.google.com/linux/linux_signing_key.pub']).stdout
     with tempfile.TemporaryDirectory(prefix='safe-code-google-') as temporary:
@@ -319,8 +353,11 @@ def setup_chrome(options):
         keybytes=output.read_bytes()
     Path('/etc/apt/keyrings').mkdir(exist_ok=True)
     target=Path('/etc/apt/keyrings/safe-code-google.gpg');target.write_bytes(keybytes);target.chmod(0o644)
+    write('/etc/default/google-chrome','repo_add_once="false"\nrepo_reenable_on_distupgrade="false"\n')
+    Path('/etc/apt/sources.list.d/google-chrome.list').unlink(missing_ok=True)
     write('/etc/apt/sources.list.d/safe-code-google.sources','Types: deb\nURIs: https://dl.google.com/linux/chrome/deb/\nSuites: stable\nComponents: main\nArchitectures: amd64\nSigned-By: /etc/apt/keyrings/safe-code-google.gpg\n')
     apt(['google-chrome-stable'])
+    Path('/etc/apt/sources.list.d/google-chrome.list').unlink(missing_ok=True)
     # 从当前桌面环境启动，保留 Chrome 沙箱，不使用 --no-sandbox。
     user_write('Desktop/Chrome.desktop','[Desktop Entry]\nType=Application\nName=Chrome\nExec=google-chrome-stable\nIcon=google-chrome\nTerminal=false\n',0o755)
     log(version('/usr/bin/google-chrome-stable'))
@@ -332,6 +369,30 @@ def setup_input(options):
     user_write('.config/autostart/fcitx5.desktop','[Desktop Entry]\nType=Application\nName=Fcitx5\nExec=fcitx5 -d\nTerminal=false\n')
     log('拼音与中文字体已就绪，重新登录桌面后生效。')
 
+def ensure_herdr():
+    a=account();h=home()
+    herdr_bin=h/'.local/bin/herdr'
+    ver=version(herdr_bin)
+    if not ver:
+        apt(['curl','ca-certificates'])
+        installer=Path('/opt/safe-code/install-herdr.sh')
+        r=run(['curl','-fsSL','--retry','3','https://herdr.dev/install.sh'],False)
+        if r.returncode==0 and r.stdout.strip():
+            write(installer,r.stdout,0o755)
+            log('为工作用户安装 Herdr 持久终端工作台。')
+            stream(['runuser','-u',a['username'],'--','env','-i','HOME='+str(h),'PATH='+str(h/'.local/bin')+':/usr/local/bin:/usr/bin:/bin','LANG=C.UTF-8','sh',str(installer)])
+            ver=version(herdr_bin)
+    path_line='export PATH="$HOME/.local/bin:/opt/safe-code/node/bin:$PATH"'
+    user_files('append_unique','.profile',content=path_line,mode=0o644)
+    user_files('append_unique','.bashrc',content=path_line,mode=0o644)
+    if ver:
+        if not user_read('.config/herdr/config.toml'):
+            user_write('.config/herdr/config.toml','onboarding = false\n\n[terminal]\nshell_mode = "login"\nnew_cwd = "~/workspace"\n',0o644)
+        if (h/'.local/bin/claude').exists():
+            run(['runuser','-u',a['username'],'--','env','-i','HOME='+str(h),'PATH='+str(h/'.local/bin')+':/usr/local/bin:/usr/bin:/bin','LANG=C.UTF-8',str(herdr_bin),'integration','install','claude'],False)
+        log('Herdr 已就绪：'+ver)
+    return ver
+
 def setup_claude(options):
     a=account();apt(['curl','ca-certificates','git','tmux'])
     target=Path('/opt/safe-code/install-claude.sh')
@@ -342,16 +403,27 @@ def setup_claude(options):
     value=version(home()/'.local/bin/claude')
     if not value:raise RuntimeError('Claude Code 安装后未找到有效程序。')
     user_files('append_unique','.profile',content='export PATH="$HOME/.local/bin:$PATH"',mode=0o644)
+    ensure_herdr()
     log(value+'；请由本人完成 Claude 账号授权。')
 
 def setup_ssh(options):
     account();public=options.get('publicKey','').strip()
     if not re.fullmatch(r'(ssh-rsa|ssh-ed25519|ecdsa-sha2-nistp256) [A-Za-z0-9+/=]+ safe-code-[A-Za-z0-9_-]+',public):raise RuntimeError('客户端 SSH 公钥格式无效。')
     user_files('append_unique','.ssh/authorized_keys',content=public,mode=0o600)
-    user_write('.local/bin/safe-code-terminal','#!/bin/sh\ncd "$HOME/workspace"\nexec tmux new-session -A -s safe-code\n',0o755)
+    ensure_herdr()
+    terminal_script=(
+        '#!/bin/sh\n'
+        'export PATH="$HOME/.local/bin:/opt/safe-code/node/bin:$PATH"\n'
+        'cd "$HOME/workspace"\n'
+        'if [ -x "$HOME/.local/bin/herdr" ]; then\n'
+        '  exec "$HOME/.local/bin/herdr" --session safe-code\n'
+        'fi\n'
+        'exec tmux new-session -A -s safe-code\n'
+    )
+    user_write('.local/bin/safe-code-terminal',terminal_script,0o755)
     log('工作用户公钥已授权，原 SSH 配置及管理入口保持。')
 
-def install_mount(options):apt(['davfs2','fuse3']);log('目录挂载组件已安装。')
+def install_mount(options):apt(['davfs2','fuse3','iproute2']);log('目录挂载组件已安装。')
 
 def setup_cloud(options):
     secure_root_directory('/mnt/safe-code',0o755)
@@ -508,9 +580,20 @@ def poll_job(job,offset):
         if status not in ['active','activating'] and age>3:error='远端任务意外结束，重连后可检查实际安装状态。'
     return {'lines':lines,'nextOffset':next_offset,'done':value is not None or error is not None,'value':value,'error':error}
 
+def probe_egress_ip():
+    if shutil.which('curl'):
+        return run(['curl','--noproxy','*','-4','-fsS','--connect-timeout','5','--max-time','12','https://api.ipify.org']).stdout.strip()
+    old_getaddrinfo=socket.getaddrinfo
+    try:
+        socket.getaddrinfo=lambda host,port,family=0,type=0,proto=0,flags=0:old_getaddrinfo(host,port,socket.AF_INET,type,proto,flags)
+        opener=urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open('https://api.ipify.org',timeout=10) as response:
+            return response.read(64).decode('ascii').strip()
+    finally:socket.getaddrinfo=old_getaddrinfo
+
 def main():
     global JOB_DIR
-    require_ubuntu() # 必须先检查系统，再创建任何目录或写入配置。
+    require_debian_13() # 必须先检查系统，再创建任何目录或写入配置。
     if sys.argv[1]=='--list-directories':
         if os.geteuid()!=0:raise RuntimeError('需要安装管理员权限。')
         result(list_directories(json.loads(base64.b64decode(sys.argv[2]))));return
@@ -522,19 +605,21 @@ def main():
     op=request.get('op','inspect')
     if op=='inspect':result(inspect());return
     if op=='egress_probe':
-        value=run(['curl','--noproxy','*','-4','-fsS','--connect-timeout','5','--max-time','12','https://api.ipify.org']).stdout.strip()
+        value=probe_egress_ip()
         result({'ip':str(ipaddress.IPv4Address(value))});return
     if os.geteuid()!=0:raise RuntimeError('安装需要 root 或免密 sudo 权限。')
     if op=='account_info':result(account());return
     if op=='list_directories':result(list_directories(request.get('options') or {}));return
     if op=='desktop_login_probe':
-        options=request.get('options') or {};path=Path('/var/log/xrdp-sesman.log');size=path.stat().st_size
+        options=request.get('options') or {};path=Path('/var/log/xrdp-sesman.log');size=path.stat().st_size if path.exists() else 0
         offset=options.get('offset',size)
         if not isinstance(offset,int) or offset<0 or offset>size:offset=size
-        with path.open('rb') as f:
-            f.seek(offset);lines=f.read(131072).decode('utf-8',errors='replace')
+        lines=''
+        if path.exists():
+            with path.open('rb') as f:
+                f.seek(offset);lines=f.read(131072).decode('utf-8',errors='replace')
         user=account()['username']
-        success=any(('++ created session' in line or '++ reconnected session' in line or 'Session started successfully' in line) and (user in line) for line in lines.splitlines())
+        success=any(('++ created session' in line or '++ reconnected session' in line or 'Session started successfully' in line or 'Access permitted for user' in line) and (user in line) for line in lines.splitlines())
         result({'offset':size,'loggedIn':success});return
     secure_root_directory(STATE,0o700)
     write('/etc/needrestart/conf.d/99-safe-code.conf', '$nrconf{override_rc}->{qr(^(?:ssh|xrdp(?:-sesman)?)(?:\\.service)?$)} = 0;\n')
