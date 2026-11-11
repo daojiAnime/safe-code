@@ -20,8 +20,9 @@ class Debian13Tests(unittest.TestCase):
     def test_locale_packages_do_not_require_ubuntu_language_packs(self):
         for loc in ['en_US.UTF-8','ja_JP.UTF-8','zh_CN.UTF-8']:
             pkgs=agent.locale_packages(loc)
-            self.assertEqual(pkgs,['locales','tzdata'])
+            self.assertEqual(pkgs,['locales','tzdata','fonts-noto-cjk'])
             self.assertFalse(any(p.startswith('language-pack-') for p in pkgs))
+        self.assertEqual(agent.locale_packages('en_US.UTF-8','Asia/Seoul'),['locales','tzdata','fonts-noto-cjk','fonts-nanum'])
 
     def test_debian13_locale_gen_and_locale_conf(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -42,7 +43,7 @@ class Debian13Tests(unittest.TestCase):
                 ran.append(args)
                 if args==['locale','-a']:return subprocess.CompletedProcess(args,0,'C\nC.utf8\nja_JP.utf8\n','')
                 return subprocess.CompletedProcess(args,0,'','')
-            with patch.object(agent,'Path',local_path),patch.object(agent,'STATE',state),patch.object(agent,'account',return_value={'username':'workspace'}),patch.object(agent,'apt'),patch.object(agent,'log'),patch.object(agent,'setup_xsession'),patch.object(agent,'stream',side_effect=lambda a,env=None:streamed.append(a)),patch.object(agent,'run',side_effect=fake_run):
+            with patch.object(agent,'Path',local_path),patch.object(agent,'STATE',state),patch.object(agent,'account',return_value={'username':'workspace'}),patch.object(agent,'home',return_value=base/'home/workspace'),patch.object(agent,'user_files'),patch.object(agent,'apt'),patch.object(agent,'log'),patch.object(agent,'setup_xsession'),patch.object(agent,'stream',side_effect=lambda a,env=None:streamed.append(a)),patch.object(agent,'run',side_effect=fake_run):
                 agent.setup_locale({'timezone':'Asia/Tokyo','locale':'ja_JP.UTF-8'})
                 self.assertIn('\nja_JP.UTF-8 UTF-8\n','\n'+(base/'etc/locale.gen').read_text())
                 self.assertEqual(streamed,[['locale-gen']])

@@ -192,7 +192,7 @@ def inspect():
     if locale_state.exists():
         desired=json.loads(locale_state.read_text())
         timezone=run(['timedatectl','show','-p','Timezone','--value'],False).stdout.strip()
-        localized=timezone==desired.get('timezone') and system_locale==desired.get('locale','') and locale_generated(desired.get('locale','')) and all(package_installed(p) for p in locale_packages(desired.get('locale','')))
+        localized=timezone==desired.get('timezone') and system_locale==desired.get('locale','') and locale_generated(desired.get('locale','')) and all(package_installed(p) for p in locale_packages(desired.get('locale',''),desired.get('timezone','')))
     pub=user_read('.ssh/authorized_keys') if account_ok else ''
     statuses={
       'account':account_ok and bool(a.get('hostname')) and a['hostname']==os.uname().nodename,
@@ -289,17 +289,19 @@ print(json.dumps({'path':str(p),'parent':str(p.parent),'directories':sorted(item
     log('目录读取完成。')
     return json.loads(output.stdout)
 
-def locale_packages(locale):
+def locale_packages(locale,timezone=''):
     language=locale.split('_',1)[0]
     if not re.fullmatch('[a-z]{2}',language):raise RuntimeError('系统语言无效。')
-    return ['locales','tzdata']
+    pkgs=['locales','tzdata','fonts-noto-cjk']
+    if timezone=='Asia/Seoul':pkgs.append('fonts-nanum')
+    return pkgs
 
 def setup_locale(options):
-    account()
-    timezone=options.get('timezone','');locale=options.get('locale','')
+    a=account()
+    timezone=options.get('timezone','');locale=options.get('locale','') or 'en_US.UTF-8'
     if not timezone or '..' in timezone or not (Path('/usr/share/zoneinfo')/timezone).is_file():raise RuntimeError('请选择有效的 IANA 时区。')
     if not re.fullmatch('[a-z]{2}_[A-Z]{2}\\.UTF-8',locale):raise RuntimeError('请选择有效的 UTF-8 系统语言。')
-    apt(locale_packages(locale))
+    apt(locale_packages(locale,timezone))
     supported=Path('/usr/share/i18n/SUPPORTED').read_text()
     entry=locale+' UTF-8'
     if entry not in supported:raise RuntimeError('Debian 13 不支持此 Locale。')
@@ -315,6 +317,11 @@ def setup_locale(options):
     if Path('/etc/default/locale').exists() and not Path('/etc/default/locale').is_symlink():
         run(['update-locale','--locale-file=/etc/default/locale','LANG='+locale],False)
     write(STATE/'localization.json',json.dumps({'timezone':timezone,'locale':locale}),0o600)
+    user_files('append_unique','.profile',content='export LANG='+locale,mode=0o644)
+    user_files('append_unique','.bashrc',content='export LANG='+locale,mode=0o644)
+    user_files('append_unique','.bashrc',content="alias ll='ls -alF'",mode=0o644)
+    if shutil.which('xdg-user-dirs-update'):
+        run(['runuser','-u',a['username'],'--','env','-i','HOME='+str(home()),'PATH=/usr/bin:/bin','LANG='+locale,'LC_ALL='+locale,'xdg-user-dirs-update','--force'],False)
     setup_xsession()
 
 def setup_xsession():

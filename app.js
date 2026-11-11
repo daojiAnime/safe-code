@@ -7,13 +7,13 @@ let ipPolicy = { lockIngress: false, lockEgress: false };
 let detectedRegion = 'us_ny';
 let localeSelection = 'auto';
 const localePresets = {
-  jp: {name:'日本',timezone:'Asia/Tokyo',language:'日语',locale:'ja_JP.UTF-8'},
+  jp: {name:'日本',timezone:'Asia/Tokyo',language:'英语（保留日韩中字体）',locale:'en_US.UTF-8'},
   us_ny: {name:'美国 · 纽约',timezone:'America/New_York',language:'英语（美国）',locale:'en_US.UTF-8'},
   us_la: {name:'美国 · 洛杉矶',timezone:'America/Los_Angeles',language:'英语（美国）',locale:'en_US.UTF-8'},
-  sg: {name:'新加坡',timezone:'Asia/Singapore',language:'英语（新加坡）',locale:'en_SG.UTF-8'},
-  gb: {name:'英国',timezone:'Europe/London',language:'英语（英国）',locale:'en_GB.UTF-8'},
-  de: {name:'德国',timezone:'Europe/Berlin',language:'德语',locale:'de_DE.UTF-8'},
-  kr: {name:'韩国',timezone:'Asia/Seoul',language:'韩语',locale:'ko_KR.UTF-8'}
+  sg: {name:'新加坡',timezone:'Asia/Singapore',language:'英语',locale:'en_US.UTF-8'},
+  gb: {name:'英国',timezone:'Europe/London',language:'英语',locale:'en_US.UTF-8'},
+  de: {name:'德国',timezone:'Europe/Berlin',language:'英语',locale:'en_US.UTF-8'},
+  kr: {name:'韩国',timezone:'Asia/Seoul',language:'英语（保留韩文字体）',locale:'en_US.UTF-8'}
 };
 function currentLocale(){return localePresets[localeSelection==='auto'?detectedRegion:localeSelection]||null;}
 let runToken = 0;

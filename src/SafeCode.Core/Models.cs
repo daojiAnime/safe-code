@@ -41,7 +41,7 @@ public static class DeploymentCatalog
 {
     public static readonly DeploymentStep[] Steps = [
         new("account", "设置工作用户和机器名称", "创建日常开发账户，配置独立密码和项目目录。"),
-        new("localization", "本土化设置", "按出口所在地配置时区与系统语言。"),
+        new("localization", "本土化设置", "按出口所在地配置时区，默认英文系统语言并保留中日韩字体。"),
         new("desktop", "安装虚拟桌面", "安装 XFCE 与 xrdp，通过加密隧道访问。"),
         new("chrome", "安装 Chrome", "使用 Google 官方软件源安装浏览器。"),
         new("input", "安装中文输入法", "安装拼音输入法与中文字体。"),
@@ -50,23 +50,23 @@ public static class DeploymentCatalog
     ];
     public static LocaleSettings? MatchLocale(string country, string? city) => country.ToLowerInvariant() switch
     {
-        "jp" => new("日本", "Asia/Tokyo", "ja_JP.UTF-8", "日语"),
-        "sg" => new("新加坡", "Asia/Singapore", "en_SG.UTF-8", "英语"),
-        "gb" => new("英国", "Europe/London", "en_GB.UTF-8", "英语"),
-        "de" => new("德国", "Europe/Berlin", "de_DE.UTF-8", "德语"),
-        "kr" => new("韩国", "Asia/Seoul", "ko_KR.UTF-8", "韩语"),
+        "jp" => new("日本", "Asia/Tokyo", "en_US.UTF-8", "英语"),
+        "sg" => new("新加坡", "Asia/Singapore", "en_US.UTF-8", "英语"),
+        "gb" => new("英国", "Europe/London", "en_US.UTF-8", "英语"),
+        "de" => new("德国", "Europe/Berlin", "en_US.UTF-8", "英语"),
+        "kr" => new("韩国", "Asia/Seoul", "en_US.UTF-8", "英语"),
         "us" when city is "New York" => new("美国 · 纽约", "America/New_York", "en_US.UTF-8", "英语"),
         "us" when city is "Los Angeles" => new("美国 · 洛杉矶", "America/Los_Angeles", "en_US.UTF-8", "英语"),
         _ => null
     };
     public static readonly LocaleSettings[] Locales = [
-        new("日本", "Asia/Tokyo", "ja_JP.UTF-8", "日语"),
+        new("日本", "Asia/Tokyo", "en_US.UTF-8", "英语"),
         new("美国 · 洛杉矶", "America/Los_Angeles", "en_US.UTF-8", "英语"),
         new("美国 · 纽约", "America/New_York", "en_US.UTF-8", "英语"),
-        new("新加坡", "Asia/Singapore", "en_SG.UTF-8", "英语"),
-        new("英国", "Europe/London", "en_GB.UTF-8", "英语"),
-        new("德国", "Europe/Berlin", "de_DE.UTF-8", "德语"),
-        new("韩国", "Asia/Seoul", "ko_KR.UTF-8", "韩语")
+        new("新加坡", "Asia/Singapore", "en_US.UTF-8", "英语"),
+        new("英国", "Europe/London", "en_US.UTF-8", "英语"),
+        new("德国", "Europe/Berlin", "en_US.UTF-8", "英语"),
+        new("韩国", "Asia/Seoul", "en_US.UTF-8", "英语")
     ];
 }
 public sealed class UnsupportedOsException(string message) : Exception(message);
