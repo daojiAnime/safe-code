@@ -388,3 +388,207 @@ dialog :is(.config-description,.dialog-hint,.account-description,.bridge-check s
 #notice-screen :is(.declaration p,.usage-consent small,.diagnostic-notice),
 #login-screen .login-heading p,#login-form .rating-disclosure{color:#626f66}
 dialog :is(.config-footer,.mount-footer){align-items:center}
+
+/* Daoji Custom: Web 宿主无冗余标题栏、Herdr 卡片与远程桌面显示/HiDPI 缩放弹窗 */
+html.web-host .window{display:flex;flex-direction:column}
+html.web-host:not(.native-client) .window{width:min(460px,calc(100vw - 32px));height:min(640px,calc(100svh - 40px));border-radius:12px}
+html.web-host:not(.native-client) .window.wide{width:min(920px,calc(100vw - 32px));height:min(760px,calc(100svh - 40px))}
+.web-host .window>.titlebar{border-bottom:0;flex-shrink:0;height:auto;min-height:32px;padding:3px 18px}
+.web-host .window>.titlebar .app-name,
+.web-host .window>.titlebar:not(:has(#developer-preview,#title-update-notice:not([hidden]))){display:none}
+html.web-host .window>.screen,
+html.web-host .window>.workspace{height:auto;flex:1;min-height:0}
+html.web-host:not(.native-client) .window>.screen{overflow-y:auto}
+
+.desktop-card .maintenance-card-trigger{padding-bottom:30px}
+.desktop-card .resolution-link:disabled{opacity:.55;cursor:wait}
+
+/* 远程桌面显示与 HiDPI 缩放弹窗 */
+.resolution-dialog:not(.native-dialog-front){
+  width:min(440px,calc(100vw - 32px));
+  max-height:calc(100svh - 28px);
+  overflow:hidden;
+}
+.resolution-dialog[open]:not(.native-dialog-front){
+  display:flex;
+  flex-direction:column;
+}
+.resolution-dialog>.titlebar{
+  flex-shrink:0;
+}
+#resolution-form{
+  padding:16px 20px 18px;
+  min-height:0;
+  overflow-y:auto;
+  scrollbar-width:thin;
+}
+.native-dialog-window .native-dialog-front#resolution-dialog #resolution-form{
+  overflow:visible;
+}
+.rdp-presets{
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:10px;
+  padding-bottom:12px;
+  margin-bottom:12px;
+  border-bottom:1px solid var(--border);
+  flex-wrap:wrap;
+}
+.rdp-presets-label{
+  font-size:var(--type-small);
+  font-weight:500;
+  color:#56685c;
+  white-space:nowrap;
+}
+.rdp-preset-buttons{
+  display:flex;
+  align-items:center;
+  gap:8px;
+  flex-wrap:wrap;
+}
+.rdp-preset-btn{
+  display:inline-flex;
+  align-items:center;
+  justify-content:center;
+  padding:5px 12px;
+  border:1px solid #d7e2da;
+  border-radius:999px;
+  background:#f8faf8;
+  color:#465b4d;
+  font-size:var(--type-small);
+  font-weight:500;
+  line-height:1.4;
+  white-space:nowrap;
+  transition:background .15s,border-color .15s,color .15s,box-shadow .15s;
+}
+.rdp-preset-btn:hover:not(:disabled){
+  background:var(--pale);
+  border-color:#9fc0aa;
+  color:var(--green);
+}
+.rdp-preset-btn.is-active{
+  background:var(--pale);
+  border-color:var(--green);
+  color:var(--green);
+  font-weight:600;
+  box-shadow:inset 0 0 0 1px #286e4f24;
+}
+.rdp-preset-btn:disabled{
+  opacity:.55;
+}
+#resolution-form .rdp-field{
+  margin-bottom:11px;
+}
+#resolution-form .rdp-field>label{
+  display:block;
+  margin:0 0 5px;
+  font-size:var(--type-small);
+  font-weight:500;
+  color:#3f5045;
+}
+#resolution-form .rdp-field>select{
+  width:100%;
+  height:37px;
+  margin:0;
+  padding:0 10px;
+  border:1px solid #dce5de;
+  border-radius:6px;
+  background:#fff;
+  color:var(--ink);
+  font-size:var(--type-small);
+  font-variant-numeric:tabular-nums;
+  outline:0;
+  transition:border-color .15s,box-shadow .15s;
+}
+#resolution-form .rdp-field>select:hover:not(:disabled){
+  border-color:#a9c1b2;
+}
+#resolution-form .rdp-field>select:focus{
+  border-color:#6b9b7e;
+  box-shadow:0 0 0 2px #286e4f12;
+}
+#resolution-form .rdp-field>select:disabled{
+  background:#f6f8f6;
+  color:var(--muted);
+}
+#resolution-form label.policy-toggle{
+  display:flex;
+  align-items:center;
+  gap:10px;
+  padding:9px 12px;
+  margin:12px 0;
+  border:1px solid var(--border);
+  border-radius:6px;
+  background:#fcfdfb;
+  color:var(--ink);
+  cursor:pointer;
+  transition:border-color .15s,background .15s;
+}
+#resolution-form label.policy-toggle:hover{
+  border-color:#c2d6c8;
+}
+#resolution-form label.policy-toggle:has(input:checked){
+  border-color:#bfd7c6;
+  background:var(--pale);
+}
+#resolution-form #rdp-fullscreen{
+  appearance:auto;
+  width:15px;
+  height:15px;
+  min-width:15px;
+  flex:0 0 15px;
+  margin:0;
+  padding:0;
+  border:0;
+  border-radius:3px;
+  box-shadow:none;
+  accent-color:var(--green);
+  cursor:pointer;
+}
+#resolution-form label.policy-toggle>span{
+  font-size:var(--type-small);
+  font-weight:500;
+  color:#384a3e;
+  line-height:1.45;
+}
+#resolution-form .dialog-hint{
+  margin:0 0 16px;
+  padding:9px 12px;
+  border:1px solid var(--border);
+  border-radius:6px;
+  background:#f7faf7;
+  color:#56685c;
+  font-size:var(--type-small);
+  line-height:1.6;
+}
+#resolution-form .dialog-hint:empty{
+  display:none;
+}
+#resolution-form .dialog-hint.is-recommended{
+  background:var(--pale);
+  border-color:#c7dfd0;
+  color:#21573f;
+}
+#resolution-form .dialog-hint.is-warning{
+  background:#fcf5e8;
+  border-color:#ecd2a2;
+  color:#8c5914;
+}
+#resolution-form .dialog-buttons{
+  padding-top:12px;
+  border-top:1px solid var(--border);
+  gap:8px;
+}
+#resolution-form .dialog-buttons .deploy-button{
+  height:34px;
+  min-width:68px;
+  padding:0 14px;
+  font-size:var(--type-small);
+}
+#resolution-form .dialog-buttons .primary{
+  height:34px;
+  min-width:112px;
+  padding:0 16px;
+  font-size:var(--type-small);
+}

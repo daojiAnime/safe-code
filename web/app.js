@@ -8,13 +8,13 @@ let localeSelection = '';
 let accountSettingsSaved = false;
 let localeSaving = false;
 const localePresets = {
-  jp: {name:'日本',timezone:'Asia/Tokyo',language:'日语',locale:'ja_JP.UTF-8'},
+  jp: {name:'日本',timezone:'Asia/Tokyo',language:'英语（保留日韩中字体）',locale:'en_US.UTF-8'},
   us_ny: {name:'美国 · 纽约',timezone:'America/New_York',language:'英语（美国）',locale:'en_US.UTF-8'},
   us_la: {name:'美国 · 洛杉矶',timezone:'America/Los_Angeles',language:'英语（美国）',locale:'en_US.UTF-8'},
-  sg: {name:'新加坡',timezone:'Asia/Singapore',language:'英语（新加坡）',locale:'en_SG.UTF-8'},
-  gb: {name:'英国',timezone:'Europe/London',language:'英语（英国）',locale:'en_GB.UTF-8'},
-  de: {name:'德国',timezone:'Europe/Berlin',language:'德语',locale:'de_DE.UTF-8'},
-  kr: {name:'韩国',timezone:'Asia/Seoul',language:'韩语',locale:'ko_KR.UTF-8'}
+  sg: {name:'新加坡',timezone:'Asia/Singapore',language:'英语',locale:'en_US.UTF-8'},
+  gb: {name:'英国',timezone:'Europe/London',language:'英语',locale:'en_US.UTF-8'},
+  de: {name:'德国',timezone:'Europe/Berlin',language:'英语',locale:'en_US.UTF-8'},
+  kr: {name:'韩国',timezone:'Asia/Seoul',language:'英语（保留韩文字体）',locale:'en_US.UTF-8'}
 };
 function currentLocale(){return Object.hasOwn(localePresets,localeSelection)?localePresets[localeSelection]:null;}
 function deploymentSettingsReady(){return accountSettingsSaved&&currentLocale()!==null;}
@@ -45,12 +45,14 @@ function showScreen(name) {
   appWindow.classList.toggle('wide',name==='workspace');
 }
 function stopWork(){for(const timer of advancedTimers)clearTimeout(timer);advancedTimers.clear();if(ipQueryController)ipQueryController.abort();clearTimeout(connectionTimer);runToken++;busy=false;}
-function exit(){stopWork();$('#login-form').reset();appWindow.hidden=true;$('#restore-window').hidden=true;$('#ip-policy-dialog').close();$('#localization-dialog').close();$('#mount-dialog').close();$('#maintenance-result').close();$('#result-body').replaceChildren();$('#client-window').close();$('#client-frame').removeAttribute('src');document.title='Safe Code · 已退出';}
-$('#close').onclick=exit;
+function exit(){stopWork();$('#login-form').reset();appWindow.hidden=true;if($('#restore-window'))$('#restore-window').hidden=true;$('#ip-policy-dialog').close();$('#localization-dialog').close();$('#mount-dialog').close();$('#resolution-dialog')?.close();$('#maintenance-result').close();$('#result-body').replaceChildren();$('#client-window').close();$('#client-frame').removeAttribute('src');document.title='Safe Code · 已退出';}
+if($('#close'))$('#close').onclick=exit;
 $('#exit').onclick=exit;
-$('#minimize').onclick=()=>{appWindow.hidden=true;$('#restore-window').hidden=false;};
-$('#restore-window').onclick=()=>{appWindow.hidden=false;$('#restore-window').hidden=true;};
-$('#maximize').onclick=()=>{
+if($('#minimize')&&$('#restore-window')){
+  $('#minimize').onclick=()=>{appWindow.hidden=true;$('#restore-window').hidden=false;};
+  $('#restore-window').onclick=()=>{appWindow.hidden=false;$('#restore-window').hidden=true;};
+}
+if($('#maximize'))$('#maximize').onclick=()=>{
   const expanded=appWindow.classList.toggle('maximized');
   $('#maximize').setAttribute('aria-label',expanded?'还原窗口':'最大化');
   $('#maximize').title=expanded?'还原窗口':'最大化';
@@ -108,7 +110,7 @@ function enterDeveloperPreview(){
   $('#password').value='';$('#server-ingress').textContent='127.0.0.1';$('#server-address').textContent='127.0.0.1';$('#server-user').textContent='developer';
   states=Array(tasks.length).fill('pending');taskLogs=Array(tasks.length).fill('');resetDeploymentSettings();
   $('#rating-state').textContent='示例数据';$('#ip-location').textContent='开发预览';$('#ip-score').textContent='—';$('#score-unit').textContent='';
-  let banner=$('#developer-preview');if(!banner){banner=document.createElement('div');banner.id='developer-preview';banner.className='developer-preview';$('.window>.titlebar').insertBefore(banner,$('.window-controls'));}
+  let banner=$('#developer-preview');if(!banner){banner=document.createElement('div');banner.id='developer-preview';banner.className='developer-preview';const titlebar=$('.window>.titlebar');if(titlebar)titlebar.insertBefore(banner,$('.window-controls'));}
   banner.replaceChildren(document.createTextNode('开发预览 · 未连接服务器 '));
   const back=document.createElement('button');back.className='text-button';back.textContent='返回登录';back.onclick=()=>location.reload();banner.append(back);
   renderTasks();resetLogin();switchMode('deployment');showScreen('workspace');
@@ -513,3 +515,5 @@ $('#enter-preview').onclick=()=>{
   if(window.__safeCodeDesktop){showAppMessage('客户端核心模块未就绪，无法进入预览。');return;}
   $('#advanced-dialog').close();enterDeveloperPreview();
 };
+if($('#desktop-resolution'))$('#desktop-resolution').onclick=()=>{if(!$('#resolution-dialog').open)$('#resolution-dialog').showModal();};
+if($('#resolution-form'))$('#resolution-form').onsubmit=event=>{event.preventDefault();$('#resolution-dialog').close();};

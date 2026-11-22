@@ -10,7 +10,7 @@ internal sealed record DeploymentChoices(bool AccountSaved,string? LocaleRegion)
 public sealed record DesktopResolution(int Width=1280,int Height=800);
 internal sealed class ClientPreferences(string directory)
 {
-    internal static readonly DesktopResolution[] Resolutions=[new(1024,768),new(1280,800),new(1366,768),new(1600,900),new(1920,1080),new(2560,1440),new(2560,1600)];
+    internal static readonly DesktopResolution[] Resolutions=[new(1024,768),new(1280,800),new(1366,768),new(1440,900),new(1512,982),new(1600,900),new(1920,1080),new(2560,1440),new(2560,1600)];
     private string ClaudeDesktopWarningPath=>Path.Combine(directory,"claude-desktop-warning-accepted-v1");
     public bool ClaudeDesktopWarningAccepted=>File.Exists(ClaudeDesktopWarningPath);
     public void AcceptClaudeDesktopWarning()
@@ -65,9 +65,10 @@ internal sealed class ClientPreferences(string directory)
         // 使用默认账户参数时不会创建草稿目录，部署成功后的清理应直接跳过。
         try{File.Delete(DraftPath(session));}catch(DirectoryNotFoundException){}
     }
+    private static DesktopResolution DefaultResolution()=>new(RdpDisplayConstants.DefaultResolution.Width,RdpDisplayConstants.DefaultResolution.Height);
     public DesktopResolution ReadResolution()
     {
-        try{var value=JsonSerializer.Deserialize<DesktopResolution>(File.ReadAllText(Path.Combine(directory,"desktop-resolution.json")),JsonDefaults.Options);return value!=null&&Resolutions.Contains(value)?value:new();}catch(IOException){return new();}catch(JsonException){return new();}
+        try{var value=JsonSerializer.Deserialize<DesktopResolution>(File.ReadAllText(Path.Combine(directory,"desktop-resolution.json")),JsonDefaults.Options);return value!=null&&Resolutions.Contains(value)?value:DefaultResolution();}catch(IOException){return DefaultResolution();}catch(JsonException){return DefaultResolution();}
     }
     public void SaveResolution(DesktopResolution resolution)
     {

@@ -591,8 +591,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKSc
     }
     private func openFile(_ path:String) {
         let url=URL(fileURLWithPath:path).standardizedFileURL;let root=directory.standardizedFileURL.path+"/"
-        guard url.path.hasPrefix(root),["rdp","dmg"].contains(url.pathExtension.lowercased()),FileManager.default.fileExists(atPath:url.path) else{fail("拒绝打开非客户端生成的文件。");return}
-        if url.pathExtension=="rdp" {openRemoteDesktop(url);return}
+        let ext=url.pathExtension.lowercased()
+        guard url.path.hasPrefix(root),["rdp","dmg"].contains(ext),FileManager.default.fileExists(atPath:url.path) else{fail("拒绝打开非客户端生成的文件。");return}
+        if ext=="rdp" {openRemoteDesktop(url);return}
         NSWorkspace.shared.open(url)
     }
     private func openRemoteDesktop(_ document:URL) {
@@ -609,13 +610,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKSc
             }
         }
         if let client=explicitClient {
-            workspace.open([document],withApplicationAt:client,configuration:NSWorkspace.OpenConfiguration()){_,error in
-                if error != nil {DispatchQueue.main.async {showLaunchError("无法打开 Windows App，请确认应用仍可运行。")}}
+            let config=NSWorkspace.OpenConfiguration();config.activates=true
+            workspace.open([document],withApplicationAt:client,configuration:config){_,error in
+                guard error != nil else{return}
+                DispatchQueue.main.async {
+                    let shared=NSWorkspace.shared
+                    if let fallback=shared.urlForApplication(toOpen:document),fallback.standardizedFileURL != client.standardizedFileURL,Bundle(url:fallback) != nil,shared.open(document) {
+                        return
+                    }
+                    showLaunchError("无法打开 Windows App，请确认应用仍可运行。")
+                }
             }
         }else if let handler=workspace.urlForApplication(toOpen:document),Bundle(url:handler) != nil {
             if !workspace.open(document) {showLaunchError("无法打开远程桌面配置，请检查默认 RDP 客户端。")}
         }else {
-            showLaunchError("请先安装支持 RDP 的 macOS 客户端（例如 Windows App），再打开远程桌面。工作用户密码需在远程桌面客户端自行输入。")
+            showLaunchError("请先安装支持 RDP 的 macOS 客户端（例如 Windows App、Microsoft Remote Desktop 或 FreeRDP），再打开远程桌面。工作用户密码需在远程桌面客户端自行输入。")
         }
     }
     func windowShouldClose(_ sender:NSWindow) -> Bool {

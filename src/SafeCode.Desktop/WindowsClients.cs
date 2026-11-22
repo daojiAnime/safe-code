@@ -60,13 +60,64 @@ public sealed class WindowsClients : IDisposable
     public async Task OpenTerminalAsync(SshSession session, CancellationToken ct)
     {
         if (session.Server?.Statuses.GetValueOrDefault("account") != true) throw new InvalidOperationException("请先部署工作用户。");
-        await session.DeployAsync("ssh", null, ct: ct); await session.VerifyWorkspaceKeyAsync(ct);
+        var updatedServer = await session.DeployAsync("ssh", null, ct: ct); await session.VerifyWorkspaceKeyAsync(ct);
         var account = await session.RequestAsync<AccountInfo>("account_info", null, ct);
+        string sshAlias = HerdrClient.EnsureManagedSshAlias(session, account.Username);
+        string? localHerdr = HerdrClient.FindLocalExecutable();
+        if (!string.IsNullOrEmpty(localHerdr) && updatedServer.HerdrReady)
+        {
+            string preferredLabel = !string.IsNullOrWhiteSpace(updatedServer.Hostname) ? updatedServer.Hostname : session.Host;
+            bool merged = await HerdrClient.EnsureMachineSavedAsync(localHerdr, sshAlias, preferredLabel, "safe-code", ct);
+            var herdrStart = new ProcessStartInfo(localHerdr) { UseShellExecute = true };
+            if (!merged)
+            {
+                herdrStart.ArgumentList.Add("--remote");
+                herdrStart.ArgumentList.Add(sshAlias);
+                herdrStart.ArgumentList.Add("--session");
+                herdrStart.ArgumentList.Add("safe-code");
+            }
+            var herdrProc = Process.Start(herdrStart) ?? throw new IOException("无法启动本机 Herdr 客户端。");
+            terminals.Add(herdrProc);
+            return;
+        }
         string ssh=NativeSshPath();
         string[] args=[..SshOptions(session,account.Username,true),".local/bin/safe-code-terminal"];
         var start=new ProcessStartInfo(ssh){UseShellExecute=true};
         foreach(string arg in args)start.ArgumentList.Add(arg);
         var process=Process.Start(start)??throw new IOException("无法打开 Windows 终端。");terminals.Add(process);
+    }
+    public async Task<object> DisconnectTerminalAsync(SshSession session, CancellationToken ct)
+    {
+        string sshAlias = HerdrClient.BuildAlias(session.Host, session.Port);
+        string? localHerdr = HerdrClient.FindLocalExecutable();
+        bool removedLocal = false;
+        if (!string.IsNullOrEmpty(localHerdr))
+        {
+            removedLocal = await HerdrClient.RemoveSavedMachineAsync(localHerdr, sshAlias, "safe-code", ct);
+        }
+
+        string? workspaceUser = session.Server?.Username;
+        if (!string.IsNullOrWhiteSpace(workspaceUser))
+        {
+            try
+            {
+                string prefix = session.Server?.IsRoot == true ? "" : "sudo -n ";
+                string userQuoted = SshSession.Quote(workspaceUser);
+                string stopCmd = prefix + "runuser -u " + userQuoted + " -- sh -lc 'if [ -x \"$HOME/.local/bin/herdr\" ]; then \"$HOME/.local/bin/herdr\" session stop safe-code >/dev/null 2>&1 || true; fi; tmux kill-session -t safe-code >/dev/null 2>&1 || true'";
+                await session.ExecuteTextAsync(stopCmd, ct);
+            }
+            catch
+            {
+                // Ignore if remote session is already stopped.
+            }
+        }
+
+        return new
+        {
+            removedLocal,
+            title = "远程会话已关闭",
+            message = "已从本机 Herdr 侧边栏移除该远程机器，并停止远端 safe-code 持久终端会话。"
+        };
     }
     public static string OpenCodex()
     {

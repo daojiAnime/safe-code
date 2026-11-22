@@ -22,7 +22,7 @@ internal sealed class MacBackend : IDisposable
     private readonly object consentGate=new();
     private readonly ClientPreferences preferences;
     private readonly MacClients clients;
-    private readonly RdpResizePreferences desktopDisplay;
+    private readonly RdpDisplayPreferences desktopDisplay;
     private readonly SemaphoreSlim writer=new(1),mutation=new(1);
     private readonly CancellationTokenSource lifetime=new();
     private readonly ConcurrentDictionary<string,DiagnosticTrace> traces=new();
@@ -60,7 +60,7 @@ internal sealed class MacBackend : IDisposable
         try
         {
             using var doc=JsonDocument.Parse(line);var root=doc.RootElement;id=root.GetProperty("id").GetString()??"";operation=root.GetProperty("op").GetString()??"";var args=root.GetProperty("args");
-            bool modifies=operation is "deploy" or "job.resume" or "mount.apply" or "mount.install" or "cloud.install" or "cloud.expose" or "ip.apply" or "terminal" or "desktop" or "desktop.resolution.save" or "host.enable" or "host.disable" or "app.shutdown" or "connection.reauthenticate"
+            bool modifies=operation is "deploy" or "job.resume" or "mount.apply" or "mount.install" or "cloud.install" or "cloud.expose" or "ip.apply" or "terminal" or "terminal.disconnect" or "desktop" or "desktop.resolution.save" or "host.enable" or "host.disable" or "app.shutdown" or "connection.reauthenticate"
                 or "desktopKey.enable" or "desktopKey.disable" or "claudeDesktop.start" or "claudeDesktop.stop" or "safeCodeApi.install";
             if(modifies){if(!await mutation.WaitAsync(0))throw new InvalidOperationException("已有任务正在执行，请等待完成。");gate=true;Interlocked.Increment(ref activeMutations);}
             var diagnosticOperation=offline||operation=="mount.reconnect"&&session?.HasMounts!=true?null:DiagnosticTrace.OperationFor(operation,args);
@@ -325,6 +325,12 @@ internal sealed class MacBackend : IDisposable
                 step=Read("step");
                 if(step=="account"&&(hostControl?.Enabled==true||claudeDesktop.Running))throw new InvalidOperationException("请先停用本机控制和 Claude Desktop SSH 接入，再修改工作账户。");
                 var deploymentTarget=RequireSession();
+                if(step=="desktop")
+                {
+                    if(deploymentTarget.Server?.Statuses.GetValueOrDefault("account")!=true)throw new InvalidOperationException("请先创建工作用户。");
+                    int savedScale=desktopDisplay.ReadRemoteScale();
+                    return await deploymentTarget.RequestAsync<ServerInfo>("desktop",new{scale=savedScale,desktopScale=savedScale},ct);
+                }
                 var locale=preferences.RequireDeploymentChoices(deploymentTarget);
                 var draft=step=="account"?preferences.ReadDraft(deploymentTarget)??throw new InvalidOperationException("请先保存工作账户设置。"):null;
                 var result=await deploymentTarget.DeployAsync(step,locale,draft?.Username??"workspace",ct,draft?.Password??"",draft?.Hostname??"");
@@ -342,22 +348,143 @@ internal sealed class MacBackend : IDisposable
             case "deployment.locale.save":return preferences.SaveDeploymentLocale(RequireSession(),Read("region"));
             case "account":return await RequireSession().RequestAsync<AccountInfo>("account_info",null,ct);
             case "desktop.resolution.get":
+            {
                 var resolution=preferences.ReadResolution();
-                return new{resolution.Width,resolution.Height,displayMode=desktopDisplay.Read().ToString(),fullscreen=desktopDisplay.ReadFullscreen()};
-            case "desktop.resolution.save":
-                var mode=Read("displayMode",desktopDisplay.Read().ToString()) switch {
-                    "Original"=>RdpResizeMode.Original,"Scale"=>RdpResizeMode.Scale,"Dynamic"=>RdpResizeMode.Dynamic,
-                    _=>throw new ArgumentException("请选择支持的远程桌面显示模式。")
+                var mode=desktopDisplay.ReadMode();
+                bool fullscreen=desktopDisplay.ReadFullscreen();
+                bool desktopReady=session?.Server?.DesktopReady==true;
+                var hostDisplay=HostDisplayMetrics.DetectPrimary();
+                double displayScale=hostDisplay?.ScaleFactor??1.0;
+                bool isRetina=OperatingSystem.IsMacOS()&&displayScale>=1.5;
+                int remoteScale=desktopDisplay.HasSavedPreferences
+                    ?desktopDisplay.ReadRemoteScale()
+                    :(isRetina
+                        ?RdpDisplayConstants.DefaultRemoteScale
+                        :(desktopReady&&RdpDisplayConstants.IsSupportedScale(session!.Server!.DesktopScale)
+                            ?session.Server.DesktopScale
+                            :desktopDisplay.ReadRemoteScale()));
+                var supported=ClientPreferences.Resolutions.Select(item=>new{width=item.Width,height=item.Height}).ToArray();
+                return new
+                {
+                    width=resolution.Width,
+                    height=resolution.Height,
+                    displayMode=mode.ToString(),
+                    fullscreen,
+                    remoteScale,
+                    keyboardMode=desktopDisplay.ReadKeyboardMode().ToString(),
+                    clientPreference=desktopDisplay.ReadClientPreference().ToString(),
+                    desktopReady,
+                    supported,
+                    supportedScales=RdpDisplayConstants.SupportedScales,
+                    displayScale,
+                    isRetina
                 };
-                preferences.SaveResolution(new(args.GetProperty("width").GetInt32(),args.GetProperty("height").GetInt32()));
-                desktopDisplay.Save(mode);
-                if(args.TryGetProperty("fullscreen",out _)) desktopDisplay.SaveFullscreen(Flag("fullscreen"));
-                return new{windows=0,dynamicUpdated=0,deferred=1};
+            }
+            case "desktop.resolution.save":
+            {
+                if(args.ValueKind!=JsonValueKind.Object||
+                   !args.TryGetProperty("width",out var widthProp)||!widthProp.TryGetInt32(out int width)||
+                   !args.TryGetProperty("height",out var heightProp)||!heightProp.TryGetInt32(out int height))
+                    throw new ArgumentException("请选择支持的分辨率。");
+
+                var resolution=new DesktopResolution(width,height);
+                if(!ClientPreferences.Resolutions.Contains(resolution)&&!RdpDisplayConstants.IsSupportedResolution(resolution.Width,resolution.Height))
+                    throw new ArgumentException("请选择支持的分辨率。");
+
+                RdpResizeMode mode=desktopDisplay.ReadMode();
+                if(args.TryGetProperty("displayMode",out var modeProp)&&modeProp.ValueKind!=JsonValueKind.Null)
+                {
+                    if(modeProp.ValueKind!=JsonValueKind.String)throw new ArgumentException("请选择支持的远程桌面显示模式。");
+                    string? rawMode=modeProp.GetString();
+                    if(!string.IsNullOrWhiteSpace(rawMode))
+                    {
+                        var parsedA=RdpDisplayConstants.ParseMode(rawMode,RdpResizeMode.Original);
+                        var parsedB=RdpDisplayConstants.ParseMode(rawMode,RdpResizeMode.Scale);
+                        if(parsedA!=parsedB)throw new ArgumentException("请选择支持的远程桌面显示模式。");
+                        mode=parsedA;
+                    }
+                }
+
+                bool fullscreen=desktopDisplay.ReadFullscreen();
+                if(args.TryGetProperty("fullscreen",out var fullscreenProp)&&fullscreenProp.ValueKind!=JsonValueKind.Null)
+                {
+                    if(fullscreenProp.ValueKind is not (JsonValueKind.True or JsonValueKind.False))
+                        throw new ArgumentException("远程桌面全屏设置无效。");
+                    fullscreen=fullscreenProp.GetBoolean();
+                }
+
+                RdpKeyboardMode keyboardMode=desktopDisplay.ReadKeyboardMode();
+                if(args.TryGetProperty("keyboardMode",out var kbdProp)&&kbdProp.ValueKind!=JsonValueKind.Null)
+                {
+                    if(kbdProp.ValueKind!=JsonValueKind.String)throw new ArgumentException("请选择支持的键盘映射模式。");
+                    string? rawKbd=kbdProp.GetString();
+                    if(!string.IsNullOrWhiteSpace(rawKbd)&&!RdpDisplayConstants.TryParseKeyboardMode(rawKbd,out keyboardMode))
+                        throw new ArgumentException("请选择支持的键盘映射模式。");
+                }
+
+                RdpClientPreference clientPreference=desktopDisplay.ReadClientPreference();
+                if(args.TryGetProperty("clientPreference",out var clientProp)&&clientProp.ValueKind!=JsonValueKind.Null)
+                {
+                    if(clientProp.ValueKind!=JsonValueKind.String)throw new ArgumentException("请选择支持的远程桌面客户端。");
+                    string? rawClient=clientProp.GetString();
+                    if(!string.IsNullOrWhiteSpace(rawClient)&&!RdpDisplayConstants.TryParseClientPreference(rawClient,out clientPreference))
+                        throw new ArgumentException("请选择支持的远程桌面客户端。");
+                }
+
+                bool hasRemoteScale=args.TryGetProperty("remoteScale",out var scaleProp)&&scaleProp.ValueKind!=JsonValueKind.Null;
+                int remoteScale=desktopDisplay.ReadRemoteScale();
+                if(hasRemoteScale)
+                {
+                    if(scaleProp.ValueKind==JsonValueKind.Number&&scaleProp.TryGetInt32(out int parsedScale))
+                        remoteScale=parsedScale;
+                    else if(scaleProp.ValueKind==JsonValueKind.String&&int.TryParse(scaleProp.GetString(),out int parsedStringScale))
+                        remoteScale=parsedStringScale;
+                    else
+                        throw new ArgumentException("请选择支持的远程桌面缩放比例（100%、150% 或 200%）。");
+                }
+                if(!RdpDisplayConstants.IsSupportedScale(remoteScale))
+                    throw new ArgumentException("请选择支持的远程桌面缩放比例（100%、150% 或 200%）。");
+
+                preferences.SaveResolution(resolution);
+                desktopDisplay.Save(mode,fullscreen,remoteScale,keyboardMode,clientPreference);
+
+                if(session?.IsConnected==true&&session.Server?.DesktopReady==true&&hasRemoteScale)
+                {
+                    var scaleResult=await session.RequestAsync<JsonElement>("desktop_scale",new{scale=remoteScale},ct);
+                    bool appliedLive=scaleResult.ValueKind==JsonValueKind.Object&&
+                        scaleResult.TryGetProperty("appliedLive",out var liveProp)&&
+                        liveProp.ValueKind==JsonValueKind.True;
+                    int effectiveScale=remoteScale;
+                    if(scaleResult.ValueKind==JsonValueKind.Object)
+                    {
+                        if(scaleResult.TryGetProperty("server",out var serverProp)&&serverProp.ValueKind==JsonValueKind.Object)
+                        {
+                            var updatedServer=JsonSerializer.Deserialize<ServerInfo>(serverProp,JsonDefaults.Options);
+                            if(updatedServer!=null&&RdpDisplayConstants.IsSupportedScale(updatedServer.DesktopScale))
+                                effectiveScale=updatedServer.DesktopScale;
+                        }
+                        else if(scaleResult.TryGetProperty("desktopScale",out var dsProp)&&dsProp.TryGetInt32(out int ds)&&RdpDisplayConstants.IsSupportedScale(ds))
+                        {
+                            effectiveScale=ds;
+                        }
+                        else if(scaleResult.TryGetProperty("scale",out var scProp)&&scProp.TryGetInt32(out int sc)&&RdpDisplayConstants.IsSupportedScale(sc))
+                        {
+                            effectiveScale=sc;
+                        }
+                    }
+                    if(session.Server!=null)session.Server.DesktopScale=effectiveScale;
+                    if(effectiveScale!=remoteScale)desktopDisplay.Save(mode,fullscreen,effectiveScale,keyboardMode,clientPreference);
+                    return new{windows=0,dynamicUpdated=appliedLive?1:0,deferred=appliedLive?0:1,displayMode=mode.ToString(),fullscreen,remoteScale=effectiveScale,keyboardMode=keyboardMode.ToString(),clientPreference=clientPreference.ToString(),remoteScaleApplied=true,appliedLive};
+                }
+
+                return new{windows=0,dynamicUpdated=0,deferred=1,displayMode=mode.ToString(),fullscreen,remoteScale,keyboardMode=keyboardMode.ToString(),clientPreference=clientPreference.ToString(),remoteScaleApplied=false,appliedLive=false};
+            }
             case "desktop":
                 var path=await clients.DesktopAsync(RequireSession(),preferences.ReadResolution(),desktopDisplay,ct);
                 if(path!=null)await EmitAsync(new{type="openFile",path});
                 return true;
             case "terminal":step="ssh";await clients.OpenTerminalAsync(RequireSession(),ct);return RequireSession().Server;
+            case "terminal.disconnect":step="ssh";return await clients.DisconnectTerminalAsync(RequireSession(),ct);
             case "cloud.install":step="cloud";return await RequireSession().RequestAsync<ServerInfo>("cloud",null,ct);
             case "cloud.open":
                 if(RequireSession().Server?.CloudReady!=true)throw new InvalidOperationException("请先安装 CloudCLI。");

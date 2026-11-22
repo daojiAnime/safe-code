@@ -66,13 +66,61 @@ internal static class MacSelfTest
         var rdp=MacClients.FreeRdpArguments(new(22119,"fixture",fingerprint),new("workspace","fixture password"),
             new(2560,1600),RdpResizeMode.Dynamic,true);
         if(!rdp.Contains("/cert:deny,fingerprint:sha256:"+fingerprint)||!rdp.Contains("/p:fixture password")||
-           !rdp.Contains("/f")||!rdp.Contains("/dynamic-resolution")||rdp.Contains("/smart-sizing"))
+           !rdp.Contains("/f")||!rdp.Contains("+dynamic-resolution")||rdp.Any(a=>a.StartsWith("/smart-sizing")))
             throw new Exception("Mac RDP 指纹和动态分辨率参数错误。");
+        try{MacClients.FreeRdpArguments(new(22119,"fixture",null),new("workspace","fixture password"),new(1920,1080),RdpResizeMode.Scale,false);throw new Exception("Mac RDP 未拦截缺失证书指纹。");}catch(InvalidOperationException){}
         var scaled=MacClients.FreeRdpArguments(new(22119,"fixture",fingerprint),new("workspace","fixture password"),
             new(1920,1080),RdpResizeMode.Scale,false);
-        if(!scaled.Contains("/smart-sizing")||scaled.Contains("/dynamic-resolution")||scaled.Contains("/f"))
+        if(!scaled.Contains("/smart-sizing")||scaled.Contains("+dynamic-resolution")||scaled.Contains("/f"))
             throw new Exception("Mac RDP 固定分辨率缩放参数错误。");
         Console.WriteLine("MAC_RDP_PINNED_CERTIFICATE_AND_DISPLAY_MODES_OK");
+
+        // Verify RDP HiDPI display preferences, Retina 5K/14" scaling, SDL3 hints, keyboard modes, and .rdp generation.
+        if(!RdpDisplayConstants.IsSupportedResolution(1440,900)||!RdpDisplayConstants.IsSupportedResolution(1512,982))throw new Exception("高分屏分辨率列表缺失。");
+        if(!ClientPreferences.Resolutions.Contains(new(1440,900))||!ClientPreferences.Resolutions.Contains(new(1512,982))||!ClientPreferences.Resolutions.Contains(new(2560,1440))||!ClientPreferences.Resolutions.Contains(new(2560,1600)))throw new Exception("客户端分辨率列表不完整。");
+        if(!RdpDisplayConstants.IsSupportedScale(100)||!RdpDisplayConstants.IsSupportedScale(150)||!RdpDisplayConstants.IsSupportedScale(200)||RdpDisplayConstants.IsSupportedScale(125))throw new Exception("远端缩放校验异常。");
+        string tempDir=Path.Combine(Path.GetTempPath(),"safecode-rdp-selftest-"+Guid.NewGuid().ToString("N"));
+        try
+        {
+            var prefs=new RdpDisplayPreferences(tempDir);
+            if(prefs.HasSavedPreferences||prefs.ReadMode()!=RdpDisplayConstants.DefaultMode||prefs.ReadFullscreen()||prefs.ReadRemoteScale()!=RdpDisplayConstants.DefaultRemoteScale||prefs.ReadKeyboardMode()!=RdpDisplayConstants.DefaultKeyboardMode||prefs.ReadClientPreference()!=RdpClientPreference.Auto)throw new Exception("默认 RDP 显示配置异常。");
+            prefs.Save(RdpResizeMode.Dynamic,true,200,RdpKeyboardMode.SwapCmdCtrl,RdpClientPreference.WindowsApp);
+            if(!prefs.HasSavedPreferences||prefs.ReadMode()!=RdpResizeMode.Dynamic||!prefs.ReadFullscreen()||prefs.ReadRemoteScale()!=200||prefs.ReadKeyboardMode()!=RdpKeyboardMode.SwapCmdCtrl||prefs.ReadClientPreference()!=RdpClientPreference.WindowsApp)throw new Exception("RDP 显示配置持久化往返失败。");
+            try{prefs.Save(RdpResizeMode.Scale,false,175);throw new Exception("接受了非法远端缩放值。");}catch(ArgumentException){}
+            var env=new Dictionary<string,string?>();
+            RdpLaunchBuilder.ApplyFreeRdpEnvironment(env,tempDir,macOsOverride:true);
+            string sdlConfigPath=Path.Combine(env["XDG_CONFIG_HOME"]!,"freerdp","sdl-freerdp.json");
+            if(!File.Exists(sdlConfigPath))throw new Exception("未生成 sdl-freerdp.json 配置。");
+            using var sdlCfg=JsonDocument.Parse(File.ReadAllText(sdlConfigPath));
+            var mask=sdlCfg.RootElement.GetProperty("SDL_KeyModMask");
+            if(mask.GetArrayLength()!=1||mask[0].GetString()!="SDL_KMOD_NONE")throw new Exception("sdl-freerdp 热键屏蔽配置异常。");
+            if(env["SDL_MAC_PRESS_AND_HOLD"]!="0"||env["SDL_MAC_OPTION_AS_ALT"]!="both"||env["SDL_MAC_CTRL_CLICK_EMULATE_RIGHT_CLICK"]!="0"||env["SDL_MAC_SCROLL_MOMENTUM"]!="0"||env["SDL_MOUSE_FOCUS_CLICKTHROUGH"]!="1"||env["SDL_VIDEO_MAC_FULLSCREEN_SPACES"]!="1"||env["SDL_VIDEO_MAC_FULLSCREEN_MENU_VISIBILITY"]!="1"||env["SDL_VIDEO_MINIMIZE_ON_FOCUS_LOSS"]!="0")throw new Exception("macOS SDL3 输入优化环境变量缺失。");
+        }
+        finally{if(Directory.Exists(tempDir))Directory.Delete(tempDir,true);}
+
+        var account=new AccountInfo("workspace","secret-pass-1234");
+        var tlsEndpoint=new RemoteDesktopConnection(45123,"0123456789abcdef0123",fingerprint);
+        var scaleArgs1x=RdpLaunchBuilder.BuildFreeRdpArguments(tlsEndpoint,account,1440,900,RdpResizeMode.Scale,false,"Safe Code · 远程桌面",100,null,RdpKeyboardMode.CmdToCtrl,macOsOverride:true);
+        if(!scaleArgs1x.Contains("/size:1440x900")||!scaleArgs1x.Contains("/bpp:32")||!scaleArgs1x.Contains("/smart-sizing")||scaleArgs1x.Contains("+dynamic-resolution")||!scaleArgs1x.Contains("/clipboard:direction-to:all")||!scaleArgs1x.Contains("+fonts")||!scaleArgs1x.Contains("-grab-keyboard")||!scaleArgs1x.Contains("/kbd:layout:0x00000409,remap:0x15b=0x1d,remap:0x15c=0x1d")||!scaleArgs1x.Contains("/sec:tls")||!scaleArgs1x.Contains("/cert:deny,fingerprint:sha256:"+fingerprint)||scaleArgs1x.Contains("/f"))throw new Exception("macOS CmdToCtrl Scale 模式 FreeRDP 参数错误。");
+        var swapArgs=RdpLaunchBuilder.BuildFreeRdpArguments(tlsEndpoint,account,1440,900,RdpResizeMode.Scale,false,"Safe Code · 远程桌面",100,null,RdpKeyboardMode.SwapCmdCtrl,macOsOverride:true);
+        if(!swapArgs.Contains("/kbd:layout:0x00000409,remap:0x15b=0x1d,remap:0x15c=0x1d,remap:0x1d=0x15b"))throw new Exception("SwapCmdCtrl 键盘映射参数错误。");
+        var stdArgs=RdpLaunchBuilder.BuildFreeRdpArguments(tlsEndpoint,account,1440,900,RdpResizeMode.Scale,false,"Safe Code · 远程桌面",100,null,RdpKeyboardMode.Standard,macOsOverride:true);
+        if(!stdArgs.Contains("/kbd:layout:0x00000409")||stdArgs.Any(a=>a.Contains("remap:")))throw new Exception("Standard 键盘模式不应含 remap。");
+        var display5k=new HostDisplayMetrics(2560,1440,5120,2880,2.0);
+        var scaleArgs5k=RdpLaunchBuilder.BuildFreeRdpArguments(tlsEndpoint,account,1440,900,RdpResizeMode.Scale,false,"Safe Code · 远程桌面",100,display5k,RdpKeyboardMode.CmdToCtrl,macOsOverride:true);
+        if(!scaleArgs5k.Contains("/size:2880x1800")||!scaleArgs5k.Contains("/smart-sizing:1440x900")||scaleArgs5k.Contains("+dynamic-resolution"))throw new Exception("5K Retina Scale 模式 FreeRDP 参数未按 2x 放大窗口。");
+        var display14=new HostDisplayMetrics(1512,982,3024,1964,2.0);
+        var scaleArgs14=RdpLaunchBuilder.BuildFreeRdpArguments(tlsEndpoint,account,1440,900,RdpResizeMode.Scale,false,"Safe Code · 远程桌面",100,display14);
+        if(!scaleArgs14.Contains("/smart-sizing:1440x900")||scaleArgs14.Contains("/size:2880x1800"))throw new Exception("14 寸 Retina 屏幕未按可用边界安全限幅。");
+        var dynArgs200=RdpLaunchBuilder.BuildFreeRdpArguments(tlsEndpoint,account,1440,900,RdpResizeMode.Dynamic,false,"Safe Code · 远程桌面",200,display5k);
+        if(!dynArgs200.Contains("/size:2880x1800")||!dynArgs200.Contains("+dynamic-resolution")||dynArgs200.Any(a=>a.StartsWith("/smart-sizing")))throw new Exception("Retina Dynamic 200% 模式 FreeRDP 物理尺寸错误。");
+        var dynArgs=RdpLaunchBuilder.BuildFreeRdpArguments(new RemoteDesktopConnection(45123,"0123456789abcdef0123",null),account,1512,982,RdpResizeMode.Dynamic,true);
+        if(!dynArgs.Contains("+dynamic-resolution")||dynArgs.Contains("/smart-sizing")||!dynArgs.Contains("/f")||!dynArgs.Contains("/cert:ignore"))throw new Exception("Dynamic 模式 FreeRDP 参数错误。");
+        if(OperatingSystem.IsMacOS()&&HostDisplayMetrics.DetectPrimary() is not { LogicalWidth: > 0, PhysicalWidth: > 0, ScaleFactor: >= 1.0 })throw new Exception("macOS 主显示器缩放探测失败。");
+        try{RdpLaunchBuilder.BuildFreeRdpArguments(tlsEndpoint,new AccountInfo("bad\nuser","p"),1440,900,RdpResizeMode.Scale,false);throw new Exception("未拦截含换行符凭据。");}catch(InvalidOperationException){}
+        string rdpText=RdpLaunchBuilder.BuildRdpFileContent(tlsEndpoint,account,1440,900,RdpResizeMode.Scale,true);
+        if(!rdpText.Contains("smart sizing:i:1")||!rdpText.Contains("dynamic resolution:i:0")||!rdpText.Contains("screen mode id:i:2")||!rdpText.Contains("desktopwidth:i:1440"))throw new Exception(".rdp 文件生成内容错误。");
+
         Console.WriteLine("MAC_AES_GCM_TAMPER_SHELL_QUOTING_AND_PLATFORM_UPDATE_SELECTION_OK");
         string folder=Directory.CreateTempSubdirectory("safecode-host-resume-").FullName;
         try

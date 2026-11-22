@@ -1,8 +1,8 @@
+global using RdpResizeMode = SafeCode.Core.RdpResizeMode;
 using System.IO;
+using SafeCode.Core;
 
 namespace SafeCode.Desktop;
-
-internal enum RdpResizeMode { Original, Scale, Dynamic }
 
 internal sealed class RdpResizePreferences(string directory)
 {

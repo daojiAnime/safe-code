@@ -1,12 +1,15 @@
-/* Windows 客户端桥接。普通浏览器继续使用概念稿；桌面模式不执行模拟部署。 */
-if (window.chrome?.webview && (location.host === 'safe-code.local' || (window.__safeCodePlatform === 'macos' && location.protocol === 'file:'))) {
+/* 本地客户端与 Web 宿主桥接。普通静态页面继续使用概念稿；宿主模式不执行模拟部署。 */
+if ((window.chrome?.webview && (location.host === 'safe-code.local' || (window.__safeCodePlatform === 'macos' && location.protocol === 'file:'))) || window.__safeCodeWebPostMessage) {
   (() => {
+    const isWebHost=!!window.__safeCodeWeb;
+    const isAppShell=isWebHost&&new URLSearchParams(location.search).get('shell')==='app';
     const isMac=window.__safeCodePlatform==='macos';
+    const postNativeMessage=isWebHost?window.__safeCodeWebPostMessage:message=>window.chrome.webview.postMessage(message);
     const servicesWindow=isMac&&window.__safeCodeServicesWindow;
     const pending = new Map();
     const native = (op,args={}) => new Promise((resolve,reject) => {
       if(developerPreview&&!/^(window\.|services\.|diagnostics\.|notice\.|updates\.|feedback\.|copy$|mount\.status\.open$|preview\.|acceptance\.|claudeDesktop\.open$|desktopKey\.|codex\.open$)/.test(op))return reject(new Error('开发预览未连接服务器，此操作仅在真实连接后可用。'));
-      const id=crypto.randomUUID();pending.set(id,{resolve,reject});window.chrome.webview.postMessage({id,op,args});
+      const id=crypto.randomUUID();pending.set(id,{resolve,reject});postNativeMessage({id,op,args});
     });
     window.safeCodeNativeResponse = ({id,result,error}) => {
       const item=pending.get(id);if(!item)return;pending.delete(id);error?item.reject(new Error(error)):item.resolve(result);
@@ -30,10 +33,14 @@ if (window.chrome?.webview && (location.host === 'safe-code.local' || (window.__
     }
     if(isMac){
       document.documentElement.classList.add('macos-client');
-      $('.window-controls').hidden=true;
+      if($('.window-controls'))$('.window-controls').hidden=true;
       for(const element of document.querySelectorAll('[data-os-label]'))element.textContent='macOS';
       window.safeCodeApplyPreferences=showPreferences;
       window.safeCodeRefreshPreferences=refreshPreferences;
+    }else if(isWebHost){
+      document.documentElement.classList.add('web-host');
+      if($('.window-controls'))$('.window-controls').hidden=true;
+      if(navigator.platform?.toLowerCase().includes('mac'))for(const element of document.querySelectorAll('[data-os-label]'))element.textContent='macOS';
     }
     for(const id of consentIds)document.getElementById(id).disabled=true;
     $('#feedback-send').disabled=true;
@@ -57,7 +64,7 @@ if (window.chrome?.webview && (location.host === 'safe-code.local' || (window.__
     function showUpdateNotice(info){
       const available=!!info.version;
       $('#services-entry').textContent=available?'发现新版本':'更新与反馈';$('#services-entry').classList.toggle('has-update',available);
-      const notice=$('#title-update-notice');notice.hidden=!available;notice.title=available?'发现新版本 '+info.version+'，点击查看更新':'打开更新与反馈';notice.setAttribute('aria-label',notice.title);
+      const notice=$('#title-update-notice');if(notice){notice.hidden=!available;notice.title=available?'发现新版本 '+info.version+'，点击查看更新':'打开更新与反馈';notice.setAttribute('aria-label',notice.title);}
     }
     async function checkUpdate(force=false){$('#check-update').disabled=true;$('#update-status').textContent='正在检查 GitHub…';try{displayUpdate(await native('updates.check',{force}));}catch(e){$('#update-status').textContent='检查失败：'+e.message;}finally{$('#check-update').disabled=false;}}
     $('#check-update').onclick=()=>checkUpdate(true);
@@ -90,7 +97,7 @@ if (window.chrome?.webview && (location.host === 'safe-code.local' || (window.__
         'login-help-dialog':[620,495],'ip-policy-dialog':[490,495],
         'remote-folder-dialog':[460,435],'operation-log-dialog':[540,425],
         'claude-desktop-dialog':[490,510],'cloud-remote-dialog':[470,445],
-        'advanced-dialog':[355,235],'resolution-dialog':[355,305],
+        'advanced-dialog':[355,235],'resolution-dialog':[440,560],
         'create-folder-dialog':[380,250],'desktop-key-dialog':[360,190],
         'app-message-dialog':[400,300]
       };
@@ -151,6 +158,7 @@ if (window.chrome?.webview && (location.host === 'safe-code.local' || (window.__
     let currentTask = -1;
     let nativeServer = null;
     let sshPort = 22;
+    let resolutionSaving=false,resolutionLoading=false,resolutionDesktopReady=null;
     let metricsTask = Promise.resolve();
     let metricsTimer=null;let metricsBusy=false;
     let resourceTimer=null;let resourceBusy=false;
@@ -169,15 +177,32 @@ if (window.chrome?.webview && (location.host === 'safe-code.local' || (window.__
       else if(advancedOperation&&!advancedOperation.done&&step===advancedOperation.key){appendOperationLog(line);}
     };
     window.safeCodeNativeLogs=lines=>{for(const entry of lines)window.safeCodeNativeLog(entry.step,entry.line);};
-    document.documentElement.classList.add('native-client');
-    const nativeStyle=document.createElement('style');nativeStyle.textContent=`html,body{overflow:hidden!important;height:100%!important;margin:0!important;padding:0!important;scrollbar-width:none!important;-ms-overflow-style:none!important}*::-webkit-scrollbar,html::-webkit-scrollbar,body::-webkit-scrollbar{display:none!important;width:0!important;height:0!important}*{scrollbar-width:none!important;-ms-overflow-style:none!important}body{padding:0;display:block;background:white;min-height:100vh}.window,.window.wide,.window.maximized{width:100%;height:100vh;max-width:none;border:0;border-radius:0;box-shadow:none;transition:none;overflow:hidden!important}html:not(.macos-client) .window::after{content:"";position:fixed;inset:0;border:1px solid #b7c3bb;pointer-events:none;z-index:1000}.screen{height:calc(100% - 43px);overflow:hidden!important}.header-controls{width:112px}.maintenance-panel .advanced-actions>span{overflow:hidden;white-space:nowrap;text-overflow:ellipsis;max-width:100%}.connection-message{overflow:hidden;white-space:nowrap;text-overflow:ellipsis}.native-log-note{white-space:normal;line-height:1.6;color:#68786d;font-size:var(--type-small)}`;document.head.append(nativeStyle);
-    $('#minimize').onclick=()=>native('window.minimize');
-    $('#maximize').onclick=()=>native('window.maximize');
-    $('#close').onclick=()=>native('window.close');$('#exit').onclick=()=>native('window.close');
-    $('.titlebar').addEventListener('mousedown',e=>{if(e.button===0&&!e.target.closest('button'))native('window.drag');});
-    $('.titlebar').addEventListener('dblclick',e=>{if(!e.target.closest('button'))native('window.maximize');});
+    if(!isWebHost||isAppShell)document.documentElement.classList.add('native-client');
+    const nativeStyle=document.createElement('style');
+    const framelessCss=(!isWebHost||isAppShell)?`html,body{overflow:hidden!important;height:100%!important;margin:0!important;padding:0!important;scrollbar-width:none!important;-ms-overflow-style:none!important}*::-webkit-scrollbar,html::-webkit-scrollbar,body::-webkit-scrollbar{display:none!important;width:0!important;height:0!important}*{scrollbar-width:none!important;-ms-overflow-style:none!important}body{padding:0;display:block;background:white;min-height:100vh}.window,.window.wide,.window.maximized{width:100%;height:100vh;max-width:none;border:0;border-radius:0;box-shadow:none;transition:none;overflow:hidden!important}html:not(.macos-client):not(.web-host) .window::after{content:"";position:fixed;inset:0;border:1px solid #b7c3bb;pointer-events:none;z-index:1000}`:'';
+    const nativeLayoutCss=!isWebHost?`.screen{height:calc(100% - 43px);overflow:hidden!important}.header-controls{width:112px}`:'';
+    nativeStyle.textContent=framelessCss+nativeLayoutCss+`.maintenance-panel .advanced-actions>span{overflow:hidden;white-space:nowrap;text-overflow:ellipsis;max-width:100%}.connection-message{overflow:hidden;white-space:nowrap;text-overflow:ellipsis}.native-log-note{white-space:normal;line-height:1.6;color:#68786d;font-size:var(--type-small)}`;
+    document.head.append(nativeStyle);
+    const mainTitlebar=$('#window > .titlebar');
+    if(!isWebHost){
+      if($('#minimize'))$('#minimize').onclick=()=>native('window.minimize');
+      if($('#maximize'))$('#maximize').onclick=()=>native('window.maximize');
+      if($('#close'))$('#close').onclick=()=>native('window.close');
+      $('#exit').onclick=()=>native('window.close');
+      if(mainTitlebar){
+        mainTitlebar.addEventListener('mousedown',e=>{if(e.button===0&&!e.target.closest('button'))native('window.drag');});
+        mainTitlebar.addEventListener('dblclick',e=>{if(!e.target.closest('button'))native('window.maximize');});
+      }
+    }else if(isAppShell){
+      if($('#close'))$('#close').onclick=()=>window.close();
+      $('#exit').onclick=()=>window.close();
+    }
     $('#client-window').addEventListener('close',()=>$('#client-frame').removeAttribute('src'));
-    const originalShowScreen=showScreen;showScreen=function(name){originalShowScreen(name);native('window.resize',{wide:name==='workspace'});};
+    const originalShowScreen=showScreen;showScreen=function(name){
+      originalShowScreen(name);
+      if(isAppShell){try{window.resizeTo(name==='workspace'?920:460,name==='workspace'?760:640);}catch{}}
+      native('window.resize',{wide:name==='workspace'}).catch(()=>{});
+    };
     const advanced=$('#advanced-connect');
     advanced.onclick=()=>{$('#ssh-port').value=String(sshPort);$('#advanced-dialog').showModal();$('#ssh-port').focus();};
     $('#ssh-port').addEventListener('input',()=>$('#ssh-port').setCustomValidity(''));
@@ -207,7 +232,12 @@ if (window.chrome?.webview && (location.host === 'safe-code.local' || (window.__
       if(server.ipPolicy)serverConnection.ingressIp=server.ipPolicy.ingressIp;
       $('#ip-policy-summary').textContent=server.ipPolicy?.lockEgress?'住宅出口已固定；外部检测：'+(server.observedEgressIp||'待确认'):'未固定出口，当前实际出口：'+(server.observedEgressIp||'待确认');
       $('#server-user').textContent=$('#username').value.trim();
-      const meta=$('.server-metadata');const user=$('#server-user');meta.replaceChildren(user,document.createTextNode(' / Ubuntu '+server.osVersion+' / SSH'));
+      const meta=$('.server-metadata');const user=$('#server-user');
+      const osLabel=(server.osId==='debian'?'Debian ':(server.osName?server.osName+' ':'Debian '))+(server.osVersion||'13');
+      meta.replaceChildren(user,document.createTextNode(' / '+osLabel.trim()+' / SSH'));
+      if(typeof server.desktopReady==='boolean')resolutionDesktopReady=server.desktopReady;
+      const serverScale=Number(server.desktopScale);
+      if([100,150,200].includes(serverScale)&&!$('#resolution-dialog')?.open&&$('#rdp-remote-scale')){$('#rdp-remote-scale').value=String(serverScale);updateResolutionHint();}
       $('#mount-state').textContent=server.mountReady?'已安装':'未安装';$('#install-mount').disabled=server.mountReady;$('#install-mount').textContent=server.mountReady?'已安装':'安装';
       $('#cloud-state').textContent=server.cloudReady?'已就绪':'未安装';$('#install-cloud').disabled=server.cloudReady;$('#install-cloud').textContent=server.cloudReady?'已安装':'安装';$('#open-cloud').disabled=!server.cloudReady;if($('#open-cloud-remote'))$('#open-cloud-remote').disabled=!server.cloudReady;
       renderTasks();
@@ -375,7 +405,7 @@ if (window.chrome?.webview && (location.host === 'safe-code.local' || (window.__
     }
     async function runTask(index){
       if(!connectionReady||!deploymentSettingsReady())throw new Error('请先保存工作用户和本土化设置。');
-      const previousState=states[index];currentTask=index;states[index]='running';taskLogs[index]='正在连接 Ubuntu 部署模块…';renderTasks();
+      const previousState=states[index];currentTask=index;states[index]='running';taskLogs[index]='正在连接 Debian 13 部署模块…';renderTasks();
       try{
         const preset=currentLocale();
         const locale=preset?{region:preset.name,timezone:preset.timezone,locale:preset.locale,language:preset.language}:null;
@@ -398,14 +428,15 @@ if (window.chrome?.webview && (location.host === 'safe-code.local' || (window.__
         for(const [name,value] of [['用户名',account.username],['密码',account.password]]){
           const row=document.createElement('div');row.className='credential-row';const label=document.createElement('span');label.textContent=name;
           const group=document.createElement('div');group.className='credential-value';const code=document.createElement('code');code.textContent=value;
-          const copy=document.createElement('button');copy.className='copy-button';copy.setAttribute('aria-label','复制'+name);copy.textContent='⧉';copy.onclick=async()=>{await native('copy',{text:value});copy.title='已复制';setTimeout(()=>copy.title='复制',1200);};group.append(code,copy);row.append(label,group);$('#result-body').append(row);
+          const copy=document.createElement('button');copy.className='copy-button';copy.setAttribute('aria-label','复制'+name);copy.textContent='⧉';copy.onclick=async()=>{try{await navigator.clipboard.writeText(value);}catch{await native('copy',{text:value});}copy.title='已复制';setTimeout(()=>copy.title='复制',1200);};group.append(code,copy);row.append(label,group);$('#result-body').append(row);
         }
         $('#maintenance-result').showModal();
       }catch(error){showAppMessage(error.message);}
     };
     async function runMaintenanceCard(selector,action){const card=$(selector);const caption=card.querySelector('span');const text=caption.textContent;card.disabled=true;caption.textContent='正在连接…';try{await action();}catch(e){showAppMessage(e.message);}finally{card.disabled=false;caption.textContent=text;}}
-    $('#desktop-card').onclick=()=>runMaintenanceCard('#desktop-card',()=>native('desktop'));
-    $('#terminal-card').onclick=()=>runMaintenanceCard('#terminal-card',async()=>{const result=await native('terminal');if(result)applyServer(result);});
+    $('#desktop-card').onclick=()=>runMaintenanceCard('#desktop-card',async()=>{const res=await native('desktop');if(res?.message)await showAppMessage(res.message,{title:res.title||'远程桌面'});});
+    $('#terminal-card').onclick=()=>runMaintenanceCard('#terminal-card',async()=>{const result=await native('terminal');const server=result?.server||result;if(server?.osId)applyServer(server);if(result?.message)await showAppMessage(result.message,{title:result.title||'SSH 终端'});});
+    if($('#terminal-disconnect'))$('#terminal-disconnect').onclick=async()=>{const btn=$('#terminal-disconnect');const prev=btn.textContent;btn.disabled=true;btn.textContent='正在关闭…';try{const res=await native('terminal.disconnect');await showAppMessage(res?.message||'已关闭远程会话。',{title:res?.title||'关闭会话'});}catch(e){showAppMessage(e.message);}finally{btn.disabled=false;btn.textContent=prev;}};
     let advancedOperation=null;let displayedOperation=null;const operationHistory=new Map();
     function appendOperationLog(line){
       if(!advancedOperation)return;advancedOperation.lines.push(line);if(advancedOperation.lines.length>300)advancedOperation.lines.shift();
@@ -430,7 +461,7 @@ if (window.chrome?.webview && (location.host === 'safe-code.local' || (window.__
       finally{advancedOperation.done=true;busy=false;renderTasks();syncAdvancedButtons();}
     }
     $('#install-cloud').onclick=()=>installAdvanced('cloud');$('#install-mount').onclick=()=>installAdvanced('mount');
-    $('#open-cloud').onclick=()=>native('cloud.open').catch(e=>showAppMessage(e.message));
+    $('#open-cloud').onclick=()=>native('cloud.open').then(res=>{if(isWebHost&&res?.url)window.open(res.url,'_blank','noopener,noreferrer');}).catch(e=>showAppMessage(e.message));
     let cloudRemoteUrl=null;
     let cloudRemoteRunning=false;
     function appendCloudRemoteLog(line){
@@ -492,7 +523,7 @@ if (window.chrome?.webview && (location.host === 'safe-code.local' || (window.__
       if(status.authenticationRequired)$('#update-login-password').classList.add('needs-credentials');else $('#update-login-password').classList.remove('needs-credentials');
       if(status.count)$('#mount-summary').textContent='已挂载 '+status.count+' 个目录，'+(status.state==='connected'?'断线自动恢复。':status.message+'。');
     };
-    $('#mount-guard-status').onclick=()=>native('mount.status.open').catch(error=>showAppMessage(error.message));
+    $('#mount-guard-status').onclick=async()=>{try{const status=await native('mount.status.open');if(isWebHost&&status&&typeof status==='object')await showAppMessage((status.summary||'未挂载目录')+(status.detail?'\n'+status.detail:''),{title:'挂载守护状态'});}catch(error){await showAppMessage(error.message);}};
     $('#folder-retry').onclick=()=>listRemote(lastFolderPath);
     $('#remote-folder-dialog').addEventListener('close',()=>{folderEpoch++;clearInterval(folderTimer);native('folder.cancel').catch(()=>{});});
     $('#folder-confirm').onclick=()=>{if(selectedRemoteField)selectedRemoteField.value=$('#folder-path').textContent;$('#remote-folder-dialog').close();};
@@ -568,31 +599,135 @@ if (window.chrome?.webview && (location.host === 'safe-code.local' || (window.__
       }catch(error){$('#credential-error').textContent=error.message+' 原挂载和缓存已保留，可重新输入密码。';}
       finally{credentialSaving=false;busy=false;for(const control of controls)control.disabled=false;renderTasks();}
     };
-    if(isMac){
-      $('#mac-rdp-options').hidden=false;
-      $('#rdp-display-hint').textContent='下次打开桌面时生效。使用 SDL FreeRDP 可免重复输入工作用户密码；其他客户端按其自身设置连接。';
-    }
-    $('#desktop-resolution').onclick=async()=>{
-      try{
-        const value=await native('desktop.resolution.get');
-        $('#resolution-select').value=value.width+'x'+value.height;
-        if(isMac){
-          $('#rdp-display-mode').value=value.displayMode||'Original';
-          $('#rdp-fullscreen').checked=!!value.fullscreen;
+    function updateResolutionHint(){
+      const mode=$('#rdp-display-mode')?.value||'Scale';
+      const scale=String($('#rdp-remote-scale')?.value||'100');
+      const res=$('#resolution-select')?.value||'1440x900';
+      const kbdMode=$('#rdp-keyboard-mode')?.value||'CmdToCtrl';
+      const clientPref=$('#rdp-client-pref')?.value||'Auto';
+      const kbdSelect=$('#rdp-keyboard-mode');
+      if(kbdSelect)kbdSelect.disabled=clientPref==='WindowsApp';
+      const hint=$('#resolution-hint');
+      if(hint){
+        let text='';let isWarning=false;let isRecommended=false;
+        if(mode==='Dynamic'&&scale==='100'){
+          text='⚠️ 动态分辨率 + 100% 缩放在 Mac 高分屏上文字会偏小；建议将远端缩放设为 200% 或改用「等比缩放」。';
+          isWarning=true;
+        }else if(mode==='Dynamic'&&scale==='200'){
+          text='已启用真 Retina HiDPI 组合：远端按 2x 锐利渲染，文字清晰度最佳。';
+          isRecommended=true;
+        }else if(mode==='Dynamic'&&scale==='150'){
+          text='动态分辨率 + 150% DPI，适合外接 2K/4K 屏折中清晰度。';
+        }else if(mode==='Scale'&&scale==='100'){
+          text='等比缩放 + 100% 标准 DPI：最省带宽与服务器 CPU，Retina 屏自动按 2x 窗口等比放大。';
+        }else if(mode==='Scale'&&(scale==='200'||scale==='150')){
+          text='等比缩放配合较高远端 DPI 会双重放大，通常选 100% 即可。';
+        }else if(mode==='Original'){
+          text='按所选像素 1:1 原始大小打开，不自动缩放。';
+        }else{
+          text='等比缩放 + 100% 标准 DPI：最省带宽与服务器 CPU，Retina 屏自动按 2x 窗口等比放大。';
         }
-        $('#resolution-dialog').showModal();
+        if(clientPref==='WindowsApp'){
+          text+=' 使用 Windows App 打开时会自动复制工作密码到剪贴板，按键映射由 Windows App 自身管理。';
+        }else if(kbdMode==='CmdToCtrl'){
+          text+=' FreeRDP 已关闭右 Shift 热键冲突，支持 ⌘+C/V/A/Z/T/W 与终端 ⌃+C/D 并存，且禁用长按变音菜单与惯性滚轮狂飙。';
+        }else if(kbdMode==='SwapCmdCtrl'){
+          text+=' FreeRDP 已关闭右 Shift 热键冲突，⌘ 作为 Ctrl，物理 ⌃ 作为远端 Super/Win 键。';
+        }else{
+          text+=' FreeRDP 已关闭右 Shift 热键冲突，按原生 Linux 键位透传。';
+        }
+        if(resolutionDesktopReady===false&&scale!=='100'){
+          text+=' 当前尚未检测到远端虚拟桌面，远端缩放将在安装后生效。';
+        }
+        hint.textContent=text;
+        hint.classList.toggle('is-warning',isWarning);
+        hint.classList.toggle('is-recommended',isRecommended);
+      }
+      const retinaBtn=$('#rdp-preset-retina');
+      const smoothBtn=$('#rdp-preset-smooth');
+      const retinaActive=mode==='Dynamic'&&scale==='200'&&res==='1440x900';
+      const smoothActive=mode==='Scale'&&scale==='100'&&res==='1440x900';
+      if(retinaBtn){retinaBtn.classList.toggle('is-active',retinaActive);retinaBtn.setAttribute('aria-pressed',String(retinaActive));}
+      if(smoothBtn){smoothBtn.classList.toggle('is-active',smoothActive);smoothBtn.setAttribute('aria-pressed',String(smoothActive));}
+    }
+    if($('#rdp-preset-retina'))$('#rdp-preset-retina').onclick=()=>{$('#rdp-display-mode').value='Dynamic';$('#rdp-remote-scale').value='200';$('#resolution-select').value='1440x900';updateResolutionHint();};
+    if($('#rdp-preset-smooth'))$('#rdp-preset-smooth').onclick=()=>{$('#rdp-display-mode').value='Scale';$('#rdp-remote-scale').value='100';$('#resolution-select').value='1440x900';updateResolutionHint();};
+    for(const selector of ['#rdp-display-mode','#rdp-remote-scale','#resolution-select','#rdp-keyboard-mode','#rdp-client-pref']){const control=$(selector);if(control)control.onchange=updateResolutionHint;}
+    $('#resolution-dialog').addEventListener('cancel',event=>{if(resolutionSaving)event.preventDefault();});
+    updateResolutionHint();
+    $('#desktop-resolution').onclick=async()=>{
+      if(resolutionLoading||resolutionSaving)return;
+      resolutionLoading=true;
+      try{
+        const value=await native('desktop.resolution.get')||{};
+        const width=Number(value.width),height=Number(value.height);
+        const resKey=Number.isFinite(width)&&width>0&&Number.isFinite(height)&&height>0?`${width}x${height}`:'1440x900';
+        const resSelect=$('#resolution-select');
+        if(resSelect){
+          if(![...resSelect.options].some(opt=>opt.value===resKey)){
+            const opt=document.createElement('option');opt.value=resKey;opt.textContent=`${width} × ${height}`;resSelect.append(opt);
+          }
+          resSelect.value=resKey;
+        }
+        const displayMode=['Scale','Dynamic','Original'].includes(value.displayMode)?value.displayMode:'Scale';
+        if($('#rdp-display-mode'))$('#rdp-display-mode').value=displayMode;
+        const scaleNum=Number(value.remoteScale??nativeServer?.desktopScale);
+        const remoteScale=[100,150,200].includes(scaleNum)?String(scaleNum):'100';
+        if($('#rdp-remote-scale'))$('#rdp-remote-scale').value=remoteScale;
+        const keyboardMode=['CmdToCtrl','SwapCmdCtrl','Standard'].includes(value.keyboardMode)?value.keyboardMode:'CmdToCtrl';
+        if($('#rdp-keyboard-mode'))$('#rdp-keyboard-mode').value=keyboardMode;
+        const clientPreference=['Auto','FreeRdp','WindowsApp'].includes(value.clientPreference)?value.clientPreference:'Auto';
+        if($('#rdp-client-pref'))$('#rdp-client-pref').value=clientPreference;
+        if($('#rdp-fullscreen'))$('#rdp-fullscreen').checked=Boolean(value.fullscreen);
+        resolutionDesktopReady=typeof value.desktopReady==='boolean'?value.desktopReady:(typeof nativeServer?.desktopReady==='boolean'?nativeServer.desktopReady:null);
+        updateResolutionHint();
+        if(!$('#resolution-dialog').open)$('#resolution-dialog').showModal();
       }catch(error){showAppMessage(error.message);}
+      finally{resolutionLoading=false;}
     };
     $('#resolution-form').onsubmit=async event=>{
       event.preventDefault();
-      const [width,height]=$('#resolution-select').value.split('x').map(Number);
-      const settings={width,height};
-      if(isMac)Object.assign(settings,{displayMode:$('#rdp-display-mode').value,fullscreen:$('#rdp-fullscreen').checked});
+      if(resolutionSaving)return;
+      const [width,height]=($('#resolution-select').value||'1440x900').split('x').map(Number);
+      const displayMode=$('#rdp-display-mode')?.value||'Scale';
+      const remoteScale=Number($('#rdp-remote-scale')?.value)||100;
+      const keyboardMode=$('#rdp-keyboard-mode')?.value||'CmdToCtrl';
+      const clientPreference=$('#rdp-client-pref')?.value||'Auto';
+      const fullscreen=Boolean($('#rdp-fullscreen')?.checked);
+      const saveBtn=$('#resolution-save-btn');
+      const prevText=saveBtn?saveBtn.textContent:'保存并应用';
+      const controls=[...$('#resolution-form').querySelectorAll('select,input,button'),$('#close-resolution')].filter(Boolean);
+      resolutionSaving=true;
+      for(const control of controls)control.disabled=true;
+      if(saveBtn)saveBtn.textContent='正在保存并应用…';
       try{
-        const result=await native('desktop.resolution.save',settings);
+        const result=await native('desktop.resolution.save',{width,height,displayMode,fullscreen,remoteScale,keyboardMode,clientPreference})||{};
         $('#resolution-dialog').close();
-        if(result.deferred>0)showAppMessage(isMac?'已保存，下次打开远程桌面时生效。':'窗口大小已调整。当前服务器未接受在线分辨率切换，新像素分辨率将在下次打开桌面时使用。');
-      }catch(error){showAppMessage(error.message);}
+        const savedScale=Number(result.remoteScale)||remoteScale;
+        if(nativeServer&&[100,150,200].includes(savedScale))nativeServer.desktopScale=savedScale;
+        const modeLabels={Scale:'等比缩放',Dynamic:'动态分辨率',Original:'原始大小'};
+        const modeLabel=modeLabels[result.displayMode||displayMode]||displayMode;
+        const summary=`${modeLabel} · ${width}×${height}${fullscreen?' · 启动全屏':''}`;
+        const deferredNote=result.windows>0&&result.deferred>0?'\n当前已打开窗口未接受在线分辨率切换，新分辨率将在下次打开桌面时生效。':'';
+        if(result.remoteScaleApplied&&result.appliedLive){
+          const reconnectHint='\nXFCE 面板与 Chrome 已实时切换为 '+savedScale+'% HiDPI；重新打开远程桌面即可按 1:1 物理像素清晰显示。';
+          showAppMessage(`显示设置已保存（${summary}）。${reconnectHint}${deferredNote}`,{title:'显示设置已应用'});
+        }else if(result.remoteScaleApplied&&!result.appliedLive){
+          showAppMessage(`显示设置已保存，已写入远端 ${savedScale}% HiDPI 缩放配置（${summary}），将在下次打开远程桌面时生效。${deferredNote}`,{title:'显示设置已保存'});
+        }else if(result.windows>0&&result.deferred>0){
+          showAppMessage('显示设置已保存，窗口大小已调整。当前服务器未接受在线分辨率切换，新像素分辨率将在下次打开桌面时使用。',{title:'显示设置已保存'});
+        }else if(result.dynamicUpdated>0){
+          showAppMessage(`显示设置已保存（${summary}），已同步调整当前远程桌面窗口。`,{title:'显示设置已应用'});
+        }else{
+          showAppMessage(`显示设置已保存在本地（${summary} · 远端缩放 ${savedScale}%），将在下次打开远程桌面时生效。`,{title:'显示设置已保存'});
+        }
+      }catch(error){showAppMessage(error.message,{title:'保存失败'});}
+      finally{
+        resolutionSaving=false;
+        for(const control of controls)control.disabled=false;
+        if(saveBtn)saveBtn.textContent=prevText;
+        updateResolutionHint();
+      }
     };
     function fillSavedLogin(saved){
       if(!saved||!$('#workspace-screen').hidden)return;
@@ -854,7 +989,7 @@ if (window.chrome?.webview && (location.host === 'safe-code.local' || (window.__
       $('#safe-code-cloudcli-api-key').value='';
       publicGatewaySetupOnly=false;renderClaudeDesktop();
     });
-    $('#safe-code-open-cloudcli').onclick=()=>native('cloud.open').catch(e=>publicGatewayNotice(e.message));
+    $('#safe-code-open-cloudcli').onclick=()=>native('cloud.open').then(res=>{if(isWebHost&&res?.url)window.open(res.url,'_blank','noopener,noreferrer');}).catch(e=>publicGatewayNotice(e.message));
     $('#claude-desktop-consent').onchange=()=>renderClaudeDesktop();
     $('#safe-code-api-enable').onclick=async()=>{
       if($('#safe-code-api-enable').disabled)return;
@@ -1262,7 +1397,7 @@ if (window.chrome?.webview && (location.host === 'safe-code.local' || (window.__
       try{
         await startupReady;await native('diagnostics.consent',{enabled:false});await native('services.consent',{enabled:false,confirmed:true});await native('notice.accept');
         $('#ip').value=config.host;$('#username').value=config.username;
-        const connected=await connect(config);config.password='';if(!connected||connected.osId!=='ubuntu')throw new Error('未连接指定的真实测试目标');
+        const connected=await connect(config);config.password='';if(!connected||connected.osId!=='debian')throw new Error('未连接指定的真实测试目标');
         if(nativeServer.observedEgressIp!==config.egressIp||!nativeServer.ipPolicyHealthy)throw new Error('初始住宅出口基线不健康');checks.initialBaseline=true;
         let rejected=false;try{await native('ip.apply',{ingressIp:config.ingressIp,egressIp:'192.0.2.123',lockIngress:true,lockEgress:true});}catch{rejected=true;}
         if(!rejected)throw new Error('未分配出口没有被拒绝');checks.unassignedRejected=true;
