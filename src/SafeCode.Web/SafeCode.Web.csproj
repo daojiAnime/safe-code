@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <Version>0.4.4-beta.32-debian13</Version>
+    <InformationalVersion>Beta-0.4.4.32-debian13</InformationalVersion>
+    <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../SafeCode.Core/SafeCode.Core.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <Compile Include="../Shared/DesktopKeyAccess.cs" Link="Shared/DesktopKeyAccess.cs" />
+    <Compile Include="../Shared/GatewayDiagnostic.cs" Link="Shared/GatewayDiagnostic.cs" />
+    <Compile Include="../SafeCode.Desktop/ClientServices.cs" Link="Shared/ClientServices.cs" />
+    <Compile Include="../SafeCode.Desktop/DiagnosticTrace.cs" Link="Shared/DiagnosticTrace.cs" />
+    <Compile Include="../SafeCode.Desktop/ReleaseNumber.cs" Link="Shared/ReleaseNumber.cs" />
+    <Compile Include="../SafeCode.Desktop/ConnectionErrors.cs" Link="Shared/ConnectionErrors.cs" />
+  </ItemGroup>
+</Project>
