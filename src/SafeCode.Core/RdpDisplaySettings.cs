@@ -371,6 +371,8 @@ public static class RdpLaunchBuilder
             "/clipboard:direction-to:all",
             "+fonts",
             "/network:auto",
+            "/gfx",
+            "+rfx",
             "/t:" + windowTitle
         ];
 
@@ -451,7 +453,13 @@ public static class RdpLaunchBuilder
         if (!(macOsOverride ?? OperatingSystem.IsMacOS()))
             return;
 
-        // Official SDL3 macOS input & windowing hints (verified against SDL3 SDL_hints.h):
+        // Official SDL3 macOS input & windowing hints (verified against SDL3 SDL_hints.h
+        // and FreeRDP 3.33.1 client/SDL/SDL3/sdl_freerdp.cpp — never set hints that FreeRDP
+        // checks with `if (!SDL_SetHint(...)) return -1;`, such as SDL_TRACKPAD_IS_TOUCH_ONLY
+        // or SDL_TOUCH_MOUSE_EVENTS):
+        // - Disable renderer vsync so Metal CAMetalLayer nextDrawable never starves FreeRDP's
+        //   main SDL event loop during bursts of dirty-rect updates.
+        environment["SDL_RENDER_VSYNC"] = "0";
         // - Disable Press-and-Hold accent popup so holding keys repeats normally in editors/terminals.
         environment["SDL_MAC_PRESS_AND_HOLD"] = "0";
         // - Treat both Option keys as Alt for Linux shortcuts without macOS diacritic composition.

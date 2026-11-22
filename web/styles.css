@@ -398,7 +398,7 @@ html.web-host:not(.native-client) .window.wide{width:min(920px,calc(100vw - 32px
 .web-host .window>.titlebar:not(:has(#developer-preview,#title-update-notice:not([hidden]))){display:none}
 html.web-host .window>.screen,
 html.web-host .window>.workspace{height:auto;flex:1;min-height:0}
-html.web-host:not(.native-client) .window>.screen{overflow-y:auto}
+html.web-host .window>.screen{overflow-y:auto}
 
 .desktop-card .maintenance-card-trigger{padding-bottom:30px}
 .desktop-card .resolution-link:disabled{opacity:.55;cursor:wait}
