@@ -2,6 +2,9 @@
 """Safe Code 独立 IPv4 出入口策略。仅管理专用 nft 表与自己的默认路由首选源。"""
 import contextlib,fcntl,functools,ipaddress,json,os,re,secrets,shlex,subprocess,sys,time
 from pathlib import Path
+for _sbin in ['/usr/local/sbin','/usr/local/bin','/usr/sbin','/usr/bin','/sbin','/bin']:
+    if _sbin not in os.environ.get('PATH','').split(':'):
+        os.environ['PATH']=(os.environ.get('PATH','')+':'+_sbin).lstrip(':')
 ROOT=Path('/var/lib/safe-code')
 TABLE='safe_code_ip'
 MARKER='Safe Code managed'

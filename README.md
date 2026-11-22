@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <b>一个安装包，把 Ubuntu VPS 配成顺手的开发环境</b>
+  <b>一个安装包，把 Debian 13 VPS 配成顺手的开发环境</b>
 </p>
 
 <p align="center">

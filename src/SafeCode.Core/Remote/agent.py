@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
-"""Safe Code Ubuntu 部署端。仅由客户端显式请求运行；不包含服务凭据。"""
-import base64,contextlib,fcntl,hashlib,ipaddress,json,os,pwd,re,secrets,shlex,shutil,subprocess,sys,time,tempfile
+"""Safe Code Debian 13 部署端。仅由客户端显式请求运行；不包含服务凭据。"""
+import base64,contextlib,fcntl,hashlib,ipaddress,json,os,pwd,re,secrets,shlex,shutil,socket,subprocess,sys,time,tempfile,urllib.request
+import xml.etree.ElementTree as ET
 from pathlib import Path
+for _sbin in ['/usr/local/sbin','/usr/local/bin','/usr/sbin','/usr/bin','/sbin','/bin']:
+    if _sbin not in os.environ.get('PATH','').split(':'):
+        os.environ['PATH']=(os.environ.get('PATH','')+':'+_sbin).lstrip(':')
 STATE=Path('/var/lib/safe-code')
 SECRETS_PATH=Path('/etc/davfs2/secrets')
 REDACTIONS=[]
@@ -21,6 +25,83 @@ def error_code(error):
 
 LONG_OPERATIONS={'account','localization','desktop','chrome','input','claude','ssh','cloud','mount_install'}
 TASKS=['account','localization','desktop','chrome','input','claude','ssh']
+VALID_DESKTOP_SCALES=(100,150,200)
+DESKTOP_SCALE_PROFILES={
+    100:{'window_scaling':1,'xft_dpi':96,'xrdb_dpi':96,'cursor_size':24,'qt_scale':'1','gdk_scale':1,'chrome_exec':'google-chrome-stable'},
+    150:{'window_scaling':1,'xft_dpi':144,'xrdb_dpi':144,'cursor_size':36,'qt_scale':'1.5','gdk_scale':1,'chrome_exec':'google-chrome-stable --force-device-scale-factor=1.5'},
+    # Keep Xft.dpi=96 alongside WindowScalingFactor=2 / GDK_SCALE=2 so toolkits do not double-scale (2x * 2x = 4x).
+    200:{'window_scaling':2,'xft_dpi':96,'xrdb_dpi':96,'cursor_size':48,'qt_scale':'2','gdk_scale':2,'chrome_exec':'google-chrome-stable --force-device-scale-factor=2'},
+}
+
+def _parse_xfconf_xml(text):
+    normalized=re.sub(r'<\?xml\s+version="1\.1"','<?xml version="1.0"',text,count=1)
+    return ET.fromstring(normalized)
+
+def _merge_xfconf_xml(existing_text,channel_name,updates):
+    root=None
+    if existing_text:
+        try:
+            parsed=_parse_xfconf_xml(existing_text)
+            if parsed.tag=='channel' and parsed.get('name')==channel_name:
+                root=parsed
+        except Exception:
+            root=None
+    if root is None:
+        root=ET.Element('channel',{'name':channel_name,'version':'1.0'})
+    for path_parts,prop_type,value in updates:
+        parent=root
+        for segment in path_parts[:-1]:
+            found=None
+            for child in parent.findall('property'):
+                if child.get('name')==segment:
+                    found=child
+                    break
+            if found is None:
+                found=ET.SubElement(parent,'property',{'name':segment,'type':'empty'})
+            parent=found
+        leaf_name=path_parts[-1]
+        leaf=None
+        for child in parent.findall('property'):
+            if child.get('name')==leaf_name:
+                leaf=child
+                break
+        if leaf is None:
+            leaf=ET.SubElement(parent,'property',{'name':leaf_name})
+        leaf.attrib.clear()
+        leaf.set('name',leaf_name)
+        leaf.set('type',prop_type)
+        leaf.set('value',str(value))
+    if hasattr(ET,'indent'):
+        ET.indent(root,space='  ')
+    return '<?xml version="1.0" encoding="UTF-8"?>\n'+ET.tostring(root,encoding='unicode')+'\n'
+
+def read_desktop_scale():
+    path=STATE/'desktop-scale.json'
+    try:
+        if path.exists():
+            data=json.loads(path.read_text())
+            value=data.get('scale') if isinstance(data,dict) else None
+            if isinstance(value,int) and not isinstance(value,bool) and value in VALID_DESKTOP_SCALES:
+                return value
+    except Exception:
+        pass
+    try:
+        cfg=read_config()
+        if cfg and cfg.get('username'):
+            entry=pwd.getpwnam(cfg['username'])
+            xs=Path(entry.pw_dir)/'.config/xfce4/xfconf/xfce-perchannel-xml/xsettings.xml'
+            if xs.exists():
+                root=_parse_xfconf_xml(xs.read_text())
+                wsf=root.find("./property[@name='Gdk']/property[@name='WindowScalingFactor']")
+                if wsf is not None and wsf.get('value')=='2':
+                    return 200
+                dpi=root.find("./property[@name='Xft']/property[@name='DPI']")
+                if dpi is not None and dpi.get('value')=='144':
+                    return 150
+    except Exception:
+        pass
+    return 100
+
 def os_info():
     data={}
     for line in Path('/etc/os-release').read_text().splitlines():
@@ -28,10 +109,16 @@ def os_info():
             k,v=line.split('=',1);data[k]=v.strip('"')
     return data
 
-def require_ubuntu():
+def is_debian_13(info):
+    if info.get('ID')!='debian':return False
+    ver=info.get('VERSION_ID','').strip()
+    if ver=='13' or ver.startswith('13.'):return True
+    return not ver and info.get('VERSION_CODENAME','').strip()=='trixie'
+
+def require_debian_13():
     info=os_info()
-    if info.get('ID')!='ubuntu':
-        raise RuntimeError('无法安装环境：仅支持 Ubuntu，当前系统为 '+info.get('PRETTY_NAME','未知系统'))
+    if not is_debian_13(info):
+        raise RuntimeError('无法安装环境：仅支持 Debian 13，当前系统为 '+info.get('PRETTY_NAME','未知系统'))
     return info
 
 def result(value):
@@ -486,6 +573,20 @@ def version(path):
         return line if code==0 else ''
     finally:process.stdout.close()
 
+def read_system_locale():
+    for path in [Path('/etc/locale.conf'),Path('/etc/default/locale')]:
+        if path.exists():
+            match=re.search(r'(?m)^LANG="?([^\s"]+)',path.read_text())
+            if match:return match[1]
+    return ''
+
+def locale_generated(locale):
+    if not locale:return False
+    norm=lambda s:re.sub(r'[^a-z0-9]','',s.lower())
+    target=norm(locale)
+    out=run(['locale','-a'],False).stdout
+    return any(norm(line.strip())==target for line in out.splitlines())
+
 def inspect():
     info=os_info();a=read_config() if os.geteuid()==0 else None
     account_ok=bool(a and run(['id',a['username']],False).returncode==0)
@@ -493,11 +594,12 @@ def inspect():
     xrdp=Path('/etc/xrdp/xrdp.ini')
     loopback=xrdp.exists() and 'port=tcp://127.0.0.1:3389' in xrdp.read_text()
     locale_state=STATE/'localization.json'
+    system_locale=read_system_locale()
     localized=False
     if locale_state.exists():
         desired=json.loads(locale_state.read_text())
         timezone=run(['timedatectl','show','-p','Timezone','--value'],False).stdout.strip()
-        localized=timezone==desired.get('timezone') and Path('/etc/default/locale').exists() and desired.get('locale','') in Path('/etc/default/locale').read_text() and all(package_installed(p) for p in locale_packages(desired.get('locale','')))
+        localized=timezone==desired.get('timezone') and system_locale==desired.get('locale','') and locale_generated(desired.get('locale','')) and all(package_installed(p) for p in locale_packages(desired.get('locale',''),desired.get('timezone','')))
     pub=user_read('.ssh/authorized_keys') if account_ok else ''
     statuses={
       'account':account_ok and bool(a.get('hostname')) and a['hostname']==os.uname().nodename,
@@ -519,16 +621,45 @@ def inspect():
     if policy and shutil.which('nft'):
         import network
         healthy=network.healthy(policy)
-    language=Path('/etc/default/locale').read_text() if Path('/etc/default/locale').exists() else ''
-    match=re.search(r'(?m)^LANG="?([^\s"]+)',language)
-    return {'osId':info.get('ID',''),'osName':info.get('PRETTY_NAME',''),'osVersion':info.get('VERSION_ID',''),
+    os_version=info.get('VERSION_ID','').strip() or ('13' if info.get('VERSION_CODENAME','').strip()=='trixie' else '')
+    herdr_ver=version(h/'.local/bin/herdr')
+    return {'osId':info.get('ID',''),'osName':info.get('PRETTY_NAME',''),'osVersion':os_version,
       'architecture':os.uname().machine,'memoryBytes':mem,'diskFreeBytes':disk.free,'cpuCount':os.cpu_count(),
       'hostname':os.uname().nodename, 'homeDirectory':str(h), 'isRoot':os.geteuid()==0,'username':a['username'] if account_ok else '', 'statuses':statuses,
       'assignedIps':addresses,'timezone':run(['timedatectl','show','-p','Timezone','--value'],False).stdout.strip(),
-      'systemLocale':match[1] if match else '', 'ipPolicyHealthy':healthy,
-      'claudeVersion':version(h/'.local/bin/claude'),'desktopReady':statuses['desktop'],
+      'systemLocale':system_locale, 'ipPolicyHealthy':healthy,
+      'claudeVersion':version(h/'.local/bin/claude'),
+      'herdrVersion':herdr_ver,'herdrReady':bool(herdr_ver),
+      'desktopReady':statuses['desktop'],'desktopScale':read_desktop_scale(),
       'cloudReady':active('safe-code-cloudcli'),'mountReady':package_installed('davfs2'),
       'ipPolicy':policy,'activeJobs':active_jobs() if os.geteuid()==0 else []}
+
+def resolve_fish():
+    return shutil.which('fish') or '/usr/bin/fish'
+
+def ensure_fish():
+    apt(['fish'])
+    fish_bin=resolve_fish()
+    a=read_config()
+    if not a:return fish_bin
+    entry=pwd.getpwnam(a['username'])
+    if Path(fish_bin).exists() and entry.pw_shell!=fish_bin:
+        run(['usermod','-s',fish_bin,a['username']])
+    locale='en_US.UTF-8'
+    if (STATE/'localization.json').exists():
+        locale=json.loads((STATE/'localization.json').read_text()).get('locale') or locale
+    elif read_system_locale():
+        locale=read_system_locale()
+    fish_conf=(
+        'set -g fish_greeting ""\n'
+        'set -gx LANG '+locale+'\n'
+        'fish_add_path -g -p "$HOME/.local/bin" /opt/safe-code/node/bin\n'
+        'if command -q starship\n'
+        '    starship init fish | source\n'
+        'end\n'
+    )
+    user_write('.config/fish/conf.d/safe-code.fish',fish_conf,0o644)
+    return fish_bin
 
 def setup_account(options):
     existing=read_config()
@@ -556,20 +687,25 @@ def setup_account(options):
             except Exception as error:
                 if password:raise RuntimeError('工作用户密码已更新，但账户记录保存失败。请使用刚设置的新工作密码；服务器登录账户密码未修改。修复配置目录权限或磁盘空间后，可重新应用账户设置。') from error
                 raise
+            ensure_fish()
             log('工作账户设置已应用。');return
     if run(['id',user],False).returncode==0:raise RuntimeError('此用户已存在，拒绝覆盖其密码。请选择新工作用户名。')
     if existing and Path('/etc/systemd/system/safe-code-cloudcli.service').exists():
         run(['systemctl','disable','--now','safe-code-cloudcli'])
         log('旧工作用户的 CloudCLI 已停止；可为新用户重新安装。')
+    apt(['fish'])
+    fish_bin=resolve_fish()
+    login_shell=fish_bin if Path(fish_bin).exists() else '/bin/bash'
     password=password or secrets.token_urlsafe(20)
     run(['hostnamectl','set-hostname',hostname])
-    run(['useradd','-m','-s','/bin/bash',user])
+    run(['useradd','-m','-s',login_shell,user])
     run(['chpasswd'],stdin=user+':'+password+'\n')
     try:write(STATE/'account.json',json.dumps({'username':user,'password':password,'hostname':hostname}),0o600)
     except Exception as error:raise RuntimeError('工作用户已创建并设置密码，但账户记录保存失败。请保留刚设置的工作用户名和密码，通过服务器控制台检查配置目录权限或磁盘空间；服务器登录账户密码未修改。') from error
     user_write('workspace/.keep','')
+    ensure_fish()
     if package_installed('xfce4-session'):setup_xsession()
-    log('工作账户、机器名称与项目目录已创建。')
+    log('工作账户、机器名称与项目目录已创建（默认启用 fish shell）。')
 
 def list_directories(options):
     a=account();entry=pwd.getpwnam(a['username'])
@@ -605,34 +741,203 @@ def create_directory(options):
     if not Path(parent).is_absolute() or '..' in Path(parent).parts or not target.is_relative_to(home()):raise RuntimeError('请在工作用户主目录内新建文件夹。')
     return json.loads(user_files('mkdir',str(target.relative_to(home()))).stdout)
 
-def locale_packages(locale):
+def locale_packages(locale,timezone=''):
     language=locale.split('_',1)[0]
     if not re.fullmatch('[a-z]{2}',language):raise RuntimeError('系统语言无效。')
-    if language=='zh':language='zh-hant' if locale.startswith(('zh_TW','zh_HK','zh_MO')) else 'zh-hans'
-    return ['language-pack-'+language,'language-pack-gnome-'+language]
+    pkgs=['locales','tzdata','fonts-noto-cjk']
+    if timezone=='Asia/Seoul':pkgs.append('fonts-nanum')
+    return pkgs
 
 def setup_locale(options):
-    account()
-    timezone=options.get('timezone','');locale=options.get('locale','')
+    a=account()
+    timezone=options.get('timezone','');locale=options.get('locale','') or 'en_US.UTF-8'
     if not timezone or '..' in timezone or not (Path('/usr/share/zoneinfo')/timezone).is_file():raise RuntimeError('请选择有效的 IANA 时区。')
     if not re.fullmatch('[a-z]{2}_[A-Z]{2}\\.UTF-8',locale):raise RuntimeError('请选择有效的 UTF-8 系统语言。')
-    apt(['locales','tzdata']+locale_packages(locale))
+    apt(locale_packages(locale,timezone))
     supported=Path('/usr/share/i18n/SUPPORTED').read_text()
-    if locale+' UTF-8' not in supported:raise RuntimeError('Ubuntu 不支持此 Locale。')
+    entry=locale+' UTF-8'
+    if entry not in supported:raise RuntimeError('Debian 13 不支持此 Locale。')
+    gen_path=Path('/etc/locale.gen')
+    gen_text=gen_path.read_text() if gen_path.exists() else ''
+    if not re.search(r'(?m)^[ \t]*'+re.escape(entry)+r'[ \t]*$',gen_text):
+        updated,count=re.subn(r'(?m)^#[ \t]*'+re.escape(entry)+r'[ \t]*$',entry,gen_text,count=1)
+        if count==0:updated=gen_text.rstrip()+('\n' if gen_text.strip() else '')+entry+'\n'
+        elif not updated.endswith('\n'):updated+='\n'
+        write(gen_path,updated)
     log('设置时区：'+timezone);run(['timedatectl','set-timezone',timezone])
-    log('生成语言环境：'+locale);stream(['locale-gen',locale]);run(['update-locale','LANG='+locale])
+    log('生成语言环境：'+locale);stream(['locale-gen']);run(['update-locale','LANG='+locale])
+    if Path('/etc/default/locale').exists() and not Path('/etc/default/locale').is_symlink():
+        run(['update-locale','--locale-file=/etc/default/locale','LANG='+locale],False)
     write(STATE/'localization.json',json.dumps({'timezone':timezone,'locale':locale}),0o600)
+    user_files('append_unique','.profile',content='export LANG='+locale,mode=0o644)
+    user_files('append_unique','.bashrc',content='export LANG='+locale,mode=0o644)
+    user_files('append_unique','.bashrc',content="alias ll='ls -alF'",mode=0o644)
+    ensure_fish()
+    if shutil.which('xdg-user-dirs-update'):
+        run(['runuser','-u',a['username'],'--','env','-i','HOME='+str(home()),'PATH=/usr/bin:/bin','LANG='+locale,'LC_ALL='+locale,'xdg-user-dirs-update','--force'],False)
     setup_xsession()
 
-def setup_xsession():
-    if not read_config():return
+def resolve_xfwm4_theme(scale):
+    candidates={200:('Default-xhdpi','Default-hdpi','Default'),150:('Default-hdpi','Default-xhdpi','Default')}.get(scale,('Default',))
+    themes=Path('/usr/share/themes')
+    for name in candidates:
+        if name=='Default' or (themes/name).is_dir():
+            return name
+    return 'Default'
+
+def write_chrome_desktop(scale=None):
+    if scale is None:scale=read_desktop_scale()
+    if isinstance(scale,bool) or not isinstance(scale,int) or scale not in VALID_DESKTOP_SCALES:
+        raise RuntimeError('不支持的桌面缩放比例，仅支持 100、150 或 200。')
+    exec_cmd=DESKTOP_SCALE_PROFILES[scale]['chrome_exec']
+    # 从当前桌面环境启动，保留 Chrome 沙箱，不使用 --no-sandbox。
+    content=(
+        '[Desktop Entry]\n'
+        'Type=Application\n'
+        'Name=Chrome\n'
+        'Exec='+exec_cmd+'\n'
+        'Icon=google-chrome\n'
+        'Terminal=false\n'
+    )
+    user_write('Desktop/Chrome.desktop',content,0o755)
+    sys_desktop=Path('/usr/share/applications/google-chrome.desktop')
+    if sys_desktop.is_file():
+        factor={100:'',150:' --force-device-scale-factor=1.5',200:' --force-device-scale-factor=2'}[scale]
+        updated_lines=[]
+        for line in sys_desktop.read_text(errors='replace').splitlines():
+            if line.startswith('Exec='):
+                cleaned=re.sub(r'\s+--force-device-scale-factor=\S+','',line)
+                if factor:
+                    cleaned=re.sub(r'^(Exec=\S+)',r'\1'+factor,cleaned,count=1)
+                updated_lines.append(cleaned)
+            else:
+                updated_lines.append(line)
+        user_write('.local/share/applications/google-chrome.desktop','\n'.join(updated_lines)+'\n',0o644)
+
+def setup_xsession(scale=None):
+    try:account()
+    except RuntimeError:return
     locale='en_US.UTF-8'
-    if (STATE/'localization.json').exists():locale=json.loads((STATE/'localization.json').read_text())['locale']
-    user_write('.xsession','#!/bin/sh\nunset DBUS_SESSION_BUS_ADDRESS SESSION_MANAGER\nexec startxfce4\n',0o755)
-    user_write('.xsessionrc','export LANG='+locale+'\nexport XMODIFIERS="@im=fcitx"\nexport GTK_IM_MODULE=fcitx\nexport QT_IM_MODULE=fcitx\n')
+    if (STATE/'localization.json').exists():
+        locale=json.loads((STATE/'localization.json').read_text()).get('locale') or locale
+    if not (isinstance(scale,int) and not isinstance(scale,bool) and scale in VALID_DESKTOP_SCALES):
+        scale=read_desktop_scale()
+    profile=DESKTOP_SCALE_PROFILES[scale]
+    user_write(
+        '.xsession',
+        '#!/bin/sh\n'
+        'unset DBUS_SESSION_BUS_ADDRESS SESSION_MANAGER\n'
+        '[ -f "$HOME/.Xresources" ] && xrdb -merge "$HOME/.Xresources"\n'
+        'exec startxfce4\n',
+        0o755,
+    )
+    user_write(
+        '.xsessionrc',
+        'export LANG='+locale+'\n'
+        'export XMODIFIERS="@im=fcitx"\n'
+        'export GTK_IM_MODULE=fcitx\n'
+        'export QT_IM_MODULE=fcitx\n'
+        'export QT_AUTO_SCREEN_SCALE_FACTOR=0\n'
+        'export QT_SCALE_FACTOR='+profile['qt_scale']+'\n'
+        'export XCURSOR_SIZE='+str(profile['cursor_size'])+'\n'
+        'export GDK_SCALE='+str(profile['gdk_scale'])+'\n',
+    )
+
+def _apply_desktop_scale_live(username,profile,theme):
+    try:
+        entry=pwd.getpwnam(username)
+        if entry.pw_uid==0:return False
+        pg=run(['pgrep','-u',str(entry.pw_uid),'-x','xfce4-session'],False,timeout=10)
+        if pg.returncode!=0:return False
+        pids=[line.strip() for line in pg.stdout.splitlines() if line.strip().isdigit()]
+        applied=False
+        for pid in pids:
+            env_path=Path('/proc')/pid/'environ'
+            if not env_path.exists():continue
+            proc_env={}
+            for item in env_path.read_bytes().split(b'\x00'):
+                if b'=' in item:
+                    k,v=item.split(b'=',1)
+                    proc_env[k.decode('utf-8',errors='replace')]=v.decode('utf-8',errors='replace')
+            dbus=proc_env.get('DBUS_SESSION_BUS_ADDRESS','').strip()
+            if not dbus:continue
+            display=proc_env.get('DISPLAY','').strip() or ':10.0'
+            base_cmd=[
+                'runuser','-u',username,'--','env','-i',
+                'HOME='+entry.pw_dir,
+                'PATH=/usr/local/bin:/usr/bin:/bin',
+                'LANG=C.UTF-8',
+                'DISPLAY='+display,
+                'DBUS_SESSION_BUS_ADDRESS='+dbus,
+            ]
+            updates=[
+                ('xsettings','/Gdk/WindowScalingFactor','int',str(profile['window_scaling'])),
+                ('xsettings','/Xft/DPI','int',str(profile['xft_dpi'])),
+                ('xsettings','/Xft/Antialias','int','1'),
+                ('xsettings','/Xft/Hinting','int','1'),
+                ('xsettings','/Xft/HintStyle','string','hintslight'),
+                ('xsettings','/Xft/RGBA','string','rgb'),
+                ('xsettings','/Gtk/CursorThemeSize','int',str(profile['cursor_size'])),
+                ('xfwm4','/general/theme','string',theme),
+            ]
+            session_ok=True
+            for channel,prop,typ,val in updates:
+                r=run(base_cmd+['xfconf-query','-c',channel,'-p',prop,'-n','-t',typ,'-s',val],False,timeout=15)
+                if r.returncode!=0:
+                    session_ok=False
+                    break
+            if session_ok:
+                r=run(base_cmd+['xrdb','-merge',str(Path(entry.pw_dir)/'.Xresources')],False,timeout=15)
+                if r.returncode==0:
+                    applied=True
+                    try:
+                        run(base_cmd+['sh','-c','command -v xfce4-panel >/dev/null 2>&1 && nohup xfce4-panel -r </dev/null >/dev/null 2>&1 &'],False,timeout=10)
+                    except Exception:
+                        pass
+        return applied
+    except Exception:
+        return False
+
+def apply_desktop_scale(scale,live=True):
+    if isinstance(scale,bool) or not isinstance(scale,int) or scale not in VALID_DESKTOP_SCALES:
+        raise RuntimeError('不支持的桌面缩放比例，仅支持 100、150 或 200。')
+    a=account()
+    profile=DESKTOP_SCALE_PROFILES[scale]
+    theme=resolve_xfwm4_theme(scale)
+    write(STATE/'desktop-scale.json',json.dumps({'scale':scale}),0o600)
+    xsettings_path=home()/'.config/xfce4/xfconf/xfce-perchannel-xml/xsettings.xml'
+    xfwm4_path=home()/'.config/xfce4/xfconf/xfce-perchannel-xml/xfwm4.xml'
+    existing_xsettings=xsettings_path.read_text(errors='replace') if xsettings_path.exists() else ''
+    existing_xfwm4=xfwm4_path.read_text(errors='replace') if xfwm4_path.exists() else ''
+    xsettings_xml=_merge_xfconf_xml(existing_xsettings,'xsettings',[
+        (('Xft','DPI'),'int',profile['xft_dpi']),
+        (('Xft','Antialias'),'int',1),
+        (('Xft','Hinting'),'int',1),
+        (('Xft','HintStyle'),'string','hintslight'),
+        (('Xft','RGBA'),'string','rgb'),
+        (('Gtk','CursorThemeSize'),'int',profile['cursor_size']),
+        (('Gdk','WindowScalingFactor'),'int',profile['window_scaling']),
+    ])
+    xfwm4_xml=_merge_xfconf_xml(existing_xfwm4,'xfwm4',[
+        (('general','use_compositing'),'bool','false'),
+        (('general','theme'),'string',theme),
+    ])
+    xresources=(
+        'Xft.dpi: '+str(profile['xrdb_dpi'])+'\n'
+        'Xcursor.size: '+str(profile['cursor_size'])+'\n'
+    )
+    user_write('.config/xfce4/xfconf/xfce-perchannel-xml/xsettings.xml',xsettings_xml)
+    user_write('.config/xfce4/xfconf/xfce-perchannel-xml/xfwm4.xml',xfwm4_xml)
+    user_write('.Xresources',xresources)
+    setup_xsession(scale)
+    if (home()/'Desktop/Chrome.desktop').exists() or Path('/usr/share/applications/google-chrome.desktop').is_file():
+        write_chrome_desktop(scale)
+    applied_live=_apply_desktop_scale_live(a['username'],profile,theme) if live else False
+    log('已应用远程桌面缩放：'+str(scale)+'%'+( '（已实时刷新当前桌面）' if applied_live else '（重新登录远程桌面后完全生效）'))
+    return {'scale':scale,'appliedLive':applied_live,'server':inspect()}
 
 def setup_desktop(options):
-    account();apt(['xfce4-session','xfwm4','xfce4-panel','xfdesktop4','xfce4-settings','xfce4-terminal','thunar','dbus-x11','xrdp','xorgxrdp','xauth','x11-utils','x11-xserver-utils','xinput','xdg-user-dirs','fonts-noto-cjk'])
+    account();apt(['xfce4-session','xfwm4','xfce4-panel','xfdesktop4','xfce4-settings','xfce4-terminal','thunar','dbus-x11','libpam-systemd','ssl-cert','xrdp','xorgxrdp','xauth','x11-utils','x11-xserver-utils','xinput','xdg-user-dirs','fonts-noto-cjk'])
     config=Path('/etc/xrdp/xrdp.ini');text=config.read_text()
     new,count=re.subn(r'(?m)^port=(?:3389|tcp://[^\n]+:3389)\s*$', 'port=tcp://127.0.0.1:3389',text,count=1)
     if count!=1:raise RuntimeError('无法安全识别 xrdp 监听设置，未修改配置。')
@@ -643,15 +948,17 @@ def setup_desktop(options):
     for key,value in {'AllowRootLogin':'false','MaxSessions':'1','KillDisconnected':'false','DisconnectedTimeLimit':'0','IdleTimeLimit':'0'}.items():
         text=re.sub(r'(?m)^'+key+r'=.*$',key+'='+value,text)
     write(config,text)
-    setup_xsession();run(['usermod','-aG','ssl-cert','xrdp'])
-    user_write('.config/xfce4/xfconf/xfce-perchannel-xml/xfwm4.xml','<?xml version="1.0"?><channel name="xfwm4" version="1.0"><property name="general" type="empty"><property name="use_compositing" type="bool" value="false"/></property></channel>')
-    run(['systemctl','enable','xrdp']);run(['systemctl','restart','xrdp'])
+    run(['usermod','-aG','ssl-cert','xrdp'])
+    requested=(options or {}).get('desktopScale')
+    scale=requested if isinstance(requested,int) and not isinstance(requested,bool) and requested in VALID_DESKTOP_SCALES else read_desktop_scale()
+    apply_desktop_scale(scale,live=False)
+    run(['systemctl','enable','xrdp']);run(['systemctl','restart','xrdp-sesman'],False);run(['systemctl','restart','xrdp'])
     if not active('xrdp'):raise RuntimeError('xrdp 启动失败，请检查系统日志。')
     log('XFCE 与 xrdp 已就绪。RDP 仅监听回环地址，通过 SSH 连接。')
 
 def setup_chrome(options):
     account()
-    if os.uname().machine!='x86_64':raise RuntimeError('Google Chrome 当前仅支持本安装器的 x86_64 Ubuntu。')
+    if os.uname().machine!='x86_64':raise RuntimeError('Google Chrome 当前仅支持本安装器的 x86_64 Debian 13。')
     apt(['curl','ca-certificates','gnupg'])
     key=run(['curl','-fsSL','--retry','3','https://dl.google.com/linux/linux_signing_key.pub']).stdout
     with tempfile.TemporaryDirectory(prefix='safe-code-google-') as temporary:
@@ -660,10 +967,12 @@ def setup_chrome(options):
         keybytes=output.read_bytes()
     Path('/etc/apt/keyrings').mkdir(exist_ok=True)
     target=Path('/etc/apt/keyrings/safe-code-google.gpg');target.write_bytes(keybytes);target.chmod(0o644)
+    write('/etc/default/google-chrome','repo_add_once="false"\nrepo_reenable_on_distupgrade="false"\n')
+    Path('/etc/apt/sources.list.d/google-chrome.list').unlink(missing_ok=True)
     write('/etc/apt/sources.list.d/safe-code-google.sources','Types: deb\nURIs: https://dl.google.com/linux/chrome/deb/\nSuites: stable\nComponents: main\nArchitectures: amd64\nSigned-By: /etc/apt/keyrings/safe-code-google.gpg\n')
     apt(['google-chrome-stable'])
-    # 从当前桌面环境启动，保留 Chrome 沙箱，不使用 --no-sandbox。
-    user_write('Desktop/Chrome.desktop','[Desktop Entry]\nType=Application\nName=Chrome\nExec=google-chrome-stable\nIcon=google-chrome\nTerminal=false\n',0o755)
+    Path('/etc/apt/sources.list.d/google-chrome.list').unlink(missing_ok=True)
+    write_chrome_desktop(read_desktop_scale())
     log(version('/usr/bin/google-chrome-stable'))
 
 def setup_input(options):
@@ -673,6 +982,39 @@ def setup_input(options):
     user_write('.config/autostart/fcitx5.desktop','[Desktop Entry]\nType=Application\nName=Fcitx5\nExec=fcitx5 -d\nTerminal=false\n')
     log('拼音与中文字体已就绪，重新登录桌面后生效。')
 
+def ensure_herdr():
+    a=account();h=home()
+    fish_bin=ensure_fish()
+    herdr_bin=h/'.local/bin/herdr'
+    ver=version(herdr_bin)
+    if not ver:
+        apt(['curl','ca-certificates'])
+        installer=Path('/opt/safe-code/install-herdr.sh')
+        r=run(['curl','-fsSL','--retry','3','https://herdr.dev/install.sh'],False)
+        if r.returncode==0 and r.stdout.strip():
+            write(installer,r.stdout,0o755)
+            log('为工作用户安装 Herdr 持久终端工作台。')
+            stream(['runuser','-u',a['username'],'--','env','-i','HOME='+str(h),'PATH='+str(h/'.local/bin')+':/usr/local/bin:/usr/bin:/bin','LANG=C.UTF-8','sh',str(installer)])
+            ver=version(herdr_bin)
+    path_line='export PATH="$HOME/.local/bin:/opt/safe-code/node/bin:$PATH"'
+    user_files('append_unique','.profile',content=path_line,mode=0o644)
+    user_files('append_unique','.bashrc',content=path_line,mode=0o644)
+    if ver:
+        existing_cfg=user_read('.config/herdr/config.toml')
+        if not existing_cfg:
+            user_write('.config/herdr/config.toml','onboarding = false\n\n[terminal]\ndefault_shell = "'+fish_bin+'"\nshell_mode = "login"\nnew_cwd = "~/workspace"\n',0o644)
+        elif 'default_shell' not in existing_cfg:
+            if '[terminal]' in existing_cfg:
+                updated_cfg=existing_cfg.replace('[terminal]','[terminal]\ndefault_shell = "'+fish_bin+'"',1)
+            else:
+                updated_cfg=existing_cfg.rstrip()+'\n\n[terminal]\ndefault_shell = "'+fish_bin+'"\n'
+            user_write('.config/herdr/config.toml',updated_cfg,0o644)
+        run(['runuser','-u',a['username'],'--','env','-i','HOME='+str(h),'PATH='+str(h/'.local/bin')+':/usr/local/bin:/usr/bin:/bin','LANG=C.UTF-8',str(herdr_bin),'--session','safe-code','server','reload-config'],False)
+        if (h/'.local/bin/claude').exists():
+            run(['runuser','-u',a['username'],'--','env','-i','HOME='+str(h),'PATH='+str(h/'.local/bin')+':/usr/local/bin:/usr/bin:/bin','LANG=C.UTF-8',str(herdr_bin),'integration','install','claude'],False)
+        log('Herdr 已就绪：'+ver)
+    return ver
+
 def file_sha256(file):
     digest=hashlib.sha256()
     for block in iter(lambda:file.read(1024*1024),b''):digest.update(block)
@@ -681,7 +1023,7 @@ def file_sha256(file):
 def download_claude(target):
     import platform,socket,urllib.request,urllib.error
     target_platform={'x86_64':'linux-x64','aarch64':'linux-arm64'}.get(platform.machine())
-    if not target_platform:raise RuntimeError('Claude Code 当前仅支持 x86_64 或 ARM64 Ubuntu。')
+    if not target_platform:raise RuntimeError('Claude Code 当前仅支持 x86_64 或 ARM64 Debian 13。')
 
     class NoRedirect(urllib.request.HTTPRedirectHandler):
         def redirect_request(self,req,fp,code,msg,headers,newurl):
@@ -737,16 +1079,28 @@ def setup_claude(options):
     value=version(home()/'.local/bin/claude')
     if not value:raise RuntimeError('Claude Code 安装后未找到有效程序。')
     user_files('append_unique','.profile',content='export PATH="$HOME/.local/bin:$PATH"',mode=0o644)
+    ensure_herdr()
     log(value+'；请由本人完成 Claude 账号授权。')
 
 def setup_ssh(options):
     account();public=options.get('publicKey','').strip()
     if not re.fullmatch(r'(ssh-rsa|ssh-ed25519|ecdsa-sha2-nistp256) [A-Za-z0-9+/=]+ safe-code-[A-Za-z0-9_-]+',public):raise RuntimeError('客户端 SSH 公钥格式无效。')
     user_files('append_unique','.ssh/authorized_keys',content=public,mode=0o600)
-    user_write('.local/bin/safe-code-terminal','#!/bin/sh\ncd "$HOME/workspace"\nexec tmux new-session -A -s safe-code\n',0o755)
+    ensure_herdr()
+    terminal_script=(
+        '#!/bin/sh\n'
+        'export PATH="$HOME/.local/bin:/opt/safe-code/node/bin:$PATH"\n'
+        '[ -x /usr/bin/fish ] && export SHELL=/usr/bin/fish\n'
+        'cd "$HOME/workspace"\n'
+        'if [ -x "$HOME/.local/bin/herdr" ]; then\n'
+        '  exec "$HOME/.local/bin/herdr" --session safe-code\n'
+        'fi\n'
+        'exec tmux new-session -A -s safe-code\n'
+    )
+    user_write('.local/bin/safe-code-terminal',terminal_script,0o755)
     log('工作用户公钥已授权，原 SSH 配置及管理入口保持。')
 
-def install_mount(options):apt(['davfs2','fuse3']);log('目录挂载组件已安装。')
+def install_mount(options):apt(['davfs2','fuse3','iproute2']);log('目录挂载组件已安装。')
 
 def setup_git_identity():
     a=account();entry=pwd.getpwnam(a['username'])
@@ -806,7 +1160,7 @@ def setup_cloud(options):
     log('CloudCLI 已就绪。首次创建网页账户后可直接进入主界面，Claude 账号授权由本人完成。')
 
 def setup_cloud_public(options):
-    require_ubuntu()
+    require_debian_13()
     service_path=Path('/etc/systemd/system/safe-code-cloudcli.service')
     if not service_path.exists() or not active('safe-code-cloudcli'):
         log('正在准备 CloudCLI 基础服务…')
@@ -838,7 +1192,7 @@ def setup_cloud_public(options):
     ip=(options or {}).get('host') or (options or {}).get('ip')
     if not ip or ip in ['127.0.0.1','localhost']:
         try:
-            ip=run(['curl','--noproxy','*','-4','-fsS','--connect-timeout','4','--max-time','8','https://api.ipify.org'],False).stdout.strip()
+            ip=probe_egress_ip()
         except Exception:
             pass
     if not ip:
@@ -1566,9 +1920,20 @@ def poll_job(job,offset):
         if status not in ['active','activating'] and age>3:error='远端任务意外结束，重连后可检查实际安装状态。'
     return {'lines':lines,'nextOffset':next_offset,'done':value is not None or error is not None,'value':value,'error':error,'errorCode':failure.get('code')}
 
+def probe_egress_ip():
+    if shutil.which('curl'):
+        return run(['curl','--noproxy','*','-4','-fsS','--connect-timeout','5','--max-time','12','https://api.ipify.org']).stdout.strip()
+    old_getaddrinfo=socket.getaddrinfo
+    try:
+        socket.getaddrinfo=lambda host,port,family=0,type=0,proto=0,flags=0:old_getaddrinfo(host,port,socket.AF_INET,type,proto,flags)
+        opener=urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open('https://api.ipify.org',timeout=10) as response:
+            return response.read(64).decode('ascii').strip()
+    finally:socket.getaddrinfo=old_getaddrinfo
+
 def main():
     global JOB_DIR
-    require_ubuntu() # 必须先检查系统，再创建任何目录或写入配置。
+    require_debian_13() # 必须先检查系统，再创建任何目录或写入配置。
     if sys.argv[1]=='--list-directories':
         if os.geteuid()!=0:raise RuntimeError('需要安装管理员权限。')
         result(list_directories(json.loads(base64.b64decode(sys.argv[2]))));return
@@ -1584,7 +1949,7 @@ def main():
     op=request.get('op','inspect')
     if op=='inspect':result(inspect());return
     if op=='egress_probe':
-        value=run(['curl','--noproxy','*','-4','-fsS','--connect-timeout','5','--max-time','12','https://api.ipify.org']).stdout.strip()
+        value=probe_egress_ip()
         result({'ip':str(ipaddress.IPv4Address(value))});return
     if os.geteuid()!=0:raise RuntimeError('安装需要 root 或免密 sudo 权限。')
     if op=='account_info':result(account());return
@@ -1592,13 +1957,15 @@ def main():
     if op=='create_directory':result(create_directory(request.get('options') or {}));return
     if op=='safe_code_api':result(safe_code_api(request.get('options') or {}));return
     if op=='desktop_login_probe':
-        options=request.get('options') or {};path=Path('/var/log/xrdp-sesman.log');size=path.stat().st_size
+        options=request.get('options') or {};path=Path('/var/log/xrdp-sesman.log');size=path.stat().st_size if path.exists() else 0
         offset=options.get('offset',size)
         if not isinstance(offset,int) or offset<0 or offset>size:offset=size
-        with path.open('rb') as f:
-            f.seek(offset);lines=f.read(131072).decode('utf-8',errors='replace')
+        lines=''
+        if path.exists():
+            with path.open('rb') as f:
+                f.seek(offset);lines=f.read(131072).decode('utf-8',errors='replace')
         user=account()['username']
-        success=any(('++ created session' in line or '++ reconnected session' in line or 'Session started successfully' in line) and (user in line) for line in lines.splitlines())
+        success=any(('++ created session' in line or '++ reconnected session' in line or 'Session started successfully' in line or 'Access permitted for user' in line) and (user in line) for line in lines.splitlines())
         result({'offset':size,'loggedIn':success});return
     secure_root_directory(STATE,0o700)
     write('/etc/needrestart/conf.d/99-safe-code.conf', '$nrconf{override_rc}->{qr(^(?:ssh|xrdp(?:-sesman)?)(?:\\.service)?$)} = 0;\n')
@@ -1624,6 +1991,13 @@ def main():
         if op=='mount_apply':result(apply_mounts(options));return
         if op=='mount_recover':result(apply_mounts(options,recover=True));return
         if op=='mount_remove':result(remove_mounts(options));return
+        if op=='desktop_scale':
+            raw_scale=options.get('scale',100)
+            if isinstance(raw_scale,bool) or isinstance(raw_scale,float):
+                raise RuntimeError('不支持的桌面缩放比例，仅支持 100、150 或 200。')
+            try:scale_value=int(raw_scale)
+            except (TypeError,ValueError):raise RuntimeError('不支持的桌面缩放比例，仅支持 100、150 或 200。')
+            result(apply_desktop_scale(scale_value,live=True));return
         mapping={'account':setup_account,'localization':setup_locale,'desktop':setup_desktop,'chrome':setup_chrome,'input':setup_input,'claude':setup_claude,'ssh':setup_ssh,'mount_install':install_mount,'cloud':setup_cloud,'cloud_public':setup_cloud_public,'cloud_setup':setup_cloud_onboarding}
         if op not in mapping:raise RuntimeError('未知部署操作。')
         log('开始部署：'+op)

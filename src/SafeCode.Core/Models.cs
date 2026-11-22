@@ -29,7 +29,10 @@ public sealed class ServerInfo
     public string SystemLocale { get; set; } = "";
     public bool IpPolicyHealthy { get; set; }
     public string ClaudeVersion { get; set; } = "";
+    public string HerdrVersion { get; set; } = "";
+    public bool HerdrReady { get; set; }
     public bool DesktopReady { get; set; }
+    public int DesktopScale { get; set; } = 100;
     public bool CloudReady { get; set; }
     public bool MountReady { get; set; }
     public IpPolicySettings? IpPolicy { get; set; }
@@ -40,21 +43,21 @@ public static class DeploymentCatalog
 {
     public static readonly DeploymentStep[] Steps = [
         new("account", "更新系统并设置工作用户", "先完成系统更新，再创建开发账户和配置机器名称。"),
-        new("localization", "本土化设置", "手动选择时区与系统语言。"),
+        new("localization", "本土化设置", "手动选择时区，默认英文系统语言并保留中日韩字体。"),
         new("desktop", "安装虚拟桌面", "安装 XFCE 与 xrdp，通过加密隧道访问。"),
         new("chrome", "安装 Chrome", "使用 Google 官方软件源安装浏览器。"),
         new("input", "安装中文输入法", "安装拼音输入法与中文字体。"),
-        new("claude", "安装 Claude Code", "安装官方原生程序、Git 和 tmux。"),
-        new("ssh", "配置 SSH 安全通道", "配置工作用户密钥与持久终端会话。")
+        new("claude", "安装 Claude Code", "安装官方原生程序、Git、Herdr 和 tmux。"),
+        new("ssh", "配置 SSH 安全通道", "配置工作用户密钥与 Herdr 持久终端会话。")
     ];
     public static readonly LocaleSettings[] Locales = [
-        new("日本", "Asia/Tokyo", "ja_JP.UTF-8", "日语"),
+        new("日本", "Asia/Tokyo", "en_US.UTF-8", "英语"),
         new("美国 · 洛杉矶", "America/Los_Angeles", "en_US.UTF-8", "英语"),
         new("美国 · 纽约", "America/New_York", "en_US.UTF-8", "英语"),
-        new("新加坡", "Asia/Singapore", "en_SG.UTF-8", "英语"),
-        new("英国", "Europe/London", "en_GB.UTF-8", "英语"),
-        new("德国", "Europe/Berlin", "de_DE.UTF-8", "德语"),
-        new("韩国", "Asia/Seoul", "ko_KR.UTF-8", "韩语")
+        new("新加坡", "Asia/Singapore", "en_US.UTF-8", "英语"),
+        new("英国", "Europe/London", "en_US.UTF-8", "英语"),
+        new("德国", "Europe/Berlin", "en_US.UTF-8", "英语"),
+        new("韩国", "Asia/Seoul", "en_US.UTF-8", "英语")
     ];
     public static LocaleSettings? FindLocale(string region) => region switch
     {

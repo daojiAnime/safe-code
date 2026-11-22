@@ -86,7 +86,7 @@ class Installation(unittest.TestCase):
                     self.assertEqual(source.stat().st_mode&0o777,0o444)
                     self.assertEqual(source.parent.stat().st_mode&0o777,0o755)
                 else:self.assertEqual((action,path),('append_unique','.profile'))
-            with patch.object(a,'account'),patch.object(a,'apt'),patch.object(a,'log'),patch.object(a,'home',return_value=Path(workspace)),patch.object(a,'version',return_value='2.1.311'),patch.object(a.tempfile,'TemporaryDirectory',return_value=Mock(__enter__=Mock(return_value=staging),__exit__=Mock())),patch.object(a,'download_claude',side_effect=fetch) as download,patch.object(a,'user_files',side_effect=user_files) as install:
+            with patch.object(a,'account'),patch.object(a,'apt'),patch.object(a,'log'),patch.object(a,'ensure_herdr'),patch.object(a,'home',return_value=Path(workspace)),patch.object(a,'version',return_value='2.1.311'),patch.object(a.tempfile,'TemporaryDirectory',return_value=Mock(__enter__=Mock(return_value=staging),__exit__=Mock())),patch.object(a,'download_claude',side_effect=fetch) as download,patch.object(a,'user_files',side_effect=user_files) as install:
                 a.setup_claude({'claudePayload':'/tmp/unapproved'})
             download.assert_called_once_with(Path(staging)/'claude')
             self.assertEqual(install.call_count,2)

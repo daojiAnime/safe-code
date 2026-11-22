@@ -149,7 +149,7 @@ public sealed partial class SshSession
             {
                 await replacement.ConnectAsync(ct);
                 using var check=replacement.CreateCommand("cat /etc/os-release");check.CommandTimeout=TimeSpan.FromSeconds(10);await check.ExecuteAsync(ct);
-                if(!ParseOsRelease(check.Result).TryGetValue("ID",out var id)||id!="ubuntu")throw new UnsupportedOsException("恢复目标不再是 Ubuntu，已停止挂载恢复。");
+                if(!IsSupportedDebian13(ParseOsRelease(check.Result)))throw new UnsupportedOsException("恢复目标不再是 Debian 13，已停止挂载恢复。");
                 using var create=replacement.CreateCommand("mktemp -d /tmp/safe-code.XXXXXXXX");create.CommandTimeout=TimeSpan.FromSeconds(10);await create.ExecuteAsync(ct);string restoredDirectory=create.Result.Trim();
                 if(!restoredDirectory.StartsWith("/tmp/safe-code."))throw new IOException("无法恢复管理通道。");
                 using var sftp=MakeSftp();await sftp.ConnectAsync(ct);

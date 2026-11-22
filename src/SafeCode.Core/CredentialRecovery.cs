@@ -24,7 +24,7 @@ public sealed partial class SshSession
                     {
                         await replacement.ConnectAsync(ct);
                         using var check=replacement.CreateCommand("cat /etc/os-release");check.CommandTimeout=TimeSpan.FromSeconds(10);await check.ExecuteAsync(ct);
-                        if(check.ExitStatus!=0||!ParseOsRelease(check.Result).TryGetValue("ID",out var id)||id!="ubuntu")throw new UnsupportedOsException("恢复目标未通过 Ubuntu 检查，原连接未替换。");
+                        if(check.ExitStatus!=0||!IsSupportedDebian13(ParseOsRelease(check.Result)))throw new UnsupportedOsException("恢复目标未通过 Debian 13 检查，原连接未替换。");
                         using var privilege=replacement.CreateCommand(prefix.Length>0?"sudo -n true":"test $(id -u) = 0");privilege.CommandTimeout=TimeSpan.FromSeconds(10);await privilege.ExecuteAsync(ct);
                         if(privilege.ExitStatus!=0)throw new InvalidOperationException("该账户的安装权限已变化，未替换原连接。");
                         using var create=replacement.CreateCommand("mktemp -d /tmp/safe-code.XXXXXXXX");create.CommandTimeout=TimeSpan.FromSeconds(10);await create.ExecuteAsync(ct);

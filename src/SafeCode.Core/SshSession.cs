@@ -66,10 +66,11 @@ public sealed partial class SshSession : IDisposable
             Log?.Invoke("SSH 认证成功，检查操作系统…");
             string osRelease;
             try{osRelease=await ExecuteTextAsync("cat /etc/os-release", cancellationToken);}
-            catch(InvalidOperationException){throw new UnsupportedOsException("无法安装环境：未能识别为 Ubuntu，请确认系统类型并检查连接；未写入部署文件。");}
+            catch(InvalidOperationException){throw new UnsupportedOsException("无法安装环境：未能识别为 Debian 13，请确认系统类型并检查连接；未写入部署文件。");}
             Log?.Invoke("操作系统信息已读取。");
-            if (!ParseOsRelease(osRelease).TryGetValue("ID", out var id) || id != "ubuntu")
-                throw new UnsupportedOsException("无法安装环境：本软件仅支持 Ubuntu。当前服务器未通过系统检查，未写入任何部署文件。");
+            var osInfo = ParseOsRelease(osRelease);
+            if (!IsSupportedDebian13(osInfo))
+                throw new UnsupportedOsException("无法安装环境：本软件仅支持 Debian 13（当前为 " + osInfo.GetValueOrDefault("PRETTY_NAME", "未知系统") + "）。当前服务器未通过系统检查，未写入任何部署文件。");
             string uid = (await ExecuteTextAsync("id -u", cancellationToken)).Trim();
             if (uid != "0")
             {
@@ -77,10 +78,15 @@ public sealed partial class SshSession : IDisposable
                 catch(InvalidOperationException){throw new InvalidOperationException("此账户没有免密 sudo 安装权限，请使用 root 或配置免密 sudo 后重新连接。");}
                 prefix = "sudo -n ";
             }
+            if ((await ExecuteTextAsync("command -v python3 >/dev/null 2>&1 && printf yes || true", cancellationToken)).Trim() != "yes")
+            {
+                Log?.Invoke("未检测到 Python 3，正在安装基础运行环境…");
+                await ExecuteTextAsync(prefix + "env DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=180 update && " + prefix + "env DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=180 -y --no-install-recommends install python3", cancellationToken);
+            }
             remoteDirectory = (await ExecuteTextAsync("mktemp -d /tmp/safe-code.XXXXXXXX", cancellationToken)).Trim();
             Log?.Invoke("准备远端部署模块…");
             using var sftp = MakeSftp(); await sftp.ConnectAsync(cancellationToken);
-            using var agent = Assembly.GetExecutingAssembly().GetManifestResourceStream("SafeCode.Core.Remote.agent.py") ?? throw new FileNotFoundException("缺少 Ubuntu 部署模块。");
+            using var agent = Assembly.GetExecutingAssembly().GetManifestResourceStream("SafeCode.Core.Remote.agent.py") ?? throw new FileNotFoundException("缺少 Debian 13 部署模块。");
             await sftp.UploadFileAsync(agent, remoteDirectory + "/agent.py",cancellationToken); sftp.ChangePermissions(remoteDirectory + "/agent.py", 600);
             using var network = Assembly.GetExecutingAssembly().GetManifestResourceStream("SafeCode.Core.Remote.network.py")!;
             await sftp.UploadFileAsync(network, remoteDirectory + "/network.py",cancellationToken); sftp.ChangePermissions(remoteDirectory + "/network.py", 600);
@@ -97,6 +103,13 @@ public sealed partial class SshSession : IDisposable
         catch { DisposeMountResource(client); client = null;if(trustRequired!=null)throw trustRequired;throw; }
     }
     public static Dictionary<string,string> ParseOsRelease(string input) => input.Split('\n').Where(x => x.Contains('=')).Select(x => x.Split('=', 2)).ToDictionary(x => x[0].Trim(), x => x[1].Trim().Trim('"'));
+    public static bool IsSupportedDebian13(IReadOnlyDictionary<string, string> os)
+    {
+        if (!os.TryGetValue("ID", out var id) || id != "debian") return false;
+        if (os.TryGetValue("VERSION_ID", out var ver) && !string.IsNullOrWhiteSpace(ver))
+            return ver == "13" || ver.StartsWith("13.", StringComparison.Ordinal);
+        return os.TryGetValue("VERSION_CODENAME", out var codename) && codename == "trixie";
+    }
     private bool VerifyOrConfirm(ConnectionSettings settings, string fingerprint, Func<HostKeyInfo,bool> confirm)
     {
         var store=new HostTrustStore(dataDirectory);var key=store.Describe(settings.Host,settings.Port,fingerprint);

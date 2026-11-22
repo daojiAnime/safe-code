@@ -15,7 +15,7 @@ with sync_playwright() as p:
     page.route('**/*',route)
     page.add_init_script('''
       window.__safeCodeDesktop=true;window.__safeCodeAcceptance=true;window.ipCalls=[];window.allCalls=[];window.remembered='8.8.8.8';
-      window.serverFixture={osId:'ubuntu',osVersion:'24.04',assignedIps:['8.8.8.8','1.1.1.1'],observedEgressIp:'1.1.1.1',ipPolicyHealthy:true,statuses:{},ipPolicy:{ingressIp:'8.8.8.8',egressIp:'1.1.1.1',lockIngress:true,lockEgress:true}};
+      window.serverFixture={osId:'debian',osVersion:'13',assignedIps:['8.8.8.8','1.1.1.1'],observedEgressIp:'1.1.1.1',ipPolicyHealthy:true,statuses:{},ipPolicy:{ingressIp:'8.8.8.8',egressIp:'1.1.1.1',lockIngress:true,lockEgress:true}};
       window.finishIp=()=>{const message=window.ipCalls.at(-1);window.serverFixture.ipPolicy=message.args;window.remembered=message.args.ingressIp;window.safeCodeNativeResponse({id:message.id,result:window.serverFixture});};
       window.chrome={webview:{postMessage(message){
         window.allCalls.push(message.op);let result=null;
