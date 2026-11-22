@@ -94,6 +94,7 @@ internal static class MacSelfTest
             using var sdlCfg=JsonDocument.Parse(File.ReadAllText(sdlConfigPath));
             var mask=sdlCfg.RootElement.GetProperty("SDL_KeyModMask");
             if(mask.GetArrayLength()!=1||mask[0].GetString()!="SDL_KMOD_NONE")throw new Exception("sdl-freerdp 热键屏蔽配置异常。");
+            if(!sdlCfg.RootElement.GetProperty("UseLocalMouseScrollDirection").GetBoolean())throw new Exception("sdl-freerdp 未启用本机滚轮方向配置。");
             if(env["SDL_MAC_PRESS_AND_HOLD"]!="0"||env["SDL_MAC_OPTION_AS_ALT"]!="both"||env["SDL_MAC_CTRL_CLICK_EMULATE_RIGHT_CLICK"]!="0"||env["SDL_MAC_SCROLL_MOMENTUM"]!="0"||env["SDL_MOUSE_FOCUS_CLICKTHROUGH"]!="1"||env["SDL_VIDEO_MAC_FULLSCREEN_SPACES"]!="1"||env["SDL_VIDEO_MAC_FULLSCREEN_MENU_VISIBILITY"]!="1"||env["SDL_VIDEO_MINIMIZE_ON_FOCUS_LOSS"]!="0")throw new Exception("macOS SDL3 输入优化环境变量缺失。");
         }
         finally{if(Directory.Exists(tempDir))Directory.Delete(tempDir,true);}

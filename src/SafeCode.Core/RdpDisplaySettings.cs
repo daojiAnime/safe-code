@@ -427,10 +427,10 @@ public static class RdpLaunchBuilder
         string freerdpDir = Path.Combine(xdgConfigHome, "freerdp");
         Directory.CreateDirectory(freerdpDir);
         string configPath = Path.Combine(freerdpDir, "sdl-freerdp.json");
-        // FreeRDP 3 SDL3 defaults SDL_KeyModMask to KMOD_RSHIFT, causing Right Shift + D/M/R/G/Enter
-        // to disconnect, minimize, or toggle window state while typing uppercase letters.
-        // Setting SDL_KMOD_NONE cleanly disables SDL client hotkey hijacking with zero warnings.
-        const string content = "{\n  \"SDL_KeyModMask\": [\"SDL_KMOD_NONE\"]\n}\n";
+        // FreeRDP 3 SDL3 defaults SDL_KeyModMask to KMOD_RSHIFT (causing Right Shift + D/M/R/G/Enter
+        // to disconnect or manipulate the window while typing) and defaults UseLocalMouseScrollDirection
+        // to false (FreeRDP >= 3.28 / PR #12967), which inverts macOS natural/Mos scroll direction.
+        const string content = "{\n  \"SDL_KeyModMask\": [\"SDL_KMOD_NONE\"],\n  \"UseLocalMouseScrollDirection\": true\n}\n";
         if (!File.Exists(configPath) || File.ReadAllText(configPath) != content)
         {
             string tempPath = configPath + ".new";
