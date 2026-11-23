@@ -219,37 +219,30 @@
 #claude-desktop-start[hidden],#claude-desktop-stop[hidden],#claude-desktop-open[hidden],#claude-desktop-install[hidden]{display:none!important}
 @media(max-width:520px){.claude-desktop-card{align-items:flex-start;gap:10px}}
 
-/* Connection details and live resource readings share the same left edge. */
+/* Connection details and live resource readings share the same inner content edges. */
 .connected-header .connection-card{
-  --card-columns:.65fr 1fr 1.15fr;
+  --card-columns:minmax(0,.72fr) minmax(0,1fr) minmax(0,1.08fr);
   --card-column-gap:10px;
-  --ip-label-space:47px;
   --ip-eye-width:23px;
-  --ip-eye-indent:calc(5.5 * var(--type-small) - 11.5px);
+  padding:13px 14px 9px;
   align-items:stretch;
   text-align:left;
-  container-type:inline-size;
-}
-/* Split the unused right edge of the last track evenly, keeping every column aligned. */
-.connection-card :is(.ip-addresses,.connection-details-row,.server-resources>div){
-  --last-column-width:calc((100cqi - 2 * var(--card-column-gap)) * 1.15 / 2.8);
-  transform:translateX(max(0px,calc((var(--last-column-width) - var(--ip-eye-indent) - var(--ip-eye-width)) / 2)));
 }
 .connection-card .ip-addresses{max-width:none;margin:2px 0 6px}
-.connection-card .ip-address-row{display:grid;grid-template-columns:var(--card-columns);column-gap:var(--card-column-gap);align-items:center}
-.connection-card .ip-address-label{grid-column:1;grid-row:1}
-.connection-card .ip-address-value{grid-column:1/span 2;grid-row:1;margin-left:var(--ip-label-space);width:calc(100% - var(--ip-label-space) + var(--ip-eye-indent))}
-.connection-card .ip-eye.reveal{grid-column:3;grid-row:1;justify-self:start;width:var(--ip-eye-width);margin-left:var(--ip-eye-indent)}
-.connection-details-row{display:grid;grid-template-columns:var(--card-columns);align-items:center;column-gap:var(--card-column-gap);width:100%;margin-top:auto}
-.connected-header .connection-card .server-metadata{grid-column:1/span 2;margin:0;width:auto;min-width:0;text-align:left;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.connection-details-row .credential-entry{grid-column:3;justify-self:start;margin:0;white-space:nowrap;font-size:var(--type-small)}
+.connection-card .ip-address-row{display:grid;grid-template-columns:auto minmax(0,1fr) 17px;column-gap:8px;align-items:center}
+.connection-card .ip-address-label{grid-column:1;grid-row:1;min-width:39px}
+.connection-card .ip-address-value{grid-column:2;grid-row:1;margin:0;width:auto}
+.connection-card .ip-eye.reveal{grid-column:3;grid-row:1;justify-self:center;width:var(--ip-eye-width);margin:0 -3px}
+.connection-details-row{display:grid;grid-template-columns:minmax(0,1fr) max-content;align-items:center;column-gap:var(--card-column-gap);width:100%;margin-top:auto}
+.connected-header .connection-card .server-metadata{grid-column:1;margin:0;width:auto;min-width:0;text-align:left;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.connection-details-row .credential-entry{grid-column:2;justify-self:end;margin:0;white-space:nowrap;font-size:var(--type-small)}
 .server-resources{display:grid;grid-template-columns:var(--card-columns);gap:var(--card-column-gap);width:100%;margin:2px 0 8px;padding-top:7px;border-top:1px solid #e8ede6}
 .server-resources>div{display:flex;flex-direction:column;min-width:0;gap:1px;line-height:1.4}
 .server-resources dt{font-size:var(--type-small);color:#8e9c91}
 .server-resources dd{margin:0;min-width:0;font-size:var(--type-small);color:#536b5b;font-variant-numeric:tabular-nums;white-space:nowrap}
 #advanced-dialog .advanced-dialog-actions{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}
 #advanced-dialog .advanced-dialog-actions button{width:100%;min-width:0;padding:0 6px}
-@media(max-width:650px){.connected-header .connection-card{--card-column-gap:5px;--ip-label-space:40px}.server-resources dd{font-size:var(--type-small)}}
+@media(max-width:650px){.connected-header .connection-card{--card-column-gap:6px;padding:12px 10px 9px}.connection-card .ip-address-row{column-gap:6px}.connection-card .ip-address-label{min-width:34px}.server-resources dd{font-size:var(--type-small)}}
 
 .environment-rating{display:flex;align-items:center;justify-content:center;gap:12px;margin-top:8px;padding-top:8px;border-top:1px solid #e8ede6;font-size:var(--type-small);line-height:1.5;color:#657d6b}
 .environment-rating>strong{color:#8e9c91;font-size:var(--type-small);font-weight:500;white-space:nowrap}
@@ -378,10 +371,6 @@ html.native-dialog-window dialog.native-dialog-front:not(#client-window){
 .workspace :is(.advanced-copy p,.server-metadata,.ip-address-label,.metric-label){color:#677b6d}
 .workspace-bottom>span,.workspace-bottom-actions>button{color:#687c6f}
 .macos-client .claude-desktop-content .bridge-check small,.macos-client .claude-desktop-content .bridge-check{color:#66786d}
-
-.connection-details-row{grid-template-columns:minmax(0,1fr) max-content;transform:none;padding-inline:10px}
-.connected-header .connection-card .server-metadata{grid-column:1}
-.connection-details-row .credential-entry{grid-column:2}
 
 /* Keep secondary text legible across the shared dialogs and forms. */
 dialog :is(.config-description,.dialog-hint,.account-description,.bridge-check small,.host-risk small),
