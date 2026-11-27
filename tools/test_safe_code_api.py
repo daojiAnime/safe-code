@@ -6,6 +6,7 @@ import errno
 import hashlib
 import hmac
 import http.client
+import http.server
 import importlib.util
 import io
 import json
@@ -27,7 +28,7 @@ from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT/'tools/desktop-api'), str(ROOT/'src/SafeCode.Core/Remote')]
-from claude_usage import UsageUnavailable, read_subscription
+from claude_usage import UsageUnavailable, query_usage, read_subscription
 from desktop_gateway import GatewayError
 from management import KeyRegistry, RequestQueue, send_admin
 from pricing import estimate
@@ -56,6 +57,9 @@ def decode_new_ticket(ticket):
 
 class SafeCodeApiTest(unittest.TestCase):
     def setUp(self):
+        activation = patch.object(server, "ACTIVATION_CODE_SHA256", hashlib.sha256(b"Fixture-activation").digest())
+        activation.start()
+        self.addCleanup(activation.stop)
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
@@ -65,12 +69,150 @@ class SafeCodeApiTest(unittest.TestCase):
             (self.root/'keys'/key).touch()
         self.registry = KeyRegistry(self.root)
 
+    def test_desktop_history_stays_with_the_original_key_and_verified_machine(self):
+        first, second, _ = self.digests
+        self.assertEqual(self.registry.desktop_history_device(first, 'macos', 'machine-a', 'pair-a'), 'pair-a')
+        self.assertEqual(self.registry.desktop_history_device(second, 'macos', 'machine-a', 'pair-b'), 'pair-b')
+        self.assertEqual(self.registry.desktop_history_device(first, 'macos', 'machine-b', 'pair-c'), 'pair-c')
+        registry = KeyRegistry(self.root)
+        self.assertEqual(registry.desktop_history_device(first, 'macos', 'machine-a', 'pair-d'), 'pair-a')
+        self.assertEqual(registry.desktop_history_device(second, 'macos', 'machine-a', 'pair-e'), 'pair-b')
+        self.assertEqual(registry.desktop_history_device(first, 'macos', None, 'pair-f'), 'pair-f')
+
+    def test_developer_policy_is_disabled_by_default_and_clears_raw_on_disable(self):
+        first, second, _ = self.digests
+        self.assertEqual(self.registry.desktop_policy(first), (False, False))
+        with self.assertRaisesRegex(ValueError, '开发者模式'):
+            self.registry.update(first, '', 0, raw_messages=True)
+        self.registry.update(first, '', 0, developer_mode=True, raw_messages=True)
+        self.assertEqual(self.registry.desktop_policy(first), (True, True))
+        self.assertEqual(self.registry.desktop_policy(second), (False, False))
+        self.registry.update(first, '', 0, developer_mode=False)
+        self.registry.update(first, '', 0, developer_mode=True)
+        self.assertEqual(self.registry.desktop_policy(first), (True, False))
+
+    def test_multi_gateway_routes_only_explicit_admin_actions(self):
+        gateway = object.__new__(server.PublicServer)
+        gateway.root = self.root
+        target = 'a' * 32
+        gateway.directory = server.GatewayDirectory(self.root, gateway.manage, lambda: True)
+        with patch.object(server, 'installed_directory', return_value=None):
+            self.assertEqual(gateway.manage_bound_gateway({'action':'multi.list'}, 'multi.list')['status'], 401)
+        for request in ({'action':'multi.create', 'gateway_target':target},
+                        {'action':'issue', 'gateway_target':'https://example.test'},
+                        {'action':'set_origin', 'gateway_target':target}):
+            with self.assertRaises(ValueError):
+                gateway.manage_bound_gateway(request, request['action'])
+        request = {'action':'list', 'gateway_target':target, 'details':True}
+        reply = {'value':{'keys':[]}}
+        with patch.object(Path, 'is_socket', return_value=True), patch.object(server, 'send_admin', return_value=reply) as call:
+            self.assertEqual(gateway.manage_bound_gateway(request, 'list'), reply['value'])
+            self.assertEqual(json.loads(call.call_args.args[1]), request)
+            self.assertEqual(call.call_args.kwargs['socket_name'], 'multi-gateway.sock')
+            call.return_value = {'error':'Remote binding is not authorized.', 'status':403}
+            with self.assertRaisesRegex(ValueError, 'Remote binding is not authorized'):
+                gateway.manage_bound_gateway(request, 'list')
+
+    def test_project_bindings_are_issued_and_edited_per_key(self):
+        public = object.__new__(server.PublicServer)
+        public.root = self.root
+        public.registry = self.registry
+        public.lock = threading.RLock()
+        public.queue = server.RequestQueue(public.registry)
+        public.config = {'cloudcli': {'desktopQuestions': {'username': 'fixture', 'password': 'fixture'}}}
+        public.devices = server.Devices(self.root)
+        (self.root/server.PUBLIC_ENABLED).touch()
+        (self.root/server.PUBLIC_ORIGIN).write_text('https://fixture.example')
+        project = self.root/'Project'
+        project.mkdir()
+        project_id = 'a0f16de2-1919-4d82-b924-fab039267773'
+        entry = {'project_id': project_id, 'name': 'Project', 'path': str(project.resolve())}
+        binding = {'project_id': project_id, 'directory': '/Users/example/Project'}
+        public.catalog_backend = unittest.mock.Mock()
+        public.catalog_backend.managed_projects.return_value = [entry]
+        with (patch.object(server, 'make_key', return_value=('fixture-ticket', self.digests[2])),
+              patch.object(server, 'device_service_problem', return_value=None)):
+            issued = public.manage({'action': 'issue', 'activation_code': 'Fixture-activation', 'project_bindings': [binding]})
+        self.assertEqual(issued['id'], self.digests[2])
+        self.assertEqual(self.registry.project_bindings(issued['id']), [{**entry, **binding}])
+        self.assertEqual(self.registry.project_bindings(self.digests[0]), [])
+        self.assertNotIn('project_bindings', self.registry.list()[0])
+        updated = public.manage({'action': 'update', 'id': self.digests[0], 'project_bindings': [binding]})
+        self.assertEqual(self.registry.project_bindings(updated['id']), [{**entry, **binding}])
+        with self.assertRaisesRegex(ValueError, '重复'):
+            public.manage({'action': 'update', 'id': updated['id'], 'project_bindings': [binding, binding]})
+        public.manage({'action': 'update', 'id': updated['id'], 'note': 'Rename'})
+        self.assertEqual(self.registry.project_bindings(updated['id']), [{**entry, **binding}])
+        public.manage({'action': 'update', 'id': updated['id'], 'project_bindings': []})
+        self.assertEqual(self.registry.project_bindings(updated['id']), [])
+        self.assertEqual(self.registry.project_bindings(issued['id']), [{**entry, **binding}])
+
+    def test_turn_footer_uses_key_ledger_and_cached_windows_only(self):
+        gateway = object.__new__(server.PublicServer)
+        gateway.registry = self.registry
+        gateway.subscription = {'windows': {}}
+        gateway.subscription_path = self.root/'snapshot'
+        digest, other = self.digests[:2]
+        self.registry.update(digest, '', 0, budget_nanos=1_000_000_000)
+        model = 'claude-sonnet-5-5'
+        usage = {'input_tokens': 40_000}
+        with patch.object(server, 'read_subscription', side_effect=AssertionError('Unexpected quota probe')):
+            sample = {'sampled_at': 100, 'windows': {'five_hour': {'used': 25}, 'seven_day': {'used': 9}}}
+            gateway.remember_subscription(sample)
+            gateway.remember_subscription({**sample, 'sampled_at': 50, 'windows': {'five_hour': {'used': 100}}})
+            self.assertEqual(json.loads(gateway.subscription_path.read_text()), gateway.subscription)
+            self.registry.record(other, model, False, usage)
+            self.assertEqual(gateway.account_footer(digest, model, usage),
+                             ('Key 余额 $0.9200', '账户额度（上次查询） · 5 小时剩余 75% · 7 天剩余 91%'))
+            self.registry.record(digest, model, False, usage)
+            self.assertEqual(self.registry.balance(digest)['remaining_nanos'], 920_000_000)
+            self.assertEqual(gateway.account_footer(other, model, usage)[0], 'Key 余额 不限额')
+            gateway.remember_subscription({'sampled_at': 101, 'windows': {'five_hour': {'used': 0, 'resets_at': 1}}})
+            self.assertIn('5 小时暂无记录 · 7 天暂无记录', gateway.account_footer(digest, model, {})[1])
+
     def wait_for(self, predicate):
         start=time.monotonic()
         while not predicate():
             if time.monotonic()-start>2:
                 self.fail('timed out')
             time.sleep(0.01)
+
+    def test_key_queue_waits_a_full_minute_after_owner_last_request(self):
+        first, second = self.digests[:2]
+        queue = RequestQueue(self.registry, concurrency=0, key_mode=True)
+        clock = [100.0]
+        admitted = threading.Event()
+        canceled = threading.Event()
+
+        def wait_for_next():
+            with queue.slot(second, canceled.is_set):
+                admitted.set()
+
+        with patch('management.time', SimpleNamespace(monotonic=lambda: clock[0], time=time.time)), ThreadPoolExecutor(1) as pool:
+            try:
+                with queue.slot(first):
+                    request = pool.submit(wait_for_next)
+                    self.wait_for(lambda: queue.snapshot()[1] == {second: 1})
+                    with queue.slot(first):
+                        self.assertEqual(queue.snapshot()[0], {first: 2})
+                    clock[0] += 9
+                    self.assertFalse(admitted.is_set())
+                self.assertEqual(queue.key_status()['release_in'], 60)
+                clock[0] += 59
+                queue.wake()
+                self.assertFalse(admitted.is_set())
+                self.assertEqual(queue.key_status()['release_in'], 1)
+                with queue.slot(first):
+                    self.assertFalse(admitted.is_set())
+                self.assertEqual(queue.key_status()['release_in'], 60)
+                clock[0] += 60
+                queue.wake()
+                request.result(timeout=2)
+                self.assertTrue(admitted.is_set())
+                self.assertEqual(queue.key_status()['key_id'], second)
+            finally:
+                canceled.set()
+                queue.wake()
 
     def test_official_rates_and_historical_migration(self):
         self.assertEqual(estimate('claude-opus-5-5[1m]', [1_000_000]*4, one_hour_writes=500_000),
@@ -81,17 +223,24 @@ class SafeCodeApiTest(unittest.TestCase):
         path = self.root/'legacy'
         path.mkdir()
         (path/'keys').mkdir()
+        (path/'keys'/self.digests[0]).touch()
         with sqlite3.connect(path/'gateway.sqlite3') as db:
             db.executescript('''
+                CREATE TABLE keys (id TEXT PRIMARY KEY,note TEXT NOT NULL DEFAULT '',rpm INTEGER NOT NULL DEFAULT 0,
+                    created INTEGER NOT NULL,revoked INTEGER NOT NULL DEFAULT 0,budget_nanos INTEGER);
                 CREATE TABLE usage (key_id TEXT,model TEXT,requests INTEGER,failures INTEGER,
                     input INTEGER,output INTEGER,cache_read INTEGER,cache_write INTEGER,last_used INTEGER,
                     PRIMARY KEY(key_id,model));
             ''')
+            db.execute('INSERT INTO keys(id,note,created) VALUES(?,?,0)', (self.digests[0], '原有密钥'))
             db.execute('INSERT INTO usage VALUES (?,?,1,0,100,10,20,40,0)',
                        (self.digests[0], 'claude-sonnet-5'))
         for _ in range(2):
             registry = KeyRegistry(path)
             self.assertEqual(registry.usage(self.digests[0])[0]['cost_nanos'], 404_000)
+            legacy, = registry.list()
+            self.assertEqual((legacy['note'], legacy['expires_at'], legacy['allowed_models']), ('原有密钥', None, None))
+            self.assertTrue(registry.enabled(legacy['id']))
 
     def test_legacy_keys_usage_and_revoke(self):
         first, second, _ = self.digests
@@ -151,6 +300,29 @@ class SafeCodeApiTest(unittest.TestCase):
         self.assertEqual(queue.snapshot(), ({}, {}, 1))
         with self.assertRaises(ConnectionAbortedError):
             with queue.slot(second,lambda:True):pass
+        self.assertEqual(queue.snapshot(), ({}, {}, 1))
+
+    def test_default_queue_has_no_automatic_wait_deadline(self):
+        first, second, _ = self.digests
+        queue = RequestQueue(self.registry)
+        admitted = threading.Event()
+        waiting = threading.Event()
+        clock = 1000
+
+        def wait_slot():
+            with queue.slot(second, on_wait=waiting.set):
+                admitted.set()
+
+        with patch('management.time.monotonic', side_effect=lambda: clock):
+            with queue.slot(first):
+                thread = threading.Thread(target=wait_slot)
+                thread.start()
+                self.assertTrue(waiting.wait(2))
+                clock += 3600
+                queue.wake()
+                self.assertFalse(admitted.wait(.1))
+            thread.join(2)
+        self.assertTrue(admitted.is_set())
         self.assertEqual(queue.snapshot(), ({}, {}, 1))
 
     def test_resize_admits_queued_requests_and_drains_active_requests(self):
@@ -313,6 +485,48 @@ class SafeCodeApiTest(unittest.TestCase):
                 server.open_public_server(self.root, saved)
             listen.assert_called_once()
 
+    def test_usage_trust_prompt_redraw_stays_with_the_probe_workspace(self):
+        workspace = str(self.root)
+        menu = '❯ No, exit\n  Yes, I trust this folder\n'
+        yes = '❯ Yes, I trust this folder\n'
+        header = 'Accessing workspace:\n' + workspace + '\n'
+        for case in ('redraw', 'no-path', 'different-folder', 'unexpected-dialog', 'third-confirmation'):
+            probe, screen = socket.socketpair()
+            with self.subTest(case=case), probe, screen:
+                screen.settimeout(2)
+                with ThreadPoolExecutor(1) as pool:
+                    result = pool.submit(query_usage, probe.fileno(), time.monotonic() + 4, workspace)
+
+                    def frame(text, expected):
+                        screen.sendall(text.encode())
+                        self.assertEqual(screen.recv(len(expected), socket.MSG_WAITALL), expected)
+
+                    try:
+                        if case != 'no-path':
+                            frame(header + menu, b'\x1b[B')
+                            frame(yes, b'\r')
+                        if case in ('redraw', 'third-confirmation'):
+                            frame(menu, b'\x1b[B')
+                            frame(yes, b'\r')
+                        if case == 'redraw':
+                            frame('❯ Try asking a question\n', b'/usage')
+                            frame('/usage  Show plan usage and limits\n', b'\r')
+                            screen.sendall(b'Current session\n42% used\nCurrent week\n81% remaining\n')
+                            self.assertEqual(result.result(), {'five_hour': {'used': 42}, 'seven_day': {'used': 19}})
+                        else:
+                            second = {'no-path': menu, 'third-confirmation': menu,
+                                      'different-folder': 'Accessing workspace:\n' + workspace + '-other\n' + menu,
+                                      'unexpected-dialog': 'Confirm another operation\n' + yes}[case]
+                            screen.sendall(second.encode())
+                            screen.shutdown(socket.SHUT_WR)
+                            with self.assertRaises(UsageUnavailable):
+                                result.result()
+                            screen.setblocking(False)
+                            with self.assertRaises(BlockingIOError):
+                                screen.recv(1)
+                    finally:
+                        screen.shutdown(socket.SHUT_WR)
+
     def test_claude_usage_reads_interactive_slash_command_only(self):
         cli = self.root/'.local/bin/claude'
         cli.parent.mkdir(parents=True)
@@ -378,7 +592,7 @@ if sys.stdin.buffer.read(1) == b'\r':
                 if start_fails:
                     raise RuntimeError('simulated service start failure')
                 return SimpleNamespace(stdout='')
-            return SimpleNamespace(stdout='true\n')
+            return SimpleNamespace(stdout='true\n', returncode=0)
 
         with (patch.object(agent, 'STATE', self.root),
               patch.object(agent, 'API_DIRECTORY', app),
@@ -414,6 +628,85 @@ if sys.stdin.buffer.read(1) == b'\r':
             self.assertEqual((self.root/'legacy-key-data').read_text(), 'fixture')
             self.assertEqual((app/'server.py').read_bytes(), b'fixture')
             self.assertTrue(unit.is_file())
+
+    def test_repair_uses_ssh_agent_instead_of_gateway_admin_socket(self):
+        app = self.root/'desktop-api'
+        app.mkdir()
+        script = app/'server.py'
+        script.touch()
+        entry = SimpleNamespace(pw_uid=1000, pw_name='fixture', pw_dir=str(self.root))
+        files = {name: base64.b64encode(b'x' * 8192).decode() for name in agent.API_FILES}
+        work_python = ['runuser', '-u', entry.pw_name, '--', 'env', '-i', 'HOME='+entry.pw_dir,
+                       'PATH=/usr/bin:/bin', 'LANG=C.UTF-8', '/usr/bin/python3']
+        command = [*work_python, '-B', str(script), '--state', str(self.root/agent.API_STATE)]
+        with (patch.object(agent, 'API_DIRECTORY', app),
+              patch.object(agent, 'account', return_value={'username': entry.pw_name}),
+              patch.object(agent.pwd, 'getpwnam', return_value=entry),
+              patch.object(agent, 'repair_safe_code_api', return_value={'enabled': True}) as repair,
+              patch.object(agent, 'safe_code_api_admin') as admin):
+            options = {'action': 'repair', 'accepted': True, 'files': files, 'reinstallCloudCLI': True}
+            self.assertEqual(agent.safe_code_api(options), {'enabled': True})
+            repair.assert_called_once_with(entry, command, options, work_python)
+
+            script.unlink()
+            repair.reset_mock()
+            options = {**options, 'reinstallCloudCLI': False}
+            self.assertEqual(agent.safe_code_api(options), {'enabled': True})
+            repair.assert_called_once_with(entry, command, options, work_python)
+            admin.assert_not_called()
+
+    def test_repair_only_returns_a_verified_web_login_through_the_foreground_agent(self):
+        account = {'username': 'fixture-web', 'password': 'fixture password'}
+        requests = []
+
+        class LoginHandler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_POST(self):
+                supplied = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+                requests.append((self.path, supplied))
+                accepted = self.path == '/api/auth/login' and supplied == account
+                self.send_response(200 if accepted else 401)
+                self.end_headers()
+                self.wfile.write(b'{"token":"fixture.payload.signature"}' if accepted else b'{}')
+
+        with http.server.HTTPServer(('127.0.0.1', 0), LoginHandler) as cloudcli:
+            thread = threading.Thread(target=cloudcli.serve_forever, daemon=True)
+            thread.start()
+            try:
+                port = cloudcli.server_port
+                path = self.root/'.config/safe-code/cloudcli-gateway.json'
+                path.parent.mkdir(parents=True)
+                config = {'apiKey': 'fixture-key-01234567', 'port': port, 'projectPath': str(self.root),
+                          'models': ['claude-haiku-4-5'], 'desktopQuestions': account}
+
+                def save_config(questions, mode=0o600):
+                    path.write_text(json.dumps({**config, 'desktopQuestions': questions}))
+                    path.chmod(mode)
+
+                with (patch.dict(os.environ, {'HOME': str(self.root)}),
+                      patch.object(agent, 'API_DIRECTORY', ROOT/'src/SafeCode.Core/Remote')):
+                    save_config(account)
+                    self.assertEqual(agent.repaired_cloudcli_login([sys.executable], port),
+                                     {'state': 'verified', **account})
+                    self.assertEqual(requests, [('/api/auth/login', account)])
+                    save_config({**account, 'password': 'old fixture password'})
+                    self.assertEqual(agent.repaired_cloudcli_login([sys.executable], port), {'state': 'unverified'})
+                    save_config({'tokenFile': '/run/cloudcli/fixture-token'})
+                    self.assertEqual(agent.repaired_cloudcli_login([sys.executable], port), {'state': 'unavailable'})
+                    save_config(account, mode=0o644)
+                    self.assertEqual(agent.repaired_cloudcli_login([sys.executable], port), {'state': 'unavailable'})
+                    save_config(account)
+                    self.assertEqual(agent.repaired_cloudcli_login([sys.executable], (port % 65535) + 1),
+                                     {'state': 'unavailable'})
+                    with patch.object(agent, 'JOB_DIR', self.root):
+                        with self.assertRaises(ValueError):
+                            agent.repaired_cloudcli_login([sys.executable], port)
+                    self.assertEqual(len(requests), 2)
+            finally:
+                cloudcli.shutdown()
+                thread.join()
 
     def test_gateway_provisions_verified_node_without_cloudcli(self):
         node_root = self.root/'node'
@@ -511,13 +804,14 @@ if sys.stdin.buffer.read(1) == b'\r':
             worker.join(3)
         self.assertEqual(totals, [11])
 
+    @patch.object(server, 'device_service_problem', return_value=None)
     @patch.object(server, 'load_cloudcli_config', return_value={'fixture': True})
-    def test_activation_is_required_after_the_first_active_key(self, _):
+    def test_activation_is_required_after_the_first_active_key(self, _config, _device_service):
         openssl = ['openssl', 'req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '1', '-subj', '/CN=fixture']
         subprocess.run([*openssl, '-keyout', self.root/'key.pem', '-out', self.root/'cert.pem'], check=True, capture_output=True)
         for digest in self.digests[:2]:
             self.registry.revoke(digest)
-        with server.PublicServer(self.root, {'bind':'127.0.0.1','port':0,'publicOrigin':'https://fixture.example'}) as public:
+        with server.PublicServer(self.root, {'bind':'127.0.0.1','port':0,'deviceFrpPort':45300,'publicOrigin':'https://fixture.example'}) as public:
             public.manage({'action':'enable_public','accepted':True})
             self.assertFalse(public.manage({'action':'list'})['activation_required'])
 
@@ -532,27 +826,28 @@ if sys.stdin.buffer.read(1) == b'\r':
                 issued = [key for key in pool.map(lambda _: free_issue(), range(2)) if key]
             self.assertEqual(len(issued), 1)
             self.assertTrue(public.manage({'action':'list'})['activation_required'])
-            for invalid in ('', 'wrong', 'agentom', 123):
+            for invalid in ('', 'wrong', 'fixture-activation', 123):
                 with self.assertRaisesRegex(ValueError, '激活码'):
                     public.manage({'action':'issue','activation_code':invalid})
             destination = self.root/'unissued.key'
             with self.assertRaisesRegex(ValueError, '激活码'):
                 server.issue(self.root, 'https://fixture.example', destination)
             self.assertFalse(destination.exists())
-            second = public.manage({'action':'issue','activation_code':'Agentom'})['id']
+            second = public.manage({'action':'issue','activation_code':'Fixture-activation'})['id']
             self.assertEqual({row['id'] for row in self.registry.list() if row['enabled']}, {issued[0], second})
             public.manage({'action':'revoke','id':second})
             public.manage({'action':'revoke','id':issued[0]})
             self.assertFalse(public.manage({'action':'list'})['activation_required'])
             self.assertIsNotNone(free_issue())
 
+    @patch.object(server, 'device_service_problem', return_value=None)
     @patch.object(server, 'load_cloudcli_config', return_value={'fixture': True})
-    def test_local_admin_and_public_api_boundary(self, _):
+    def test_local_admin_and_public_api_boundary(self, _config, _device_service):
         subprocess.run(['openssl','req','-x509','-newkey','rsa:2048',
                         '-nodes','-days','1','-subj','/CN=fixture','-keyout',self.root/'key.pem',
                         '-out',self.root/'cert.pem'],check=True,capture_output=True)
         with server.PublicServer(self.root,{'bind':'127.0.0.1','port':0,
-                                           'publicOrigin':'https://fixture.example'}) as public:
+                                           'deviceFrpPort':45300,'publicOrigin':'https://fixture.example'}) as public:
             fake=server.PublicManager(self.root,{'instance':'fixture'},require_cloudcli=False)
             fake.catalog=lambda: {'data':[{'id':'claude-test'}]}
             def model(data, **options):
@@ -560,26 +855,41 @@ if sys.stdin.buffer.read(1) == b'\r':
                 fake.record_result('turn',{'input_tokens':7,'output_tokens':2})
                 return {'model':'claude-test','usage':{'input_tokens':7,'output_tokens':2}}
             fake.run=model
-            public.account=lambda *_:fake
+            public.account=lambda *args, **kwargs: fake
             with socketserver.UnixStreamServer(str(self.root/'admin.sock'),server.AdminHandler) as admin:
                 admin.manage=public.manage
                 for endpoint in (public,admin):
                     threading.Thread(target=endpoint.serve_forever,daemon=True).start()
                     self.addCleanup(endpoint.shutdown)
 
+                desktop_headers = {'X-SafeCode-Client': 'safecode-desktop'}
+                bindings = {}
+                public.owner_hosts.home = self.root
+                client = 'a'*20
+                tunnel = self.root/'.ssh/safe-code-host'/client
+                tunnel.mkdir(parents=True)
+                (tunnel/'config').write_text(f'# Safe Code host bridge {client}\nHost fixture\n  HostName 127.0.0.1\n  Port 45300\n')
+                (tunnel/'identity.pub').write_text('ssh-ed25519 fixture')
+
+                def pair(token):
+                    owner = hashlib.sha256(token.encode()).hexdigest()
+                    binding = public.owner_hosts.bind(owner, client, 'Fixture device')
+                    bindings[token] = {'X-SafeCode-Device':binding['deviceId'], 'X-SafeCode-Device-Proof':binding['deviceProof']}
+
                 def admin_request(action, **args):
                     return send_admin(self.root,json.dumps({'action':action,**args}).encode())
 
                 def manage(action, **args):
                     if action == 'issue':
-                        args.setdefault('activation_code', 'Agentom')
+                        args.setdefault('activation_code', 'Fixture-activation')
                     return admin_request(action, **args)['value']
 
-                def request(method, path, key=None, body=None):
+                def request(method, path, key=None, body=None, extra_headers=None):
                     conn=http.client.HTTPSConnection('127.0.0.1',public.server_port,
                                                      context=ssl._create_unverified_context(),timeout=3)
                     try:
-                        conn.request(method,path,body,{'Authorization':'Bearer '+key} if key else {})
+                        headers = {'Authorization': 'Bearer '+key} if key else {}
+                        conn.request(method, path, body, {**headers, **(extra_headers or {})})
                         response=conn.getresponse()
                         return response.status,response.read()
                     finally:
@@ -612,6 +922,12 @@ if sys.stdin.buffer.read(1) == b'\r':
                     self.assertEqual(manage('public_status', runtime=True)['subscription'], value)
                     lookup.assert_called_once()
                 self.assertEqual(runtime['concurrency'], 0)
+                self.assertFalse(manage('list')['key_queue']['enabled'])
+                self.assertIn('error', admin_request('set_key_queue', enabled='true'))
+                self.assertTrue(manage('set_key_queue', enabled=True)['enabled'])
+                with server.PublicServer(self.root,{'bind':'127.0.0.1','port':0}) as queued:
+                    self.assertTrue(queued.manage({'action':'list'})['key_queue']['enabled'])
+                self.assertFalse(manage('set_key_queue', enabled=False)['enabled'])
                 with ExitStack() as slots:
                     for _ in range(35):
                         slots.enter_context(public.queue.slot(legacy_id))
@@ -640,7 +956,14 @@ if sys.stdin.buffer.read(1) == b'\r':
                 with server.PublicServer(self.root,{'bind':'127.0.0.1','port':0}) as reopened:
                     self.assertEqual(reopened.manage({'action':'public_status'}), {'enabled':True, 'backend':'cloudcli', 'gatewayRevision':server.GATEWAY_REVISION})
                     self.assertEqual(reopened.manage({'action':'list'})['concurrency'], 2)
-                self.assertEqual(request('GET','/v1/cloudcli/models',legacy_key)[0],200)
+                self.assertEqual(request('GET','/v1/cloudcli/models',legacy_key)[0],403)
+                self.assertEqual(request('GET','/v1/cloudcli/models',legacy_key,extra_headers=desktop_headers)[0],200)
+                for path in ('/v1/messages', '/v1/cloudcli/messages', counter_path, '/v1/cloudcli/messages/count_tokens'):
+                    for headers in ({}, desktop_headers, {**desktop_headers, 'X-SafeCode-Device':'ssh-'+'a'*20}):
+                        status, body = request('POST', path, legacy_key, '{}', headers)
+                        self.assertEqual((status, json.loads(body)['error']['code']), (403, 'device_pairing_required'))
+                self.assertEqual(request('POST','/v1/device-control',legacy_key,'{"action":"capability"}')[0],403)
+                pair(legacy_key)
 
                 settings = manage('settings')
                 self.assertEqual(settings, {'bind': '127.0.0.1', 'port': public.server_port,
@@ -652,20 +975,35 @@ if sys.stdin.buffer.read(1) == b'\r':
                 self.assertEqual(manage('settings')['publicIp'], '8.8.8.8')
 
                 def post(path, key=None, body=True):
-                    return request('POST',path,key,json.dumps({'model':'claude-test'}) if body else None)
+                    return request('POST', path, key, json.dumps({'model':'claude-test'}) if body else None,
+                                   {**desktop_headers, **bindings.get(key, {})})
 
                 created=manage('issue',note='设备一',rpm=1)
                 ticket_payload = decode_new_ticket(created['ticket'])
                 self.assertEqual(ticket_payload['url'], 'https://fixture.example')
                 key=ticket_payload['key']
                 self.assertEqual(hashlib.sha256(key.encode()).hexdigest(),created['id'])
+                status, body = request('POST', '/v1/messages')
+                self.assertEqual((status, json.loads(body)['error']['type']), (401, 'authentication_error'))
+                device_headers = {**desktop_headers, 'X-SafeCode-Device': 'ssh-'+'a'*20, 'X-SafeCode-Device-Proof': 'fixture'}
+                for failure, status_code, kind, code in (
+                        (server.DeviceOffline('private address'), 503, 'api_error', 'device_offline'),
+                        (server.DeviceError('private proof'), 403, 'permission_error', 'device_pairing_rejected')):
+                    with patch.object(public.owner_hosts, 'chat_binding', side_effect=failure):
+                        status, body = request('POST', '/v1/messages', key, extra_headers=device_headers)
+                    error = json.loads(body)['error']
+                    self.assertEqual((status, error['type'], error['code']), (status_code, kind, code))
+                    self.assertNotIn('private', error['message'])
                 self.assertEqual(post('/admin',key,False)[0],404)
                 self.assertEqual(request('GET','/v1/key/balance')[0],401)
-                status, balance = request('GET','/v1/key/balance',key)
+                self.assertEqual(request('GET','/v1/key/balance',key)[0],403)
+                status, balance = request('GET','/v1/key/balance',key,extra_headers=desktop_headers)
                 self.assertEqual(status,200)
-                self.assertEqual(json.loads(balance),{'budget_nanos':None,'used_nanos':0,'remaining_nanos':None})
+                self.assertEqual(json.loads(balance),{'budget_nanos':None,'used_nanos':0,'remaining_nanos':None,'models':[]})
                 self.assertEqual(request('GET','/v1/key/balance?id='+created['id'],legacy_key)[0],404)
                 self.assertNotIn(key,json.dumps(manage('list')))
+                self.assertEqual(post('/v1/cloudcli/messages',key)[0],403)
+                pair(key)
                 self.assertEqual(post('/v1/cloudcli/messages',key)[0],200)
                 self.assertEqual(post('/v1/messages',key)[0],429)
                 details=manage('usage',id=created['id'])
@@ -692,7 +1030,21 @@ if sys.stdin.buffer.read(1) == b'\r':
                 self.assertNotIn('analytics', manage('list', details=True, analytics=['1h']))
                 self.assertIn('请先撤销', admin_request('delete', id=created['id'])['error'])
                 self.assertEqual(manage('usage', id=created['id']), details)
-                manage('revoke',id=created['id'])
+                owner = created['id']
+                ssh_devices = self.root/'ssh-devices'
+                ssh_devices.mkdir(exist_ok=True)
+                device_id = 'ssh-'+'a'*20
+                self.assertIn('error', admin_request('unbind', id=owner, deviceId='ssh-'+'b'*20))
+                self.assertEqual(manage('unbind', id=owner, deviceId=device_id), {'id':owner})
+                self.assertEqual(manage('unbind', id=owner, deviceId=device_id), {'id':owner})
+                self.assertFalse((ssh_devices/(owner+'-'+device_id)).exists())
+                bindings.pop(key)
+                self.assertEqual(post('/v1/messages',key)[0],403)
+                self.assertEqual(request('GET','/v1/key/balance',key,extra_headers=desktop_headers)[0],200)
+                manage('revoke',id=owner)
+                status, response = request('POST','/v1/device-control',key,json.dumps({'action':'revoke'}),desktop_headers)
+                self.assertEqual((status,json.loads(response)),(200,{'revoked':True}))
+                self.assertEqual(request('POST','/v1/device-control',key,json.dumps({'action':'prepare'}),desktop_headers)[0],401)
                 self.assertEqual(manage('usage', id=created['id']), details)
                 self.assertEqual(manage('delete', id=created['id']), {'id': created['id']})
                 self.assertEqual(manage('delete', id=created['id']), {'id': created['id']})
@@ -708,6 +1060,7 @@ if sys.stdin.buffer.read(1) == b'\r':
                 self.assertEqual(post(counter_path,body=False)[0],401)
                 counter=manage('issue',note='Token count only',rpm=1)
                 counter_key=decode_new_ticket(counter['ticket'])['key']
+                pair(counter_key)
                 with patch.object(public, 'account', wraps=public.account) as account:
                     for _ in range(2):
                         status, body=post(counter_path+'?beta=true',counter_key)
@@ -724,10 +1077,16 @@ if sys.stdin.buffer.read(1) == b'\r':
                 self.assertEqual((model_failure['outcome'],model_failure['status']),('failed',400))
                 capped = manage('issue', budget_cents=0)
                 capped_key = decode_new_ticket(capped['ticket'])['key']
-                self.assertEqual(json.loads(request('GET','/v1/key/balance',capped_key)[1])['remaining_nanos'],0)
+                pair(capped_key)
+                self.assertEqual(json.loads(request('GET','/v1/key/balance',capped_key,extra_headers=desktop_headers)[1])['remaining_nanos'],0)
                 self.assertEqual(post('/v1/messages', capped_key)[0], 402)
                 manage('update', id=capped['id'], budget_cents=1)
                 public.registry.record(capped['id'], 'claude-opus-5-5', False, {'output_tokens': 500})
+                balance = json.loads(request('GET','/v1/key/balance',capped_key,extra_headers=desktop_headers)[1])
+                self.assertEqual([(model['model'],model['output']) for model in balance['models']], [('claude-opus-5-5',500)])
+                self.assertEqual(balance['used_nanos'],sum(model['cost_nanos'] for model in balance['models']))
+                self.assertNotIn('claude-opus-5-5',[model['model'] for model in
+                    json.loads(request('GET','/v1/key/balance',counter_key,extra_headers=desktop_headers)[1])['models']])
                 manage('update', id=capped['id'], note='保留额度')
                 self.assertEqual(post('/v1/messages', capped_key)[0], 402)
                 manage('update', id=capped['id'], budget_cents=2)

@@ -1,8 +1,14 @@
 using System.Security.Cryptography;
+using System.Security.Cryptography.X509Certificates;
+using System.Net;
+using System.Net.Sockets;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using SafeCode.Core;
+using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Hosting;
+using Microsoft.Extensions.Logging;
 namespace SafeCode.Desktop;
 internal static class MacSelfTest
 {
@@ -15,53 +21,121 @@ internal static class MacSelfTest
         string Feed(string suffix)=>JsonSerializer.Serialize(new{tag_name="Beta-0.4.4.2",draft=false,prerelease=true,assets=new[]{new{name="SafeCode-Beta-0.4.4.2-"+suffix,browser_download_url="https://github.com/Muchuaner/safe-code/releases/download/Beta-0.4.4.2/SafeCode-Beta-0.4.4.2-"+suffix,digest="sha256:"+new string('a',64),size=123}}});
         using(var win=JsonDocument.Parse(Feed("Setup-x64.exe")))if(ClientServices.ParseRelease(win.RootElement,"Beta-0.4.4.1","macOS-arm64.dmg").CanInstall)throw new Exception("Mac 更新误选 Windows 安装包。");
         using(var mac=JsonDocument.Parse(Feed("macOS-arm64.dmg")))if(!ClientServices.ParseRelease(mac.RootElement,"Beta-0.4.4.1","macOS-arm64.dmg").CanInstall||ClientServices.ParseRelease(mac.RootElement,"Beta-0.4.4.1","macOS-x64.dmg").CanInstall)throw new Exception("架构筛选失败。");
-        var profile=MacClaudeDesktopBridge.MakeProfile("http://127.0.0.1:18899","fixture-local-token",
-            [new("claude-fixture-opus","Opus",["low","high"],true,"opus"),
-             new("claude-fixture-classifier","Classifier",["low"],false,null,true)]);
-        var model=profile["inferenceModels"]!.AsArray().Single()!;
-        if((string?)model["name"]!="claude-fixture-opus"||(string?)model["maxEffort"]!="high"||
-           (string?)profile["claudeCodeSettings"]?["env"]?["CLAUDE_CODE_AUTO_MODE_MODEL"]!="claude-fixture-classifier")
-            throw new Exception("Mac Claude Desktop 模型和分类器配置错误。");
+        var catalog=JsonNode.Parse("""
+            [
+                {"id":"default","display_name":"Default (recommended)","desktop_model_id":"safecode-cloudcli-default"},
+                {"id":"opus","display_name":"Opus","anthropic_family_tier":"opus","behaves_as":"claude-fixture-opus",
+                 "supported_effort_levels":["max","low","ultracode"],"supports_1m":true,
+                 "desktop_model_id":"safecode-cloudcli-opus","desktop_ultracode_model_id":"safecode-ultracode/opus","ultracode_supports_1m":true},
+                {"id":"vendor/custom-model","supported_effort_levels":["high","low"]},
+                {"id":"opusplan","desktop_model_id":"safecode-cloudcli-opusplan"},
+                {"id":"claude-fixture-classifier","auto_mode_classifier":true}
+            ]
+            """)!.AsArray();
+        var (models,classifier)=DesktopKeyAccess.ReadModelCatalog(catalog);
+        string[] names=["safecode-cloudcli-default","safecode-cloudcli-opus","safecode-ultracode/opus",
+            "vendor/custom-model","safecode-cloudcli-opusplan"];
+        if(!models.Select(model=>(string?)model?["name"]).SequenceEqual(names)||
+           (string?)models[1]!["maxEffort"]!="max"||(bool?)models[1]!["supports1m"]!=true||
+           (string?)models[2]!["maxEffort"]!="xhigh"||(bool?)models[2]!["supports1m"]!=true||
+           (string?)models[2]!["behavesAs"]!="claude-fixture-opus"||
+           (string?)models[3]!["maxEffort"]!="high"||classifier!="claude-fixture-classifier")
+            throw new Exception("Claude Desktop API Key 模型、思考强度或分类器配置错误。");
+        using(var transport=DesktopKeyAccess.RemoteHandler(new("https://gateway.example",new string('0',64),new string('a',43))))
+            if(transport.UseProxy)throw new Exception("固定证书网关不应经过系统代理的 CONNECT 隧道。");
+        Console.WriteLine("MAC_PINNED_GATEWAY_DIRECT_TRANSPORT_OK");
         Console.WriteLine("MAC_CLAUDE_PROFILE_CHAT_AND_CLASSIFIER_CONFIGURATION_OK");
         string profileTest = Directory.CreateTempSubdirectory("safecode-mac-profile-").FullName;
         try
         {
             string library = Path.Combine(profileTest, "configLibrary");
-            string id = Guid.NewGuid().ToString("D");
-            string profilePath = Path.Combine(library, id + ".json");
-            string metaPath = Path.Combine(library, "_meta.json");
-            string statePath = Path.Combine(profileTest, "desktop-ssh.aes");
+            string sealedId = Guid.NewGuid().ToString("D");
+            string tokenId = Guid.NewGuid().ToString("D");
+            string otherId = Guid.NewGuid().ToString("D");
             var meta = new JsonObject
             {
-                ["appliedId"] = id,
-                ["entries"] = new JsonArray(new JsonObject { ["id"] = id, ["name"] = "SafeCode SSH" })
+                ["appliedId"] = sealedId,
+                ["entries"] = new JsonArray(
+                    new JsonObject { ["id"] = sealedId, ["name"] = "SafeCode SSH" },
+                    new JsonObject { ["id"] = tokenId, ["name"] = "SafeCode SSH" },
+                    new JsonObject { ["id"] = otherId, ["name"] = "SafeCode SSH" })
             };
-            profile["inferenceGatewayApiKey"] = "__sealed__:v1:fixture-only";
-            DesktopKeyAccess.WriteProfileFile(profilePath, JsonSerializer.SerializeToUtf8Bytes(profile));
-            DesktopKeyAccess.WriteProfileFile(metaPath, JsonSerializer.SerializeToUtf8Bytes(meta));
-            using var bridge = new MacClaudeDesktopBridge(profileTest, false, library);
-            var orphan = JsonSerializer.SerializeToElement(await bridge.RefreshAsync(CancellationToken.None));
-            if (orphan.GetProperty("oldProfile").GetString() != id)
-                throw new Exception("未识别旧版遗留的 SafeCode SSH 配置。");
-            meta["hybridPointer"] = "fixture";
-            DesktopKeyAccess.WriteProfileFile(metaPath, JsonSerializer.SerializeToUtf8Bytes(meta));
-            var protectedProfile = JsonSerializer.SerializeToElement(await bridge.RefreshAsync(CancellationToken.None));
-            if (protectedProfile.GetProperty("oldProfile").ValueKind != JsonValueKind.Null)
-                throw new Exception("将 Claude 混合模式误判为可替换的旧配置。");
-            meta.Remove("hybridPointer");
-            DesktopKeyAccess.WriteProfileFile(metaPath, JsonSerializer.SerializeToUtf8Bytes(meta));
+            var profile = new JsonObject
+            {
+                ["inferenceGatewayBaseUrl"] = "http://127.0.0.1:18899",
+                ["inferenceGatewayApiKey"] = "__sealed__:v1:fixture-only",
+                ["inferenceProvider"] = "gateway",
+                ["inferenceGatewayAuthScheme"] = "bearer",
+                ["inferenceCredentialKind"] = "static",
+                ["deploymentDisplayName"] = "SafeCode"
+            };
+            void WriteProfile(string id) => DesktopKeyAccess.WriteProfileFile(
+                Path.Combine(library,id+".json"), JsonSerializer.SerializeToUtf8Bytes(profile));
+            WriteProfile(sealedId);
+            profile["inferenceGatewayApiKey"] = "fixture-local-token";
+            WriteProfile(tokenId);
+            profile["inferenceGatewayBaseUrl"] = "https://other.example";
+            WriteProfile(otherId);
+            using var access = new DesktopKeyAccess(profileTest,LocalSecrets.Protect,LocalSecrets.Unprotect,library);
+            string originalMeta = meta.ToJsonString();
+            void SaveBetaState(string id, int port)
+            {
+                var state = new { Server = new { Host = "gateway.example" }, Id = id, Token = "fixture-local-token", Port = port };
+                DesktopKeyAccess.WriteProfileFile(Path.Combine(profileTest,"desktop-ssh.aes"),
+                    LocalSecrets.Protect(JsonSerializer.SerializeToUtf8Bytes(state)));
+            }
+            access.RemoveLegacyMacProfiles(meta,library);
+            SaveBetaState(sealedId, 18900);
+            access.RemoveLegacyMacProfiles(meta,library);
+            if(meta.ToJsonString()!=originalMeta)throw new Exception("缺少匹配的本机状态时改动了旧配置。");
+            SaveBetaState(tokenId, 18899);
+            access.RemoveLegacyMacProfiles(meta,library);
+            if((string?)meta["appliedId"]!=sealedId || meta["entries"]!.AsArray().Count!=2 ||
+                meta["entries"]!.AsArray().Any(entry=>(string?)entry?["id"]==tokenId))
+                throw new Exception("迁移明文配置时误动了同名加密配置。");
+            SaveBetaState(sealedId, 18899);
+            access.RemoveLegacyMacProfiles(meta,library);
+            if ((string?)meta["appliedId"]!="" || (string?)meta["entries"]!.AsArray().Single()!["id"]!=otherId)
+                throw new Exception("未迁移有匹配本机记录的加密 SSH 配置。");
+            Console.WriteLine("MAC_LEGACY_SSH_PROFILE_MIGRATION_OK");
 
-            var state = new { Server = new GatewayPreference(), Id = id, Token = "fixture-local-token", Port = 18899 };
-            DesktopKeyAccess.WriteProfileFile(statePath, LocalSecrets.Protect(JsonSerializer.SerializeToUtf8Bytes(state)));
-            await bridge.StopAsync(CancellationToken.None);
-            var after = DesktopKeyAccess.ReadProfileMeta(library);
-            if (File.Exists(profilePath) || File.Exists(statePath) || after["appliedId"]?.GetValue<string>() != "")
-                throw new Exception("停止 SSH 接入后遗留了加密过的本机配置。");
-            if (MacClaudeDesktopBridge.IsSealedGatewayProfile(profile, 18900))
-                throw new Exception("密文前缀匹配时也必须校验原端口。");
-            Console.WriteLine("MAC_SEALED_SSH_PROFILE_DETECTION_AND_STOP_OK");
+            var savedKey = new
+            {
+                Remote = new PublicGatewayTicket("https://gateway.example", new string('0',64), new string('a',43)),
+                Local = "fixture-local-token", Port = 18899, Profile = tokenId, Previous = otherId
+            };
+            DesktopKeyAccess.WriteProfileFile(Path.Combine(profileTest,"desktop-key.state"),
+                LocalSecrets.Protect(JsonSerializer.SerializeToUtf8Bytes(savedKey,new JsonSerializerOptions(JsonSerializerDefaults.Web))));
+            string metaPath = Path.Combine(library,"_meta.json");
+            string activePath = Path.Combine(library,tokenId+".json");
+            string otherPath = Path.Combine(library,otherId+".json");
+            string otherContents = File.ReadAllText(otherPath);
+            meta["appliedId"] = otherId;
+            DesktopKeyAccess.WriteProfileFile(metaPath,JsonSerializer.SerializeToUtf8Bytes(meta));
+            try
+            {
+                DesktopKeyAccess.PrepareProfile(library,tokenId,18899,"fixture-local-token");
+                throw new Exception("启动时接受了非当前 SafeCode 配置。");
+            }
+            catch(InvalidOperationException){}
+            if (File.ReadAllText(otherPath)!=otherContents || JsonNode.Parse(File.ReadAllText(activePath))?["codeDefaultPermissionMode"]!=null)
+                throw new Exception("打开 Claude Desktop 时改写了非当前 Safe Code 配置。");
+            meta["appliedId"] = tokenId;
+            meta["entries"]!.AsArray().Add(new JsonObject { ["id"] = tokenId, ["name"] = "SafeCode" });
+            DesktopKeyAccess.WriteProfileFile(metaPath,JsonSerializer.SerializeToUtf8Bytes(meta));
+            DesktopKeyAccess.PrepareProfile(library,tokenId,18899,"fixture-local-token");
+            string prepared = File.ReadAllText(activePath);
+            var preparedProfile = JsonNode.Parse(prepared);
+            if ((string?)preparedProfile?["codeDefaultPermissionMode"]!="auto" ||
+                (string?)preparedProfile?["inferenceGatewayApiKey"]!="fixture-local-token")
+                throw new Exception("打开 Claude Desktop 前未保留原接入并设为 Auto。");
+            DesktopKeyAccess.PrepareProfile(library,tokenId,18899,"fixture-local-token");
+            if (File.ReadAllText(activePath)!=prepared)
+                throw new Exception("重复打开 Claude Desktop 改写了相同配置。");
+            Console.WriteLine("MAC_CLAUDE_LAUNCH_AUTO_DEFAULT_OK");
         }
         finally { Directory.Delete(profileTest, true); }
+        await CheckKeyHistoryAsync();
         string fingerprint=new('A',64);
         var rdp=MacClients.FreeRdpArguments(new(22119,"fixture",fingerprint),new("workspace","fixture password"),
             new(2560,1600),RdpResizeMode.Dynamic,true);
@@ -144,5 +218,90 @@ internal static class MacSelfTest
             Console.WriteLine("MAC_HOST_CONTROL_RESUME_SCOPE_AND_OPT_OUT_OK");
         }
         finally{Directory.Delete(folder,true);}
+    }
+
+    private static async Task CheckKeyHistoryAsync()
+    {
+        using var key=RSA.Create(2048);
+        var request=new CertificateRequest("CN=localhost",key,HashAlgorithmName.SHA256,RSASignaturePadding.Pkcs1);
+        using var certificate=request.CreateSelfSigned(DateTimeOffset.UtcNow.AddMinutes(-1),DateTimeOffset.UtcNow.AddMinutes(5));
+        var builder=WebApplication.CreateSlimBuilder();
+        builder.Logging.ClearProviders();
+        builder.WebHost.ConfigureKestrel(options=>options.Listen(IPAddress.Loopback,0,listener=>listener.UseHttps(certificate)));
+        await using var gateway=builder.Build();
+        gateway.MapGet("/v1/cloudcli/models",()=>new {data=new[]{new {id="claude-fixture"}}});
+        gateway.MapGet("/v1/models",()=>new {data=new[]{new {id="claude-fixture"}}});
+        await gateway.StartAsync();
+        string directory=Directory.CreateTempSubdirectory("safecode-key-history-").FullName;
+        try
+        {
+            string library=Path.Combine(directory,"configLibrary");
+            var json=new JsonSerializerOptions(JsonSerializerDefaults.Web);
+            var pin=Convert.ToHexStringLower(SHA256.HashData(certificate.RawData));
+            var first=new PublicGatewayTicket(gateway.Urls.Single(),pin,new string('a',43));
+            var second=first with {Key=new string('b',43)};
+            string Encode(PublicGatewayTicket ticket)=>"sc1."+Convert.ToBase64String(JsonSerializer.SerializeToUtf8Bytes(ticket,json))
+                .TrimEnd('=').Replace('+','-').Replace('/','_');
+            string legacyProfile=Guid.NewGuid().ToString("D");
+            using var portCheck=new TcpListener(IPAddress.Loopback,0);
+            portCheck.Start();
+            int originalPort=((IPEndPoint)portCheck.LocalEndpoint).Port;
+            portCheck.Stop();
+            DesktopKeyAccess.WriteProfileFile(Path.Combine(directory,"desktop-key.state"),
+                LocalSecrets.Protect(JsonSerializer.SerializeToUtf8Bytes(
+                    new {Remote=first,Local="fixture-local",Port=originalPort,Profile=legacyProfile,Previous=""},json)));
+            using var access=new DesktopKeyAccess(directory,LocalSecrets.Protect,LocalSecrets.Unprotect,library);
+            using var deadline=new CancellationTokenSource(TimeSpan.FromSeconds(20));
+            string CurrentHistory()
+            {
+                string id=(string)DesktopKeyAccess.ReadProfileMeta(library)["appliedId"]!;
+                var profile=JsonNode.Parse(File.ReadAllText(Path.Combine(library,id+".json")))!;
+                if((bool?)profile["claudeAiImport"]?["automatic3pImport"]!=false)
+                    throw new Exception("切换 Key 时允许了共享历史的自动导入。");
+                return (string)profile["deploymentOrganizationUuid"]!;
+            }
+            await access.EnableAsync("",deadline.Token,useSaved:true);
+            var firstHistory=CurrentHistory();
+            if(firstHistory!=legacyProfile)throw new Exception("已接入 Key 的历史标识没有保留。");
+            var savedProfile=Path.Combine(library,legacyProfile+".json");
+            var originalProfile=JsonNode.Parse(File.ReadAllText(savedProfile))!;
+            var endpoint=new Uri((string)originalProfile["inferenceGatewayBaseUrl"]!);
+            var bearer=(string)originalProfile["inferenceGatewayApiKey"]!;
+            await DesktopKeyAccess.CheckLaunchRouteAsync(endpoint.Port,bearer,deadline.Token);
+            await access.StopAsync();
+
+            // Simulate a SafeCode restart while Desktop keeps its original URL and bearer.
+            using(var recovered=new DesktopKeyAccess(directory,LocalSecrets.Protect,LocalSecrets.Unprotect,library))
+            {
+                using(var blocker=new TcpListener(IPAddress.Loopback,endpoint.Port))
+                {
+                    blocker.Start();
+                    try
+                    {
+                        await recovered.EnableAsync("",deadline.Token,useSaved:true);
+                        throw new Exception("已保存的本机端口被占用时更改了接入地址。");
+                    }
+                    catch(InvalidOperationException error)when(error.Message.Contains("已被占用"))
+                    {
+                        if(!JsonNode.DeepEquals(originalProfile,JsonNode.Parse(File.ReadAllText(savedProfile))))
+                            throw new Exception("接入失败时覆盖了桌面原有配置。");
+                    }
+                }
+                await recovered.EnableAsync("",deadline.Token,useSaved:true);
+                var models=await DesktopKeyAccess.CheckLaunchRouteAsync(endpoint.Port,bearer,deadline.Token);
+                if(models.Count!=1||CurrentHistory()!=firstHistory)
+                    throw new Exception("恢复同一把 Key 后，原桌面地址或历史失效。");
+            }
+            Console.WriteLine("MAC_DESKTOP_RELAY_RESTART_PRESERVES_ENDPOINT_OK");
+            await access.DisableAsync(deadline.Token);
+            await access.EnableAsync(Encode(second),deadline.Token);
+            var secondHistory=CurrentHistory();
+            if(secondHistory==firstHistory)throw new Exception("同一个网关的不同 Key 共用了历史标识。");
+            await access.DisableAsync(deadline.Token);
+            await access.EnableAsync(Encode(first),deadline.Token);
+            if(CurrentHistory()!=firstHistory)throw new Exception("切回原 Key 没有加载原来的历史标识。");
+            Console.WriteLine("MAC_DESKTOP_KEY_HISTORY_ISOLATION_AND_RESTORE_OK");
+        }
+        finally { await gateway.StopAsync(); Directory.Delete(directory,true); }
     }
 }

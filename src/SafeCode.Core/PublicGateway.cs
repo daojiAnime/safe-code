@@ -19,6 +19,8 @@ public sealed partial class SshSession
     private bool publicGatewayEnabled;
     private Task? gatewayHeartbeat;
     private JsonObject? gatewaySubscription;
+    private sealed record GatewayVersionSample(int? Revision, long At);
+    private GatewayVersionSample? gatewayVersion;
 
     public static bool CanResumePublicGateway(string directory, ConnectionSettings settings)
     {
@@ -34,10 +36,29 @@ public sealed partial class SshSession
         }
     }
 
+    private static readonly Lazy<int> BundledGatewayRevision = new(() =>
+    {
+        using var stream = typeof(SshSession).Assembly.GetManifestResourceStream("SafeCode.Core.PublicApi.server.py")
+            ?? throw new IOException("缺少 Safe Code 网关安装组件。");
+        using var reader = new StreamReader(stream);
+        while (reader.ReadLine() is { } line)
+        {
+            const string prefix = "GATEWAY_REVISION = ";
+            if (line.StartsWith(prefix, StringComparison.Ordinal) && int.TryParse(line.AsSpan(prefix.Length), out var revision))
+                return revision;
+        }
+        throw new InvalidDataException("无法读取客户端内置的网关版本。");
+    });
+
     public async Task<JsonElement> ReadPublicGatewayAsync(bool runtime, CancellationToken ct)
     {
         var status = await RequestGatewayAsync(new { action = "public_status", runtime }, ct, remember: true);
-        return runtime && publicGatewayEnabled ? WithGatewaySubscription(status) : status;
+        var value = JsonNode.Parse(status.GetRawText())!.AsObject();
+        gatewayVersion = SampleGatewayVersion(status);
+        value["bundledGatewayRevision"] = BundledGatewayRevision.Value;
+        if (runtime && publicGatewayEnabled && gatewaySubscription is { } subscription)
+            value["subscription"] = subscription.DeepClone();
+        return JsonSerializer.SerializeToElement(value);
     }
 
     public async Task<JsonElement> RefreshPublicGatewaySubscriptionAsync(CancellationToken ct)
@@ -54,11 +75,32 @@ public sealed partial class SshSession
         return JsonSerializer.SerializeToElement(value);
     }
 
-    private JsonElement WithGatewaySubscription(JsonElement result)
+    private static GatewayVersionSample SampleGatewayVersion(JsonElement status) =>
+        new(status.TryGetProperty("gatewayRevision", out var revision) && revision.ValueKind == JsonValueKind.Number
+            && revision.TryGetInt32(out var number) && number > 0 ? number : null, Environment.TickCount64);
+
+    private async Task<JsonElement> WithGatewayOverviewAsync(JsonElement result, bool background, CancellationToken ct)
     {
-        if (gatewaySubscription is not { } subscription) return result;
+        var sample = gatewayVersion;
+        if (!background || sample is null || Environment.TickCount64 - sample.At >= 60000)
+        {
+            // Older gateways expose the running revision through public_status, separate from list.
+            try
+            {
+                var status = await RequestGatewayAsync(new { action = "public_status" }, ct, timeout: TimeSpan.FromSeconds(8));
+                sample = SampleGatewayVersion(status);
+            }
+            catch (Exception error) when (!ct.IsCancellationRequested && !mountLifetime.IsCancellationRequested &&
+                error is InvalidOperationException or IOException or SshException or SocketException or TimeoutException or OperationCanceledException)
+            {
+                sample = new(null, Environment.TickCount64);
+            }
+            gatewayVersion = sample;
+        }
         var value = JsonNode.Parse(result.GetRawText())!.AsObject();
-        value["subscription"] = subscription.DeepClone();
+        value["gatewayRevision"] = sample.Revision;
+        value["gatewayUpdateAvailable"] = sample.Revision is int installed && installed < BundledGatewayRevision.Value;
+        if (gatewaySubscription is { } subscription) value["subscription"] = subscription.DeepClone();
         return JsonSerializer.SerializeToElement(value);
     }
 
@@ -93,13 +135,26 @@ public sealed partial class SshSession
 
     public async Task<JsonElement> ManagePublicGatewayAsync(Dictionary<string, JsonElement> request, CancellationToken ct)
     {
+        request.Remove("background", out var background);
         string? action = request.GetValueOrDefault("action").ValueKind == JsonValueKind.String
             ? request["action"].GetString() : null;
+        if (request.ContainsKey("gateway_target"))
+        {
+            var remote = await RequestGatewayAsync(request, ct);
+            if (action != "issue") return remote;
+            return JsonSerializer.SerializeToElement(new
+            {
+                id = remote.GetProperty("id"), ticket = remote.GetProperty("ticket"),
+                origin = PublicGatewayTicket.Parse(remote.GetProperty("ticket").GetString()!).Url
+            });
+        }
         if (action == "refresh_subscription") return await RefreshPublicGatewaySubscriptionAsync(ct);
         if (action is not ("issue" or "refresh_ticket"))
         {
             var result = await RequestGatewayAsync(request, ct);
-            return action == "list" ? WithGatewaySubscription(result) : result;
+            return action == "list"
+                ? await WithGatewayOverviewAsync(result, background.ValueKind == JsonValueKind.True, ct)
+                : result;
         }
 
         string sshHost = Host;
@@ -139,6 +194,47 @@ public sealed partial class SshSession
 
     public async Task<JsonElement> InstallPublicGatewayAsync(CancellationToken ct, JsonElement? cloudcli = null)
     {
+        var files = await LoadGatewayPackageAsync(ct);
+        var result = await RequestGatewayAsync(new { action = "install", accepted = true, files, cloudcli }, ct,
+            timeout: TimeSpan.FromMinutes(12));
+        if (Server is { } server
+            && (result.TryGetProperty("backend", out var backend) && backend.GetString() == "cloudcli"
+                || result.TryGetProperty("cloudcliKeyRequired", out var keyRequired) && keyRequired.ValueKind == JsonValueKind.True))
+            server.CloudReady = true;
+        return result;
+    }
+
+    public async Task<JsonElement> RepairPublicGatewayAsync(bool reinstallCloudCLI, CancellationToken ct)
+    {
+        var files = await LoadGatewayPackageAsync(ct);
+        var result = await RequestAsync<JsonElement>("safe_code_api_repair",
+            new { action = "repair", accepted = true, files, reinstallCloudCLI }, ct);
+        RememberPublicGateway(result);
+        if (!reinstallCloudCLI || !result.TryGetProperty("cloudcliPort", out var port) || !port.TryGetInt32(out int localPort))
+            return result;
+
+        var response = JsonObject.Create(result)!;
+        response.Remove("cloudcliPort");
+        if (!result.TryGetProperty("cloudcliNeedsSetup", out var needsSetup) || needsSetup.ValueKind != JsonValueKind.True)
+        {
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            timeout.CancelAfter(TimeSpan.FromSeconds(25));
+            try
+            {
+                var login = await RequestAsync<JsonElement>("safe_code_api",
+                    new { action = "repair_cloudcli_login", port = localPort }, timeout.Token);
+                response["cloudcliLogin"] = JsonObject.Create(login);
+            }
+            catch (Exception) when (!ct.IsCancellationRequested)
+            {
+                // A credential check can fail even after the programs have been reinstalled successfully.
+            }
+        }
+        return JsonSerializer.SerializeToElement(response);
+    }
+
+    private static async Task<Dictionary<string, string>> LoadGatewayPackageAsync(CancellationToken ct)
+    {
         var assembly = Assembly.GetExecutingAssembly();
         var files = new Dictionary<string, string>();
         const string api = "SafeCode.Core.PublicApi.";
@@ -153,13 +249,7 @@ public sealed partial class SshSession
             files.Add(resource[prefix..],
                 Convert.ToBase64String(buffer.ToArray()));
         }
-        var result = await RequestGatewayAsync(new { action = "install", accepted = true, files, cloudcli }, ct,
-            timeout: TimeSpan.FromMinutes(12));
-        if (Server is { } server
-            && (result.TryGetProperty("backend", out var backend) && backend.GetString() == "cloudcli"
-                || result.TryGetProperty("cloudcliKeyRequired", out var keyRequired) && keyRequired.ValueKind == JsonValueKind.True))
-            server.CloudReady = true;
-        return result;
+        return files;
     }
 
     private void RememberPublicGateway(JsonElement result)

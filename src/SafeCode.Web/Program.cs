@@ -133,8 +133,8 @@ app.MapGet("/safe-code-web.js", async context =>
               window.safeCodeUpdateProgress?.(msg.done, msg.total);
             } else if (msg.type === 'mountStatus' && msg.mount) {
               window.safeCodeMountStatus?.(msg.mount);
-            } else if (msg.type === 'claudeDesktopStatus' && msg.status) {
-              window.safeCodeClaudeDesktopStatus?.(msg.status);
+            } else if (msg.type === 'bashDetail') {
+              window.safeCodeBashDetail?.(msg.session, msg.call);
             }
           } catch {}
         });
@@ -463,13 +463,20 @@ internal sealed class WebPreferences
         this.vault = vault;
     }
 
-    private string ClaudeDesktopWarningPath => Path.Combine(directory, "claude-desktop-warning-accepted-v1");
-    public bool ClaudeDesktopWarningAccepted => File.Exists(ClaudeDesktopWarningPath);
+    private string ApiAccessModePath => Path.Combine(directory, "api-access-mode");
+    public bool PrefersApiAccess => File.Exists(ApiAccessModePath);
 
-    public void AcceptClaudeDesktopWarning()
+    public void SetApiAccessMode(bool enabled)
     {
-        Directory.CreateDirectory(directory);
-        using var _ = new FileStream(ClaudeDesktopWarningPath, FileMode.OpenOrCreate, FileAccess.Write, FileShare.ReadWrite);
+        if (enabled)
+        {
+            Directory.CreateDirectory(directory);
+            using var _ = File.Open(ApiAccessModePath, FileMode.OpenOrCreate, FileAccess.Write, FileShare.ReadWrite);
+        }
+        else if (PrefersApiAccess)
+        {
+            File.Delete(ApiAccessModePath);
+        }
     }
 
     private static string DraftRelativePath(SshSession session) =>
@@ -726,6 +733,8 @@ internal sealed class WebHostControl : IDisposable
     private string client = "";
 
     public bool Enabled => session?.HasHostControl == true;
+    public string DefaultAlias => "mac";
+    public bool IsEnabledFor(SshSession target) => Enabled && ReferenceEquals(session, target);
     public HostControlStatus Status => session?.HostControlStatus ?? new(
         false,
         "disabled",
@@ -930,335 +939,6 @@ internal sealed class WebHostControl : IDisposable
     }
 }
 
-// Mirrors MacClaudeDesktopBridge using WebLocalVault encryption and DesktopVpsGateway.
-internal sealed class WebClaudeDesktopBridge : IDisposable
-{
-    private sealed record ProfileState(GatewayPreference Server, string Id, string Token, int Port);
-
-    private readonly WebLocalVault vault;
-    private readonly SemaphoreSlim gate = new(1);
-    private readonly string statePath;
-    private readonly string library;
-    private volatile DesktopVpsGateway? gateway;
-    private DateTimeOffset? started;
-    private string? message;
-    private DateTimeOffset nextHealthCheck;
-
-    public WebClaudeDesktopBridge(string dataDirectory, WebLocalVault vault, string? profileDirectory = null)
-    {
-        this.vault = vault;
-        statePath = Path.Combine(dataDirectory, "desktop-ssh.web.enc");
-        library = profileDirectory ?? DesktopKeyAccess.ProfileLibrary();
-    }
-
-    public bool Configured => File.Exists(statePath);
-    public bool Running => gateway != null;
-
-    private static bool Installed => OperatingSystem.IsMacOS() &&
-        (File.Exists("/Applications/Claude.app/Contents/Info.plist") ||
-         File.Exists(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Applications/Claude.app/Contents/Info.plist")));
-
-    private ProfileState ReadState()
-    {
-        byte[] data = vault.UnprotectBytes(File.ReadAllBytes(statePath));
-        try
-        {
-            var state = JsonSerializer.Deserialize<ProfileState>(data);
-            if (state == null || !Guid.TryParseExact(state.Id, "D", out _) || state.Port is < 1024 or > 65535)
-                throw new IOException("保存的 SSH 接入配置无效。");
-            return state;
-        }
-        finally { CryptographicOperations.ZeroMemory(data); }
-    }
-
-    public bool CanResume(ConnectionSettings settings)
-    {
-        if (!Configured) return false;
-        try { return ReadState().Server.Matches(settings); }
-        catch { return false; }
-    }
-
-    public async Task<object> RefreshAsync(CancellationToken ct)
-    {
-        await gate.WaitAsync(ct);
-        try
-        {
-            if (gateway != null)
-            {
-                bool applied;
-                try { applied = IsApplied(ReadState()); }
-                catch (Exception error) when (error is IOException or UnauthorizedAccessException or JsonException or CryptographicException)
-                {
-                    applied = false;
-                }
-                if (!applied)
-                {
-                    await SuspendCoreAsync(ct);
-                    message = "Claude Desktop 配置已切换或无法读取，SSH 网关已关闭。";
-                }
-                else if (DateTimeOffset.UtcNow >= nextHealthCheck)
-                {
-                    message = await gateway.RefreshAsync(ct) ? null : "SSH 网关暂不可用，请检查 VPS 连接。";
-                    nextHealthCheck = DateTimeOffset.UtcNow.AddSeconds(4);
-                }
-            }
-            return Status();
-        }
-        finally { gate.Release(); }
-    }
-
-    private object Status()
-    {
-        bool active = gateway?.Connected == true;
-        bool managed = Configured;
-        return new
-        {
-            active,
-            managed,
-            configured = managed,
-            installed = Installed,
-            oldProfile = !managed ? FindOldProfile() : null,
-            state = active ? "active" : managed ? "attention" : "unconfigured",
-            message = message ?? (active ? "SSH 网关已连接，重启 Claude Desktop 后可使用。" : managed
-                ? "已保存 SSH 接入。请在原服务器上验证本机远程控制后恢复。" : "尚未启用 SSH 接入。"),
-            endpoint = gateway?.Endpoint ?? "",
-            startedAt = started,
-            usage = gateway?.Usage ?? IntegrationUsage.Unavailable("尚未连接 VPS 网关"),
-            usageSource = "VPS CloudCLI"
-        };
-    }
-
-    public async Task<object> StartAsync(SshSession target, CancellationToken ct, string replaceOldProfile = "")
-    {
-        await gate.WaitAsync(ct);
-        try
-        {
-            target.RequireVerifiedHostControl();
-            if (gateway?.Connected == true) return Status();
-            if (gateway != null) await SuspendCoreAsync(ct);
-            if (Configured)
-            {
-                var state = ReadState();
-                if (!state.Server.Matches(target))
-                    throw new InvalidOperationException("保存的 SSH 接入绑定到原服务器。请连接原服务器，或先停用后重新设置。");
-                if (!IsApplied(state))
-                    throw new IOException("Claude Desktop 已切换配置。请先停用旧接入后重新设置。");
-                var saved = new DesktopVpsGateway(target, Guid.Parse(state.Id).ToString("N"), state.Token, (uint)state.Port);
-                try { await saved.StartAsync(ct); }
-                catch { saved.Dispose(); throw; }
-                gateway = saved;
-            }
-            else
-            {
-                if (!Installed) throw new InvalidOperationException("请先安装官方 Claude Desktop。");
-                EnsureProfileSlotAvailable(replaceOldProfile);
-                var id = Guid.NewGuid();
-                var pending = new DesktopVpsGateway(target, id.ToString("N"));
-                try
-                {
-                    await pending.StartAsync(ct);
-                    var models = await pending.ModelsAsync(ct);
-                    target.RequireVerifiedHostControl();
-                    int port = new Uri(pending.Endpoint).Port;
-                    var state = new ProfileState(GatewayPreference.For(target), id.ToString("D"), pending.LocalToken, port);
-                    var profile = MakeProfile(pending.Endpoint, state.Token, models);
-                    Activate(state, profile, replaceOldProfile);
-                    gateway = pending;
-                }
-                catch
-                {
-                    using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(15));
-                    await pending.StopAsync(timeout.Token);
-                    pending.Dispose();
-                    throw;
-                }
-            }
-            started = DateTimeOffset.UtcNow;
-            nextHealthCheck = started.Value.AddSeconds(4);
-            message = null;
-            return Status();
-        }
-        finally { gate.Release(); }
-    }
-
-    public async Task<string?> ResumeAsync(SshSession target, CancellationToken ct)
-    {
-        if (!Configured) return null;
-        try
-        {
-            if (ReadState().Server.Matches(target)) await StartAsync(target, ct);
-            return null;
-        }
-        catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
-        catch (Exception error) { return "Claude SSH 网关恢复失败：" + error.Message; }
-    }
-
-    public async Task<object> StopAsync(CancellationToken ct, bool suspend = false)
-    {
-        await gate.WaitAsync(ct);
-        try
-        {
-            var state = !suspend && Configured ? ReadState() : null;
-            await SuspendCoreAsync(ct);
-            if (state != null) RemoveProfile(state);
-            return Status();
-        }
-        finally { gate.Release(); }
-    }
-
-    private async Task SuspendCoreAsync(CancellationToken ct)
-    {
-        if (gateway == null) return;
-        var current = gateway;
-        gateway = null;
-        try { message = await current.StopAsync(ct); }
-        finally { current.Dispose(); started = null; }
-    }
-
-    private string MetaPath => Path.Combine(library, "_meta.json");
-    private string ProfilePath(ProfileState state) => Path.Combine(library, state.Id + ".json");
-
-    private string? FindOldProfile()
-    {
-        try { return FindOldProfile(DesktopKeyAccess.ReadProfileMeta(library)); }
-        catch (Exception error) when (error is IOException or UnauthorizedAccessException or JsonException)
-        {
-            return null;
-        }
-    }
-
-    private string? FindOldProfile(JsonObject meta)
-    {
-        string? id = Text(meta, "appliedId");
-        if (meta["hybridPointer"] != null || !Guid.TryParseExact(id, "D", out _)
-            || !meta["entries"]!.AsArray().OfType<JsonObject>().Any(entry =>
-                Text(entry, "id") == id && Text(entry, "name") == "SafeCode SSH"))
-            return null;
-        string path = Path.Combine(library, id + ".json");
-        if (!File.Exists(path) || JsonNode.Parse(File.ReadAllBytes(path)) is not JsonObject profile
-            || !Uri.TryCreate(Text(profile, "inferenceGatewayBaseUrl"), UriKind.Absolute, out var endpoint)
-            || endpoint.Port is < 1024 or > 65535 || !IsSealedGatewayProfile(profile, endpoint.Port))
-            return null;
-        return id;
-    }
-
-    private JsonObject EnsureProfileSlotAvailable(string replaceOldProfile)
-    {
-        var meta = DesktopKeyAccess.ReadProfileMeta(library);
-        if (!string.IsNullOrEmpty(replaceOldProfile))
-        {
-            if (FindOldProfile(meta) != replaceOldProfile)
-                throw new InvalidOperationException("Claude Desktop 配置已变更，请重新打开 Safe Code 接入设置。");
-        }
-        else if (!string.IsNullOrEmpty(Text(meta, "appliedId")) || meta["hybridPointer"] != null)
-            throw new InvalidOperationException("Claude Desktop 已启用其他配置，请先在 Claude Desktop 中停用该配置。");
-        return meta;
-    }
-
-    private static string? Text(JsonObject? node, string key) =>
-        node?[key] is JsonValue value && value.TryGetValue<string>(out var text) ? text : null;
-
-    private static bool IsSealedGatewayProfile(JsonObject? profile, int port) =>
-        Text(profile, "inferenceGatewayBaseUrl") == "http://127.0.0.1:" + port &&
-        Text(profile, "inferenceProvider") == "gateway" &&
-        Text(profile, "inferenceGatewayAuthScheme") == "bearer" &&
-        Text(profile, "inferenceCredentialKind") == "static" &&
-        Text(profile, "deploymentDisplayName") == "SafeCode" &&
-        Text(profile, "inferenceGatewayApiKey") is { Length: > 14 } credential &&
-        credential.StartsWith("__sealed__:v1:", StringComparison.Ordinal);
-
-    private static bool OwnsProfile(ProfileState state, JsonObject? profile) =>
-        (Text(profile, "inferenceGatewayBaseUrl") == "http://127.0.0.1:" + state.Port &&
-         Text(profile, "inferenceGatewayApiKey") == state.Token)
-        || IsSealedGatewayProfile(profile, state.Port);
-
-    private bool IsApplied(ProfileState state)
-    {
-        string path = ProfilePath(state);
-        return (string?)DesktopKeyAccess.ReadProfileMeta(library)["appliedId"] == state.Id
-            && File.Exists(path) && OwnsProfile(state, JsonNode.Parse(File.ReadAllBytes(path)) as JsonObject);
-    }
-
-    private void Activate(ProfileState state, JsonObject profile, string replaceOldProfile)
-    {
-        var meta = EnsureProfileSlotAvailable(replaceOldProfile);
-        ((JsonArray)meta["entries"]!).Add(new JsonObject { ["id"] = state.Id, ["name"] = "SafeCode SSH" });
-        meta["appliedId"] = state.Id;
-        byte[] data = JsonSerializer.SerializeToUtf8Bytes(state);
-        try { DesktopKeyAccess.WriteProfileFile(statePath, vault.ProtectBytes(data)); }
-        finally { CryptographicOperations.ZeroMemory(data); }
-        try
-        {
-            DesktopKeyAccess.WriteProfileFile(ProfilePath(state), JsonSerializer.SerializeToUtf8Bytes(profile));
-            DesktopKeyAccess.WriteProfileFile(MetaPath, JsonSerializer.SerializeToUtf8Bytes(meta));
-        }
-        catch
-        {
-            RemoveProfile(state);
-            throw;
-        }
-    }
-
-    private void RemoveProfile(ProfileState state)
-    {
-        var meta = DesktopKeyAccess.ReadProfileMeta(library);
-        var entries = (JsonArray)meta["entries"]!;
-        string path = ProfilePath(state);
-        if (!File.Exists(path) || OwnsProfile(state, JsonNode.Parse(File.ReadAllBytes(path)) as JsonObject))
-        {
-            var entry = entries.FirstOrDefault(node => (string?)node?["id"] == state.Id);
-            if (entry != null) entries.Remove(entry);
-            bool applied = (string?)meta["appliedId"] == state.Id;
-            if (applied) meta["appliedId"] = "";
-            if (entry != null || applied) DesktopKeyAccess.WriteProfileFile(MetaPath, JsonSerializer.SerializeToUtf8Bytes(meta));
-            if (File.Exists(path)) File.Delete(path);
-        }
-        if (File.Exists(statePath)) File.Delete(statePath);
-    }
-
-    private static JsonObject MakeProfile(string endpoint, string token, DesktopGatewayModel[] models)
-    {
-        var entries = new JsonArray();
-        foreach (var model in models.Where(model => !model.AutoModeClassifier).OrderByDescending(model => model.Family == "opus"))
-        {
-            var entry = new JsonObject
-            {
-                ["name"] = model.Id,
-                ["labelOverride"] = model.DisplayName,
-                ["maxEffort"] = model.SupportedEffortLevels.LastOrDefault() ?? "low",
-                ["supports1m"] = model.Supports1m
-            };
-            if (!string.IsNullOrEmpty(model.Family))
-            {
-                entry["anthropicFamilyTier"] = model.Family;
-                entry["isFamilyDefault"] = true;
-            }
-            entries.Add(entry);
-        }
-        if (entries.Count == 0) throw new IOException("VPS 上的 CloudCLI 未返回可用聊天模型。");
-        var profile = new JsonObject
-        {
-            ["inferenceProvider"] = "gateway",
-            ["inferenceGatewayBaseUrl"] = endpoint,
-            ["inferenceGatewayAuthScheme"] = "bearer",
-            ["inferenceCredentialKind"] = "static",
-            ["inferenceGatewayApiKey"] = token,
-            ["inferenceModels"] = entries,
-            ["deploymentMode"] = "3p",
-            ["disableDeploymentModeChooser"] = true,
-            ["deploymentDisplayName"] = "SafeCode",
-            ["modelDiscoveryEnabled"] = false,
-            ["autoModeEnabled"] = true,
-            ["chatTabEnabled"] = true
-        };
-        if (models.FirstOrDefault(model => model.AutoModeClassifier) is { } classifier)
-            DesktopKeyAccess.SetClassifier(profile, classifier.Id);
-        return profile;
-    }
-
-    public void Dispose() => gateway?.Dispose();
-}
-
 internal sealed class SafeCodeWebHost : IDisposable
 {
     private sealed record GatewayContext(SshSession Session, string Token);
@@ -1276,7 +956,6 @@ internal sealed class SafeCodeWebHost : IDisposable
     private readonly WebPreferences preferences;
     private readonly RdpDisplayPreferences desktopDisplay;
     private readonly WebHostControl hostControl;
-    private readonly WebClaudeDesktopBridge claudeDesktop;
     private readonly ConcurrentDictionary<Guid, WebSocketClient> clients = new();
     private readonly SemaphoreSlim mutationGate = new(1, 1);
     private readonly object consentGate = new();
@@ -1288,6 +967,7 @@ internal sealed class SafeCodeWebHost : IDisposable
     private SshSession? session;
     private DesktopKeyAccess? keyAccess;
     private DesktopKeyAccess.DeviceSetup? pendingKeyDevice;
+    private SshSession? keyStartedHost;
     private GatewayContext? gatewayContext;
     private CancellationTokenSource? connecting;
     private CancellationTokenSource? browsing;
@@ -1305,11 +985,10 @@ internal sealed class SafeCodeWebHost : IDisposable
         this.dataDirectory = dataDirectory;
         this.baseUrl = baseUrl.TrimEnd('/');
         vault = new WebLocalVault(dataDirectory);
-        services = new ClientServices(dataDirectory, endpointEnabled: false, currentVersion: "Beta-0.4.4.32-debian13");
+        services = new ClientServices(dataDirectory, endpointEnabled: false, currentVersion: "0.4.21-debian13");
         preferences = new WebPreferences(dataDirectory, vault);
         desktopDisplay = new RdpDisplayPreferences(dataDirectory);
         hostControl = new WebHostControl(dataDirectory, vault);
-        claudeDesktop = new WebClaudeDesktopBridge(dataDirectory, vault);
         logTimer = new Timer(_ => _ = FlushLogsAsync(), null, 120, 120);
         _ = Task.Run(() => MaintainBackgroundAsync(lifetime.Token));
     }
@@ -1361,9 +1040,12 @@ internal sealed class SafeCodeWebHost : IDisposable
             var args = root.TryGetProperty("args", out var argsProp) ? argsProp.Clone() : default;
 
             bool mutates = op is "deploy" or "job.resume" or "cloud.install" or "cloud.expose"
-                or "mount.install" or "mount.apply" or "ip.apply" or "safeCodeApi.install"
-                or "host.enable" or "host.disable" or "claudeDesktop.start" or "claudeDesktop.stop"
-                or "desktopKey.enable" or "desktopKey.disable" or "desktopKey.authorizeDevice"
+                or "mount.install" or "mount.apply" or "ip.apply" or "terminal" or "terminal.disconnect"
+                or "desktop" or "desktop.resolution.save" or "host.enable" or "host.disable"
+                or "desktopKey.enable" or "desktopKey.disable" or "desktopKey.refreshModels"
+                or "desktopKey.authorizeDevice" or "desktopKey.cancelDevice"
+                or "safeCodeApi.enablePublic" or "safeCodeApi.install" or "safeCodeApi.repair"
+                or "socks.probe" or "socks.enable" or "socks.disable"
                 or "connection.reauthenticate" or "app.shutdown";
 
             if (mutates)
@@ -1409,16 +1091,16 @@ internal sealed class SafeCodeWebHost : IDisposable
                 return new
                 {
                     busy = Volatile.Read(ref activeMutations) > 0 || Volatile.Read(ref connectionPending) != 0,
-                    guarding = session?.HasMounts == true || hostControl.Enabled || claudeDesktop.Running
+                    guarding = session?.HasMounts == true || hostControl.Enabled || keyAccess?.Running == true
                 };
 
             case "app.shutdown":
                 if (Volatile.Read(ref connectionPending) != 0)
                     throw new InvalidOperationException("正在连接，请先取消连接后退出。");
+                try { if (keyAccess != null) await keyAccess.StopAsync(); }
+                finally { await StopKeyHostControlAsync(); }
                 if (hostControl.Enabled) await hostControl.SuspendAsync(ct);
                 if (session?.HasMounts == true) await session.UnmountAsync(ct);
-                if (claudeDesktop.Running) await claudeDesktop.StopAsync(ct, suspend: true);
-                if (keyAccess != null) await keyAccess.StopAsync();
                 return true;
 
             case "window.resize":
@@ -1426,6 +1108,7 @@ internal sealed class SafeCodeWebHost : IDisposable
             case "window.minimize":
             case "window.maximize":
             case "window.close":
+            case "window.quit":
             case "window.fitDialog":
             case "window.dialogs":
             case "services.open":
@@ -1475,7 +1158,7 @@ internal sealed class SafeCodeWebHost : IDisposable
 
             case "updates.check":
                 return new UpdateInfo(
-                    "Beta-0.4.4.32-debian13",
+                    "0.4.21-debian13",
                     null,
                     "当前运行 Debian 13 定制版",
                     "https://github.com/Muchuaner/safe-code/releases",
@@ -1497,11 +1180,7 @@ internal sealed class SafeCodeWebHost : IDisposable
                 File.WriteAllText(Path.Combine(dataDirectory, "notice-accepted-v2"), DateTimeOffset.UtcNow.ToString("O"));
                 return true;
 
-            case "notice.claudeDesktop.state":
-                return preferences.ClaudeDesktopWarningAccepted;
-
-            case "notice.claudeDesktop.accept":
-                preferences.AcceptClaudeDesktopWarning();
+            case "secrets.initialize":
                 return true;
 
             case "login.restoreAvailable":
@@ -1515,17 +1194,16 @@ internal sealed class SafeCodeWebHost : IDisposable
             {
                 var remembered = vault.LoadEncrypted<ConnectionSettings>("login.enc");
                 if (remembered == null) return null;
-                bool resumeHost = (claudeDesktop.Configured || File.Exists(Path.Combine(dataDirectory, "desktop-key.state"))) &&
+                bool resumeHost = File.Exists(Path.Combine(dataDirectory, "desktop-key.state")) &&
                     hostControl.CanResume(remembered);
-                bool resumeDesktop = claudeDesktop.CanResume(remembered);
-                return resumeHost || resumeDesktop || SshSession.CanResumePublicGateway(dataDirectory, remembered)
+                return resumeHost || SshSession.CanResumePublicGateway(dataDirectory, remembered)
                     ? remembered
                     : null;
             }
 
             case "preview.begin":
                 if (Volatile.Read(ref activeMutations) > 0 || Volatile.Read(ref connectionPending) != 0 ||
-                    session?.HasMounts == true || hostControl.Enabled || claudeDesktop.Running)
+                    session?.HasMounts == true || hostControl.Enabled)
                     throw new InvalidOperationException("请先结束当前操作并安全卸载目录，再进入开发预览。");
                 connecting?.Cancel();
                 pendingHostTrust = null;
@@ -1545,6 +1223,30 @@ internal sealed class SafeCodeWebHost : IDisposable
                 pendingHostTrust = null;
                 return true;
 
+            case "connection.disconnect":
+                if (Volatile.Read(ref activeMutations) > 0 || Interlocked.CompareExchange(ref connectionPending, 1, 0) != 0)
+                    throw new InvalidOperationException("请等待当前操作完成后再退出登录。");
+                try
+                {
+                    if (session is { HasMounts: true } mounted) await mounted.UnmountAsync(ct);
+                    if (keyAccess?.ReusesHostControl == true) await keyAccess.StopAsync();
+                    if (hostControl.Enabled) await hostControl.DisableAsync(ct);
+                    session?.Dispose();
+                    session = null;
+                    pendingHostTrust = null;
+                    gatewayContext = null;
+                    keyStartedHost = null;
+                    cachedCloudPort = null;
+                    cachedRdpPort = null;
+                    cachedTunnelHost = "";
+                    lastMountStatusJson = "";
+                    return true;
+                }
+                finally
+                {
+                    Interlocked.Exchange(ref connectionPending, 0);
+                }
+
             case "host.trust":
                 if (pendingHostTrust is not { } challenge || challenge.Token != Read("token"))
                     throw new InvalidOperationException("服务器身份确认已失效，请重新连接。");
@@ -1553,8 +1255,8 @@ internal sealed class SafeCodeWebHost : IDisposable
                 return true;
 
             case "connect":
-                if (Volatile.Read(ref activeMutations) > 0 || session?.HasMounts == true || hostControl.Enabled || claudeDesktop.Running)
-                    throw new InvalidOperationException("正在保护挂载目录、SSH 接入或本机控制通道，请先停用并安全卸载再更换连接。");
+                if (Volatile.Read(ref activeMutations) > 0 || session?.HasMounts == true || hostControl.Enabled)
+                    throw new InvalidOperationException("正在保护挂载目录或本机控制通道，请先停用并安全卸载再更换连接。");
                 if (Interlocked.CompareExchange(ref connectionPending, 1, 0) != 0)
                     throw new InvalidOperationException("连接正在处理中，请稍候。");
                 try
@@ -1591,7 +1293,7 @@ internal sealed class SafeCodeWebHost : IDisposable
                     }
 
                     bool keyConfigured = File.Exists(Path.Combine(dataDirectory, "desktop-key.state"));
-                    if ((keyConfigured || claudeDesktop.Configured) && hostControl.CanResume(settings))
+                    if (keyConfigured && hostControl.CanResume(settings))
                     {
                         using var hostRestore = CancellationTokenSource.CreateLinkedTokenSource(connecting.Token);
                         hostRestore.CancelAfter(TimeSpan.FromSeconds(40));
@@ -1603,21 +1305,6 @@ internal sealed class SafeCodeWebHost : IDisposable
                         catch (OperationCanceledException) when (!connecting.IsCancellationRequested)
                         {
                             warnings.Add("本机远程控制恢复超时，可在设置中重试。");
-                        }
-                    }
-
-                    if (!keyConfigured && claudeDesktop.Configured)
-                    {
-                        using var desktopRestore = CancellationTokenSource.CreateLinkedTokenSource(connecting.Token);
-                        desktopRestore.CancelAfter(TimeSpan.FromSeconds(40));
-                        try
-                        {
-                            if (await claudeDesktop.ResumeAsync(current, desktopRestore.Token) is { } desktopWarning)
-                                warnings.Add(desktopWarning);
-                        }
-                        catch (OperationCanceledException) when (!connecting.IsCancellationRequested)
-                        {
-                            warnings.Add("Claude SSH 网关恢复超时，可在设置中重试。");
                         }
                     }
 
@@ -1664,8 +1351,8 @@ internal sealed class SafeCodeWebHost : IDisposable
             case "deploy":
             {
                 activeStep = Read("step");
-                if (activeStep == "account" && (hostControl.Enabled || claudeDesktop.Running))
-                    throw new InvalidOperationException("请先停用本机控制和 Claude Desktop SSH 接入，再修改工作账户。");
+                if (activeStep == "account" && hostControl.Enabled)
+                    throw new InvalidOperationException("请先停用本机控制，再修改工作账户。");
                 var currentSession = RequireSession();
                 if (activeStep == "desktop")
                 {
@@ -1679,9 +1366,12 @@ internal sealed class SafeCodeWebHost : IDisposable
                 }
 
                 LocaleSettings? locale = null;
-                if (args.ValueKind == JsonValueKind.Object && args.TryGetProperty("locale", out var region) && region.ValueKind == JsonValueKind.Object)
-                    locale = JsonSerializer.Deserialize<LocaleSettings>(region, JsonDefaults.Options);
-                locale ??= preferences.ReadSavedLocale(currentSession);
+                if (activeStep != "input_remove")
+                {
+                    if (args.ValueKind == JsonValueKind.Object && args.TryGetProperty("locale", out var region) && region.ValueKind == JsonValueKind.Object)
+                        locale = JsonSerializer.Deserialize<LocaleSettings>(region, JsonDefaults.Options);
+                    locale ??= preferences.ReadSavedLocale(currentSession);
+                }
 
                 var draft = activeStep == "account" ? preferences.ReadDraft(currentSession) : null;
                 var result = await currentSession.DeployAsync(
@@ -1769,6 +1459,11 @@ internal sealed class SafeCodeWebHost : IDisposable
             case "host.disable":
                 if (Volatile.Read(ref connectionPending) != 0)
                     throw new InvalidOperationException("请等待当前服务器连接完成。");
+                if (keyAccess?.ReusesHostControl == true)
+                {
+                    await keyAccess.StopAsync();
+                    keyStartedHost = null;
+                }
                 return await hostControl.DisableAsync(ct);
 
             case "safeCodeApi.refreshSubscription":
@@ -1787,9 +1482,15 @@ internal sealed class SafeCodeWebHost : IDisposable
                     args.ValueKind == JsonValueKind.Object && args.TryGetProperty("cloudcli", out var cloudcliInstall) ? cloudcliInstall : null);
             }
 
+            case "safeCodeApi.repair":
+                if (!Flag("accepted"))
+                    throw new InvalidOperationException("请先确认故障修复范围。");
+                activeStep = "gateway_repair";
+                return await RequireGatewaySession().RepairPublicGatewayAsync(Flag("reinstallCloudCLI"), ct);
+
             case "safeCodeApi.enablePublic":
                 if (!Flag("accepted"))
-                    throw new InvalidOperationException("请先确认「保证自用」。");
+                    throw new InvalidOperationException("请先点击公网网关的「启用」。");
                 return await RequireGatewaySession().EnablePublicGatewayAsync(ct);
 
             case "safeCodeApi.context":
@@ -1832,30 +1533,83 @@ internal sealed class SafeCodeWebHost : IDisposable
                 return await gatewaySession.ManagePublicGatewayAsync(request, ct);
             }
 
+            case "desktopKey.invalidate":
+                session?.InvalidateHostVerification();
+                return true;
+
+            case "desktopKey.connection":
+                return keyAccess?.ConnectionStatus;
+
+            case "desktopKey.mode":
+                if (args.ValueKind == JsonValueKind.Object && args.TryGetProperty("enabled", out var apiMode))
+                    preferences.SetApiAccessMode(apiMode.GetBoolean());
+                return preferences.PrefersApiAccess;
+
             case "desktopKey.status":
                 return await KeyAccess().RestoreAsync(ct, interactive: Flag("interactive"));
 
+            case "desktopKey.bashHistory":
+                return await KeyAccess().BashHistoryAsync(Read("session"), ct);
+
+            case "desktopKey.list":
+                return await KeyAccess().ListKeysAsync(ct);
+
+            case "desktopKey.save":
+                await KeyAccess().SaveKeyAsync(Read("key"), Read("name"), ct);
+                return true;
+
+            case "desktopKey.rename":
+                await KeyAccess().RenameKeyAsync(Read("id"), Read("name"), ct);
+                return true;
+
+            case "desktopKey.forget":
+                await KeyAccess().ForgetKeyAsync(Read("id"), ct);
+                return true;
+
+            case "desktopKey.savedBalance":
+                return await KeyAccess().SavedBalanceAsync(Read("id"), ct);
+
             case "desktopKey.enable":
-                if (claudeDesktop.Configured)
-                    throw new InvalidOperationException("请先停用 Claude Desktop 的 SSH 接入。");
+            {
                 pendingKeyDevice = null;
-                return await KeyAccess().EnableAsync(Read("key"), ct, replace: Flag("replace"), useSaved: Flag("useSaved"));
+                var keyResult = await KeyAccess().EnableAsync(
+                    Read("key"),
+                    ct,
+                    replace: Flag("replace"),
+                    useSaved: Flag("useSaved"),
+                    savedId: Read("savedId"),
+                    checkDevice: true,
+                    deviceSession: Volatile.Read(ref connectionPending) == 0 && session?.IsConnected == true && session.Server != null ? session : null);
+                if (keyResult is not DesktopKeyAccess.DeviceSetup setup) return keyResult;
+                pendingKeyDevice = setup;
+                if (Read("savedId") != "" && await KeyAccess().HasDeviceConsentAsync(setup.Remote, ct))
+                    return await AuthorizeKeyDeviceAsync(ct);
+                var keyHost = setup.HostSession;
+                bool existingControl = keyHost != null && hostControl.IsEnabledFor(keyHost);
+                return new
+                {
+                    requiresDevice = true,
+                    reuseControl = keyHost != null,
+                    existingControl,
+                    alias = existingControl ? keyHost!.HostControlStatus.Alias : setup.Existing?.Alias
+                };
+            }
 
             case "desktopKey.disable":
                 pendingKeyDevice = null;
-                return await KeyAccess().DisableAsync(ct);
+                try { return await KeyAccess().DisableAsync(ct); }
+                finally { await StopKeyHostControlAsync(); }
+
+            case "desktopKey.refreshModels":
+                return await KeyAccess().RefreshModelsAsync(ct);
 
             case "desktopKey.balance":
                 return await KeyAccess().ReadBalanceAsync(ct);
 
             case "desktopKey.authorizeDevice":
-            {
                 if (!Flag("riskAccepted"))
                     throw new InvalidOperationException("请先阅读并同意本机远程控制权限说明。");
-                var setup = pendingKeyDevice ?? throw new InvalidOperationException("请重新验证接入 Key。");
-                pendingKeyDevice = null;
-                return await KeyAccess().EnableAsync("", ct, replace: setup.Replace, useSaved: setup.UseSaved);
-            }
+                return await AuthorizeKeyDeviceAsync(ct);
 
             case "desktopKey.cancelDevice":
                 pendingKeyDevice = null;
@@ -1864,26 +1618,8 @@ internal sealed class SafeCodeWebHost : IDisposable
             case "desktopKey.deviceStatus":
                 return hostControl.Status;
 
-            case "claudeDesktop.status":
-                return await claudeDesktop.RefreshAsync(ct);
-
-            case "claudeDesktop.start":
-            {
-                if (!Flag("accepted"))
-                    throw new InvalidOperationException("请先确认通过 VPS 上的 CloudCLI 接入。");
-                if (File.Exists(Path.Combine(dataDirectory, "desktop-key.state")))
-                    throw new InvalidOperationException("请先停用 API Key 接入，再启用 SSH 接入。");
-                activeStep = "claude_desktop";
-                using var deadline = CancellationTokenSource.CreateLinkedTokenSource(ct);
-                deadline.CancelAfter(TimeSpan.FromSeconds(90));
-                return await claudeDesktop.StartAsync(RequireSession(), deadline.Token, Read("replaceOldProfile"));
-            }
-
-            case "claudeDesktop.stop":
-                if (Volatile.Read(ref connectionPending) != 0)
-                    throw new InvalidOperationException("请等待当前服务器连接完成。");
-                activeStep = "claude_desktop";
-                return await claudeDesktop.StopAsync(ct);
+            case "claudeDesktop.prepare":
+                return await KeyAccess().PrepareLaunchAsync(ct, syncHistory: Flag("syncHistory"));
 
             case "claudeDesktop.open":
                 return await PlatformLauncher.OpenLocalClientAsync("Claude", ct);
@@ -2205,6 +1941,20 @@ internal sealed class SafeCodeWebHost : IDisposable
                 return changed;
             }
 
+            case "socks.probe":
+                return await RequireSession().ProbeSocksEgressAsync(Read("proxyUrl"), ct);
+
+            case "socks.status":
+                return await RequireSession().RequestAsync<SocksEgressStatus>("socks_status", null, ct);
+
+            case "socks.enable":
+                if (!Flag("accepted"))
+                    throw new InvalidOperationException("请先确认整机代理的影响。");
+                return await RequireSession().SetSocksEgressAsync(Read("proxyUrl"), ct);
+
+            case "socks.disable":
+                return await RequireSession().SetSocksEgressAsync(null, ct);
+
             default:
                 throw new InvalidOperationException("未知客户端操作：" + operation);
         }
@@ -2215,7 +1965,91 @@ internal sealed class SafeCodeWebHost : IDisposable
         vault.ProtectBytes,
         vault.UnprotectBytes,
         diagnostics: services,
-        beforeMessages: ct => hostControl.MaintainForChatAsync(ct));
+        openBash: (sessionId, callId) => BroadcastAsync(new { type = "bashDetail", session = sessionId, call = callId }));
+
+    private async Task<object> AuthorizeKeyDeviceAsync(CancellationToken ct)
+    {
+        var setup = pendingKeyDevice ?? throw new InvalidOperationException("请重新验证接入 Key。");
+        if (setup.Switching)
+        {
+            try { await KeyAccess().DisableAsync(ct); }
+            finally { await StopKeyHostControlAsync(); }
+            if (KeyAccess().Configured)
+                throw new InvalidOperationException("原网关尚未确认解绑，请先点击「重试解绑」查看结果。");
+            setup = setup with { Switching = false };
+            pendingKeyDevice = setup;
+        }
+        if (setup.HostSession is not { } target)
+            throw new InvalidOperationException("独立 FRP 设备配对需在 macOS / Windows 原生客户端中完成；在 Web 宿主中请先 SSH 登录同一台 VPS 再复用本机远程控制。");
+        if (!ReferenceEquals(RequireSession(), target))
+            throw new InvalidOperationException("SSH 会话已变更，请重新验证接入 Key。");
+        if (hostControl.Enabled && !hostControl.IsEnabledFor(target))
+            throw new InvalidOperationException("现有本机远程控制属于另一台 VPS。请先在本机远程控制中停用它。");
+        activeStep = "host_enable";
+        bool startedHere = false;
+        try
+        {
+            if (!await target.CanReuseHostControlForKeyAsync(setup.Remote, ct))
+                throw new InvalidOperationException("该 Key 或网关的设备授权已变更，请重新验证接入 Key。");
+            if (!hostControl.Enabled)
+            {
+                await hostControl.EnableAsync(target, hostControl.DefaultAlias, ct);
+                startedHere = true;
+            }
+            else if (target.HostControlStatus.State != "connected")
+            {
+                await target.MaintainHostControlForChatAsync(ct);
+            }
+            var leaseReady = target.CaptureVerifiedHostControl();
+            bool HostReady() => ReferenceEquals(session, target) && hostControl.IsEnabledFor(target) && leaseReady();
+            string hostname = Environment.MachineName.Length <= 48 ? Environment.MachineName : Environment.MachineName[..48];
+            var binding = await target.BindPublicGatewayHostAsync(setup.Remote, hostname, ct);
+            var device = new DesktopKeyAccess.DeviceBinding(
+                binding.GetProperty("deviceId").GetString()!,
+                binding.GetProperty("deviceProof").GetString()!,
+                binding.GetProperty("alias").GetString()!,
+                0,
+                "");
+            var result = await KeyAccess().EnableAsync(
+                "",
+                ct,
+                setup.Replace,
+                setup.UseSaved,
+                setup,
+                device,
+                hostReady: HostReady,
+                devicePath: new(
+                    () => HostReady()
+                        ? null
+                        : target.HostControlStatus.State == "connected"
+                            ? "本次授权的 SSH 会话已断开，请重新启用接入。"
+                            : target.HostControlStatus.Message,
+                    (force, token) => target.MaintainHostControlForChatAsync(token, force),
+                    () => target.HostNetworkGeneration));
+            if (startedHere) keyStartedHost = target;
+            pendingKeyDevice = null;
+            return result;
+        }
+        catch
+        {
+            if (startedHere) await hostControl.DisableAsync(CancellationToken.None);
+            throw;
+        }
+        finally
+        {
+            activeStep = "";
+        }
+    }
+
+    private async Task StopKeyHostControlAsync()
+    {
+        if (keyStartedHost is { } target)
+        {
+            keyStartedHost = null;
+            if (hostControl.IsEnabledFor(target))
+                await hostControl.DisableAsync(CancellationToken.None);
+        }
+    }
 
     private async Task<uint> EnsureTunnelAsync(SshSession currentSession, uint remotePort, bool isCloud, CancellationToken ct)
     {
@@ -2762,12 +2596,10 @@ internal sealed class SafeCodeWebHost : IDisposable
     private async Task MaintainBackgroundAsync(CancellationToken ct)
     {
         using var timer = new PeriodicTimer(TimeSpan.FromSeconds(2));
-        int tick = 0;
         try
         {
             while (await timer.WaitForNextTickAsync(ct))
             {
-                tick++;
                 if (!clients.IsEmpty && session is { } current)
                 {
                     var mount = current.GetMountStatus();
@@ -2776,20 +2608,6 @@ internal sealed class SafeCodeWebHost : IDisposable
                     {
                         lastMountStatusJson = serialized;
                         await BroadcastAsync(new { type = "mountStatus", mount });
-                    }
-                }
-
-                if (tick % 8 == 0 && claudeDesktop.Running)
-                {
-                    try
-                    {
-                        var status = await claudeDesktop.RefreshAsync(ct);
-                        if (!clients.IsEmpty)
-                            await BroadcastAsync(new { type = "claudeDesktopStatus", status });
-                    }
-                    catch (Exception error) when (error is IOException or JsonException or UnauthorizedAccessException or CryptographicException)
-                    {
-                        QueueLog("claude_desktop", "无法刷新 Claude Desktop SSH 接入状态。");
                     }
                 }
             }
@@ -2871,11 +2689,9 @@ internal sealed class SafeCodeWebHost : IDisposable
     {
         logTimer.Dispose();
         lifetime.Cancel();
-        try { if (claudeDesktop.Running) claudeDesktop.StopAsync(CancellationToken.None, suspend: true).GetAwaiter().GetResult(); } catch { }
-        try { if (hostControl.Enabled) hostControl.SuspendAsync(CancellationToken.None).GetAwaiter().GetResult(); } catch { }
         try { if (keyAccess != null) keyAccess.StopAsync().GetAwaiter().GetResult(); } catch { }
+        try { if (hostControl.Enabled) hostControl.SuspendAsync(CancellationToken.None).GetAwaiter().GetResult(); } catch { }
         try { if (session?.HasMounts == true) session.UnmountAsync().GetAwaiter().GetResult(); } catch { }
-        claudeDesktop.Dispose();
         keyAccess?.Dispose();
         hostControl.Dispose();
         session?.Dispose();

@@ -23,7 +23,12 @@ def error_code(error):
     if isinstance(error,subprocess.TimeoutExpired):return 'timeout'
     return 'operation_failed'
 
-LONG_OPERATIONS={'account','localization','desktop','chrome','input','claude','ssh','cloud','mount_install'}
+LONG_OPERATIONS={'account','localization','desktop','chrome','input','input_remove','claude','ssh','cloud','mount_install','safe_code_api_repair'}
+INPUT_PACKAGES=['fcitx5','fcitx5-pinyin','fcitx5-frontend-gtk3','fcitx5-frontend-qt5']
+INPUT_AUTOSTART='.config/autostart/fcitx5.desktop'
+INPUT_DESKTOP='[Desktop Entry]\nType=Application\nName=Fcitx5\nExec=fcitx5 -d\nTerminal=false\n'
+INPUT_ENVIRONMENT='export XMODIFIERS="@im=fcitx"\nexport GTK_IM_MODULE=fcitx\nexport QT_IM_MODULE=fcitx\n'
+INPUT_PROFILE='[Groups/0]\nName=Default\nDefault Layout=us\nDefaultIM=pinyin\n\n[Groups/0/Items/0]\nName=keyboard-us\nLayout=\n\n[Groups/0/Items/1]\nName=pinyin\nLayout=\n\n[GroupOrder]\n0=Default\n'
 TASKS=['account','localization','desktop','chrome','input','claude','ssh']
 VALID_DESKTOP_SCALES=(100,150,200)
 DESKTOP_SCALE_PROFILES={
@@ -145,16 +150,20 @@ def run(args,check=True,env=None,stdin=None,timeout=180):
         raise RuntimeError(detail[-1600:] or '命令执行失败')
     return p
 
-def stream(args,env=None):
+def stream(args,env=None,report_upgrade=False):
     p=subprocess.Popen(args,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,env=env,bufsize=1)
     reason=None
+    applying=False
     for line in p.stdout:
+        if report_upgrade and not applying and line.startswith(("Preconfiguring packages", "Preparing to unpack", "Unpacking", "Setting up")):
+            applying=True
+            log("软件包已下载，正在安装系统更新。")
         if line.strip():log(line.rstrip())
         lower=line.lower()
         if 'could not resolve' in lower or 'temporary failure resolving' in lower:reason='dns_failure'
         elif 'no space left on device' in lower:reason='disk_full'
         elif 'dpkg was interrupted' in lower:reason='package_interrupted'
-        elif 'failed to fetch' in lower and reason not in ['dns_failure','disk_full']:reason='package_fetch_failed'
+        elif ('failed to fetch' in lower or 'unable to locate package' in lower or 'has no installation candidate' in lower) and reason not in ['dns_failure','disk_full']:reason='package_fetch_failed'
         elif ('lock-frontend' in lower or 'waiting for cache lock' in lower or 'could not get lock' in lower) and reason is None:reason='package_lock_wait'
     if p.wait():
         hints={'package_lock_wait':'系统包管理器正被占用，请稍后重试。','dns_failure':'服务器无法解析下载域名，请检查 DNS 后重试。','package_fetch_failed':'软件包下载失败，请检查服务器网络后重试。','disk_full':'服务器磁盘空间不足，请清理后重试。','package_interrupted':'上次软件包安装被中断，请修复 dpkg 后重试。'}
@@ -178,7 +187,7 @@ def account():
 
 def home():return Path(pwd.getpwnam(account()['username']).pw_dir)
 USER_FILES = r"""
-import json,os,pathlib,sys,tempfile
+import json,os,pathlib,re,sys,tempfile
 request=json.load(sys.stdin);base=pathlib.Path(os.environ['HOME']).resolve();relative=pathlib.Path(request['relative'])
 if relative.is_absolute() or '..' in relative.parts:raise ValueError('用户目录路径无效。')
 target=base/relative;operation=request['operation']
@@ -288,20 +297,6 @@ if operation=='host_bridge':
         if proof.returncode or proof.stdout.strip()!=user_sid:raise ValueError('本机 Windows 账户身份与授权不匹配，未生成可用状态。')
     import shlex
     print(json.dumps({'command':'ssh -F '+shlex.quote(str(config))+' '+alias,'verified':True}));sys.exit(0)
-if operation=='desktop_gateway':
-    import base64,hashlib,re,subprocess
-    client=request.get('clientId','')
-    if not re.fullmatch('[a-f0-9]{32}',client) or relative!=pathlib.Path('.local/state/safe-code/desktop-gateway')/client:raise ValueError('Desktop 网关目录无效。')
-    data=base64.b64decode(request['source']);digest=hashlib.sha256(data).hexdigest()
-    library=base/'.local/share/safe-code/desktop-gateway';library.mkdir(parents=True,exist_ok=True,mode=0o700)
-    if not library.resolve().is_relative_to(base):raise ValueError('Desktop 网关程序路径越界。')
-    script=library/(digest+'.py')
-    if script.is_symlink():raise ValueError('Desktop 网关程序不能是链接。')
-    if script.exists() and script.read_bytes()!=data:raise ValueError('Desktop 网关文件已被修改。')
-    if not script.exists():script.write_bytes(data);script.chmod(0o600)
-    result=subprocess.run(['/usr/bin/python3','-B',str(script),'--manage',str(target)],input=json.dumps(request),text=True,capture_output=True,timeout=35)
-    if result.returncode:raise ValueError('VPS Desktop 网关启动/停止未确认；未返回配置或凭据。')
-    print(result.stdout.strip());sys.exit(0)
 if operation=='codex_bridge':
     import base64,fcntl,hashlib,re,shlex,socket,struct,subprocess,time
     if relative!=pathlib.Path('.local/state/safe-code/codex-bridge'):raise ValueError('适配器管理路径无效。')
@@ -452,8 +447,36 @@ if operation=='remove_alias':
     destination=pathlib.Path(request['destination'])
     if target.is_symlink() and target.readlink()==destination:target.unlink();target.mkdir(mode=0o700)
     sys.exit(0)
+if operation in ['remove_exact','write_if_missing','session_environment']:
+    if target.is_symlink() or target.exists() and (not target.is_file() or target.stat().st_size>1048576):
+        raise ValueError('配置文件不是普通文件或超过大小限制。')
+    if operation=='remove_exact':
+        if target.is_file():
+            if target.read_text()!=request['content']:raise ValueError('输入法自启动文件已被修改，请先检查自定义配置。')
+            target.unlink()
+        sys.exit(0)
+    if operation=='write_if_missing' and target.exists():
+        if request.get('requireExact') and target.read_text()!=request['content']:
+            raise ValueError('已有其他输入法自启动配置，已保留现有设置。')
+        sys.exit(0)
+if operation=='session_environment':
+    previous=target.read_text() if target.exists() else ''
+    environment=request['inputEnvironment']
+    # Match the marked block or the contiguous lines written after LANG by earlier versions.
+    block='# Safe Code: Fcitx5\n'+environment+'# Safe Code: end Fcitx5\n'
+    content=previous.replace(block,'')
+    generated_lang=r'\Aexport LANG=[a-z]{2}_[A-Z]{2}\.UTF-8\n'
+    content=re.sub('('+generated_lang+')'+re.escape(environment),r'\1',content,count=1)
+    locale=request.get('locale')
+    if locale:
+        locale_line='export LANG='+locale+'\n'
+        if re.match(generated_lang,content):content=re.sub(generated_lang,locale_line,content,count=1)
+        else:content=locale_line+content
+    if request['inputEnabled']:content=(content.rstrip('\n')+'\n' if content else '')+block
+    if content==previous:sys.exit(0)
+    if target.exists():request['mode']=target.stat().st_mode&0o777
+else:content=request['content']
 target.parent.mkdir(parents=True,exist_ok=True)
-content=request['content']
 if operation=='append_unique':
     if target.exists() and (not target.is_file() or target.stat().st_size>1048576):raise ValueError('配置文件不是普通文件或超过大小限制。')
     previous=target.read_text() if target.exists() else ''
@@ -529,6 +552,27 @@ def wait_package_manager(timeout=900):
         log('系统正在更新，正在等待包管理器完成，请勿关闭服务器…')
         time.sleep(15)
 
+def refresh_package_lists(options,env,force=False):
+    sources=Path('/etc/apt/sources.list.d')
+    files=[Path('/etc/apt/sources.list'),*sorted(sources.glob('*.list')),*sorted(sources.glob('*.sources'))]
+    digest=hashlib.sha256()
+    for path in files:
+        if path.is_file():
+            digest.update(str(path).encode()+b'\0'+path.read_bytes()+b'\0')
+    marker=STATE/'apt-index.json'
+    fingerprint=digest.hexdigest()
+    if marker.is_file() and not force:
+        try:saved=json.loads(marker.read_text())
+        except (OSError,ValueError):saved={}
+        updated=saved.get('updatedAt') if isinstance(saved,dict) else None
+        if isinstance(updated,(int,float)) and saved.get('sources')==fingerprint and 0<=time.time()-updated<900:
+            log('软件源索引刚刚更新，复用本次部署的索引。')
+            return True
+    log('正在更新软件源，请稍候…')
+    stream(options+['update'],env)
+    write(marker,json.dumps({'sources':fingerprint,'updatedAt':time.time()}),0o600)
+    return False
+
 def prepare_system():
     marker=STATE/'system-prepared.json'
     if marker.exists():return
@@ -539,9 +583,9 @@ def prepare_system():
     if audit.stdout.strip():
         log('检测到未完成的软件包配置，正在继续完成…')
         stream(['dpkg','--configure','-a'],env)
-    log('正在更新软件源，请稍候…');stream(opts+['update'],env)
-    log('正在更新系统软件包，首次安装可能需要较长时间…')
-    stream(opts+['upgrade','-y','--with-new-pkgs','--no-remove'],env)
+    refresh_package_lists(opts,env,force=True)
+    log('正在下载系统更新，首次安装可能需要较长时间…')
+    stream(opts+['upgrade','-y','--with-new-pkgs','--no-remove'],env,report_upgrade=True)
     write(marker,json.dumps({'completedAt':int(time.time())}),0o600)
     log('系统准备完成，继续安装所选组件。')
     if Path('/var/run/reboot-required').exists():log('系统更新提示稍后需要重启；本次不会自动重启服务器。')
@@ -551,8 +595,13 @@ def apt(packages):
     if not missing:log('所需组件已安装，跳过重复下载。');return
     wait_package_manager()
     env=package_environment();opts=package_options()
-    stream(opts+['update'],env)
-    stream(opts+['install','-y','--no-install-recommends']+missing,env)
+    reused=refresh_package_lists(opts,env)
+    try:stream(opts+['install','-y','--no-install-recommends']+missing,env)
+    except OperationError as error:
+        if error.code!='package_fetch_failed' or not reused:raise
+        # A mirror may have moved a package since a recent index refresh.
+        refresh_package_lists(opts,env,force=True)
+        stream(opts+['install','-y','--no-install-recommends']+missing,env)
 
 def active(unit):return run(['systemctl','is-active','--quiet',unit],False).returncode==0
 def version(path):
@@ -601,12 +650,14 @@ def inspect():
         timezone=run(['timedatectl','show','-p','Timezone','--value'],False).stdout.strip()
         localized=timezone==desired.get('timezone') and system_locale==desired.get('locale','') and locale_generated(desired.get('locale','')) and all(package_installed(p) for p in locale_packages(desired.get('locale',''),desired.get('timezone','')))
     pub=user_read('.ssh/authorized_keys') if account_ok else ''
+    pinyin=account_ok and package_installed('fcitx5-pinyin')
+    managed_input=account_ok and (user_read(INPUT_AUTOSTART)==INPUT_DESKTOP or owns_pinyin())
     statuses={
       'account':account_ok and bool(a.get('hostname')) and a['hostname']==os.uname().nodename,
       'localization':localized,
       'desktop':package_installed('xfce4-session') and package_installed('xorgxrdp') and active('xrdp') and loopback,
       'chrome':bool(version('/usr/bin/google-chrome-stable')),
-      'input':package_installed('fcitx5-pinyin') and (h/'.config/autostart/fcitx5.desktop').exists(),
+      'input':pinyin and (h/INPUT_AUTOSTART).exists(),
       'claude':'Claude Code' in version(h/'.local/bin/claude'),
       'ssh':bool('safe-code-' in pub),
     }
@@ -621,6 +672,10 @@ def inspect():
     if policy and shutil.which('nft'):
         import network
         healthy=network.healthy(policy)
+    socks=None
+    if (STATE/'socks-egress.json').exists():
+        import socks_egress
+        socks=socks_egress.status()
     os_version=info.get('VERSION_ID','').strip() or ('13' if info.get('VERSION_CODENAME','').strip()=='trixie' else '')
     herdr_ver=version(h/'.local/bin/herdr')
     return {'osId':info.get('ID',''),'osName':info.get('PRETTY_NAME',''),'osVersion':os_version,
@@ -632,7 +687,8 @@ def inspect():
       'herdrVersion':herdr_ver,'herdrReady':bool(herdr_ver),
       'desktopReady':statuses['desktop'],'desktopScale':read_desktop_scale(),
       'cloudReady':active('safe-code-cloudcli'),'mountReady':package_installed('davfs2'),
-      'ipPolicy':policy,'activeJobs':active_jobs() if os.geteuid()==0 else []}
+      'rebootRequired':Path('/var/run/reboot-required').exists(),'inputManaged':managed_input,'inputPinyinInstalled':pinyin,
+      'ipPolicy':policy,'socksEgress':socks,'activeJobs':active_jobs() if os.geteuid()==0 else []}
 
 def resolve_fish():
     return shutil.which('fish') or '/usr/bin/fish'
@@ -697,6 +753,7 @@ def setup_account(options):
     fish_bin=resolve_fish()
     login_shell=fish_bin if Path(fish_bin).exists() else '/bin/bash'
     password=password or secrets.token_urlsafe(20)
+    log('正在创建工作用户并设置机器名称…')
     run(['hostnamectl','set-hostname',hostname])
     run(['useradd','-m','-s',login_shell,user])
     run(['chpasswd'],stdin=user+':'+password+'\n')
@@ -831,17 +888,19 @@ def setup_xsession(scale=None):
         'exec startxfce4\n',
         0o755,
     )
-    user_write(
-        '.xsessionrc',
+    rc=(
         'export LANG='+locale+'\n'
-        'export XMODIFIERS="@im=fcitx"\n'
-        'export GTK_IM_MODULE=fcitx\n'
-        'export QT_IM_MODULE=fcitx\n'
         'export QT_AUTO_SCREEN_SCALE_FACTOR=0\n'
         'export QT_SCALE_FACTOR='+profile['qt_scale']+'\n'
         'export XCURSOR_SIZE='+str(profile['cursor_size'])+'\n'
-        'export GDK_SCALE='+str(profile['gdk_scale'])+'\n',
+        'export GDK_SCALE='+str(profile['gdk_scale'])+'\n'
     )
+    if user_read(INPUT_AUTOSTART)==INPUT_DESKTOP and package_installed('fcitx5-pinyin'):
+        rc+='# Safe Code: Fcitx5\n'+INPUT_ENVIRONMENT+'# Safe Code: end Fcitx5\n'
+    user_write('.xsessionrc',rc)
+
+def update_input_environment(enabled,locale=None):
+    user_files('session_environment','.xsessionrc',inputEnvironment=INPUT_ENVIRONMENT,inputEnabled=enabled,locale=locale)
 
 def _apply_desktop_scale_live(username,profile,theme):
     try:
@@ -975,11 +1034,26 @@ def setup_chrome(options):
     write_chrome_desktop(read_desktop_scale())
     log(version('/usr/bin/google-chrome-stable'))
 
+def pinyin_owner():
+    entry=pwd.getpwnam(account()['username'])
+    return {'username':entry.pw_name,'uid':entry.pw_uid}
+
+def owns_pinyin():
+    marker=STATE/'input-pinyin-owner.json'
+    return marker.is_file() and json.loads(marker.read_text())==pinyin_owner()
+
 def setup_input(options):
-    account();apt(['fcitx5','fcitx5-pinyin','fcitx5-frontend-gtk3','fcitx5-frontend-qt5','fonts-noto-cjk'])
-    setup_xsession()
-    user_write('.config/fcitx5/profile','[Groups/0]\nName=Default\nDefault Layout=us\nDefaultIM=pinyin\n\n[Groups/0/Items/0]\nName=keyboard-us\nLayout=\n\n[Groups/0/Items/1]\nName=pinyin\nLayout=\n\n[GroupOrder]\n0=Default\n')
-    user_write('.config/autostart/fcitx5.desktop','[Desktop Entry]\nType=Application\nName=Fcitx5\nExec=fcitx5 -d\nTerminal=false\n')
+    account()
+    existing=user_read(INPUT_AUTOSTART)
+    if existing and existing!=INPUT_DESKTOP:
+        raise RuntimeError('已有其他输入法自启动配置，已保留现有设置。')
+    marker=STATE/'input-pinyin-owner.json'
+    if not marker.exists() and not package_installed('fcitx5-pinyin'):
+        write(marker,json.dumps(pinyin_owner()),0o600)
+    apt(INPUT_PACKAGES+['fonts-noto-cjk'])
+    user_files('write_if_missing','.config/fcitx5/profile',content=INPUT_PROFILE)
+    user_files('write_if_missing',INPUT_AUTOSTART,content=INPUT_DESKTOP,requireExact=True)
+    update_input_environment(True)
     log('拼音与中文字体已就绪，重新登录桌面后生效。')
 
 def ensure_herdr():
@@ -1015,6 +1089,22 @@ def ensure_herdr():
         log('Herdr 已就绪：'+ver)
     return ver
 
+def remove_input(options):
+    owner=pinyin_owner()
+    # Remove exactly the legacy or current Safe Code entry while preserving the user's profile.
+    user_files('remove_exact',INPUT_AUTOSTART,content=INPUT_DESKTOP)
+    update_input_environment(False)
+    if owns_pinyin():
+        shared=any((Path(entry.pw_dir)/'.config/fcitx5').exists() or (Path(entry.pw_dir)/INPUT_AUTOSTART).exists()
+                   for entry in pwd.getpwall() if entry.pw_uid!=owner['uid'] and entry.pw_dir.startswith(('/home/','/root')))
+        if package_installed('fcitx5-pinyin') and not shared:
+            wait_package_manager()
+            # dpkg checks dependencies and cannot remove any other package in this invocation.
+            removed=run(['dpkg','--remove','fcitx5-pinyin'],False,env=package_environment())
+            if removed.returncode:log('系统中仍保留拼音包，可能有其他软件依赖或包管理器正忙。')
+        (STATE/'input-pinyin-owner.json').unlink(missing_ok=True)
+    if package_installed('fcitx5-pinyin'):log('系统中的拼音包已保留，仅卸载当前工作用户的 Safe Code 输入法设置。')
+    log('工作用户的中文输入法配置已卸载，重新登录桌面后生效。')
 def file_sha256(file):
     digest=hashlib.sha256()
     for block in iter(lambda:file.read(1024*1024),b''):digest.update(block)
@@ -1379,14 +1469,17 @@ def codex_bridge(options):
 
 API_DIRECTORY=Path('/opt/safe-code/desktop-api')
 API_UNIT=Path('/etc/systemd/system/safe-code-desktop-api.service')
+CLOUD_UNIT=Path('/etc/systemd/system/safe-code-cloudcli.service')
 API_FILES={'install.sh','desktop_gateway.py','server.py','management.py','claude_usage.py',
-           'pricing.py','configure_cloudcli.py','host_control_mcp.py','device_bridge.py','codex_bridge.zip'}
+           'pricing.py','gateway_directory.py','configure_cloudcli.py','host_control_mcp.py','device_bridge.py','device_service.py','prompt_review.py','codex_bridge.zip'}
 API_STATE='.local/state/safe-code-desktop-api'
 
 def safe_code_api(options):
     action=options.get('action')
-    if action not in ('list','usage','issue','update','revoke','delete','settings','set_port','set_origin','set_concurrency','public_status','enable_public','refresh_subscription','install',
-                      'ticket_endpoint','key_host_reuse','bind_ssh_device'):
+    multi = action in ('multi.list', 'multi.inspect', 'multi.create', 'multi.claim', 'multi.remove')
+    remote = 'gateway_target' in options
+    if action not in ('list','usage','issue','update','unbind','revoke','delete','settings','set_port','set_origin','set_concurrency','public_status','enable_public','refresh_subscription','install',
+                      'ticket_endpoint','key_host_reuse','bind_ssh_device','model_catalog','project_catalog','set_prompt_review','set_key_queue','repair','repair_cloudcli_login') and not multi:
         raise RuntimeError('未知 Safe Code API 管理操作。')
     entry=pwd.getpwnam(account()['username'])
     if entry.pw_uid==0:raise RuntimeError('工作账户不能是 root。')
@@ -1395,8 +1488,19 @@ def safe_code_api(options):
     work_python=['runuser','-u',entry.pw_name,'--','env','-i','HOME='+entry.pw_dir,'PATH=/usr/bin:/bin',
                  'LANG=C.UTF-8','/usr/bin/python3']
     command=[*work_python,'-B',str(script),'--state',str(directory)]
+    if multi or remote:
+        if remote and action not in ('list','usage','model_catalog','refresh_subscription','issue','update',
+                                     'revoke','delete','set_concurrency','set_key_queue','set_prompt_review'):
+            raise RuntimeError('不支持此远程网关操作。')
+        if not script.is_file():
+            raise RuntimeError('当前 VPS 尚未安装 Safe Code API 管理服务。')
+        return safe_code_api_admin(command, options, timeout=27)
     if action=='install':
         return install_safe_code_api(entry, command, options, work_python)
+    if action=='repair':
+        return repair_safe_code_api(entry, command, options, work_python)
+    if action=='repair_cloudcli_login':
+        return repaired_cloudcli_login(work_python, options.get('port'))
     if not script.is_file():
         if action=='public_status':
             return {'installed':False,'enabled':False,
@@ -1405,6 +1509,8 @@ def safe_code_api(options):
     if action == 'public_status':
         status = safe_code_api_admin(command, options)
         return {**status, 'cloudcliConfigured':(Path(entry.pw_dir)/'.config/safe-code/cloudcli-gateway.json').is_file()}
+    if action in ('model_catalog', 'project_catalog'):
+        return safe_code_api_admin(command, options, timeout=27)
     if action in ('enable_public', 'issue', 'key_host_reuse', 'bind_ssh_device'):
         status = safe_code_api_admin(command, {'action':'public_status'})
         if status.get('backend') != 'cloudcli':
@@ -1412,11 +1518,15 @@ def safe_code_api(options):
     if action == 'set_port':
         return change_safe_code_api_port(command, options)
     if action == 'refresh_subscription':
-        if not safe_code_api_admin(command, {'action':'public_status'}).get('enabled'):
+        status = safe_code_api_admin(command, {'action':'public_status'})
+        if not status.get('enabled'):
             raise ValueError('请先启用 Safe Code API 公网服务。')
         source = Path(__file__).with_name('claude_usage.py').read_text()
         output = run([*work_python, '-I', '-'], stdin=source, timeout=18)
-        return json.loads(output.stdout)
+        sample = json.loads(output.stdout)
+        if status.get('gatewayRevision', 0) >= 19 and sample.get('state') == 'available':
+            return safe_code_api_admin(command, {'action':'remember_subscription', 'sample':sample})
+        return sample
     if action in ('key_host_reuse','bind_ssh_device'):
         settings = safe_code_api_admin(command, {'action':'settings'})
         # CloudCLI's gateway requires a loopback bind and uses its own device routing.
@@ -1449,7 +1559,7 @@ def gateway_public_origin(settings, hints):
         return settings['origin']
     bind = ipaddress.ip_address(settings['bind'])
     if bind.is_loopback:
-        raise ValueError('此 VPS 网关当前只监听本机回环地址。请通过 SSH 接入 Claude Desktop。')
+        raise ValueError('此 VPS 网关仅监听回环地址，请在网关设置中填写可从公网访问的 HTTPS 地址。')
     port = settings['port']
     hints = hints if isinstance(hints, dict) else {}
     resolved = hints.get('resolved')
@@ -1472,14 +1582,253 @@ def gateway_public_origin(settings, hints):
             return f'https://{host}:{port}'
     raise ValueError('未识别到 VPS 的公网 IP。请用 VPS 控制台显示的公网 IP 重新建立 SSH 连接后再创建密钥。')
 
-def install_safe_code_api(entry, command, options, work_python):
-    if options.get('accepted') is not True:
-        raise ValueError('请先确认安装 Safe Code API 服务。')
+def gateway_install_files(options, folder):
     files=options.get('files')
     if not isinstance(files,dict) or set(files)!=API_FILES or any(
         not isinstance(value,str) or len(value)>2*1024*1024 for value in files.values()
     ):
         raise ValueError('Safe Code API 安装组件不完整，请重新安装客户端。')
+    for name,data in files.items():
+        (folder/name).write_bytes(base64.b64decode(data,validate=True))
+    if hashlib.sha256((folder/'codex_bridge.zip').read_bytes()).hexdigest()!=CODEX_BRIDGE_SOURCE_HASH:
+        raise ValueError('Safe Code API 安装组件校验失败。')
+    if run(['/usr/bin/python3', '-I', '-c', 'from cryptography.hazmat.primitives.ciphers.aead import AESGCM'], check=False).returncode:
+        apt(['python3-cryptography'])
+
+def managed_service(unit, directory, user, start_arguments):
+    # Refuse another installer, distro unit, or drop-in that redirects execution elsewhere.
+    for name,expected in [('FragmentPath',str(unit)),('User',user),('WorkingDirectory',str(directory))]:
+        if run(['systemctl','show','-p',name,'--value',unit.name],timeout=8).stdout.strip()!=expected:
+            raise RuntimeError('无法确认 '+unit.name+' 由 Safe Code 管理，未更改服务。')
+    exec_start=run(['systemctl','show','-p','ExecStart','--value',unit.name],timeout=8).stdout
+    if 'argv[]='+start_arguments+' ;' not in exec_start or unit.is_symlink() or not unit.is_file() or unit.stat().st_uid!=0 or unit.stat().st_mode&0o022:
+        raise RuntimeError('检测到非标准 '+unit.name+' 启动配置，未更改服务。')
+
+def installed_gateway_revision(path):
+    if path.is_symlink() or not path.is_file():
+        return None
+    with path.open('rb') as stream:
+        match=re.search(rb'^GATEWAY_REVISION\s*=\s*(\d+)\s*$',stream.read(2*1024*1024),re.M)
+    return int(match[1]) if match else None
+
+def stage_cloudcli_repair(cloud, staged):
+    node_root=API_DIRECTORY.parent/'node'
+    npm=node_root/'bin/npm'
+    for name in ('package.json','package-lock.json'):
+        source=cloud/name
+        if source.is_symlink() or not source.is_file() or source.stat().st_uid!=0 or source.stat().st_mode&0o022:
+            raise RuntimeError('未找到 Safe Code 安装的 CloudCLI 锁定清单。')
+        shutil.copyfile(source,staged/name)
+    locked=json.loads((staged/'package-lock.json').read_text())['packages']
+    package='node_modules/@cloudcli-ai/cloudcli'
+    version=locked.get(package,{}).get('version','')
+    if not re.fullmatch(r'\d+\.\d+\.\d+',version) or not npm.is_file():
+        raise RuntimeError('无法核对已安装的 CloudCLI 官方版本或专用 Node。')
+    for name,record in locked.items():
+        if name and (record.get('link') or not record.get('resolved','').startswith('https://registry.npmjs.org/')
+                     or not record.get('integrity')):
+            raise RuntimeError('CloudCLI 锁定清单含非官方源或缺少完整性摘要。')
+    log('正在准备 CloudCLI 官方原版 '+version+'…')
+    env={'PATH':str(npm.parent)+':/usr/sbin:/usr/bin:/bin','HOME':str(staged.parent),'LANG':'C.UTF-8',
+         'SHARP_IGNORE_GLOBAL_LIBVIPS':'1'}
+    if (npm.parent.parent/'include/node/node.h').is_file():
+        env['npm_config_nodedir']=str(npm.parent.parent)
+    global_config=staged.parent/'global.npmrc'
+    global_config.touch(mode=0o600)
+    install=[str(npm),'ci','--prefix',str(staged),'--userconfig','/dev/null','--globalconfig',str(global_config),
+             '--no-audit','--no-fund','--prefer-offline']
+    try:
+        run(install,env=env,timeout=360)
+    except RuntimeError as error:
+        lacks_toolchain=any(not shutil.which(tool,path=env['PATH']) for tool in ('make','g++','python3'))
+        if 'gyp ERR!' not in str(error) or not lacks_toolchain:
+            raise
+        log('CloudCLI 的原生依赖需要在本机编译，正在安装 Debian 13 构建工具…')
+        apt(['build-essential','python3'])
+        run(install,env=env,timeout=360)
+    current=json.loads((staged/package/'package.json').read_text())
+    if current.get('name')!='@cloudcli-ai/cloudcli' or current.get('version')!=version:
+        raise RuntimeError('CloudCLI 官方软件包版本与锁定清单不一致。')
+
+def repair_safe_code_api(entry, command, options, work_python):
+    if options.get('accepted') is not True or type(options.get('reinstallCloudCLI',False)) is not bool:
+        raise ValueError('请先确认故障修复范围。')
+    with_cloud=options.get('reinstallCloudCLI',False)
+    cloud=API_DIRECTORY.parent/'cloudcli'
+    cloud_unit=CLOUD_UNIT
+    cloud_script='node_modules/@cloudcli-ai/cloudcli/dist-server/server/index.js'
+    state=Path(entry.pw_dir)/API_STATE
+    if state.resolve().is_relative_to(API_DIRECTORY.resolve()):
+        raise RuntimeError('网关数据位于程序目录，无法安全重装。')
+    secure_root_directory(STATE,0o700)
+    secure_root_directory(API_DIRECTORY.parent,0o755)
+    secure_root_directory(API_UNIT.parent,0o755)
+    with (STATE/'install.lock').open('a') as install_lock, (STATE/'desktop-api-port.lock').open('a') as port_lock:
+        try:
+            for lock in (install_lock,port_lock):fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise OperationError('deployment_busy','VPS 有部署或网关设置正在处理，请稍后再试。') from None
+        managed_service(API_UNIT,API_DIRECTORY,entry.pw_name,'/usr/bin/python3 -B '+str(API_DIRECTORY/'server.py')+' --state '+str(state)+' serve')
+        if API_DIRECTORY.exists() or API_DIRECTORY.is_symlink():
+            secure_root_directory(API_DIRECTORY,0o755)
+        if with_cloud:
+            secure_root_directory(cloud,0o755)
+            managed_service(cloud_unit,Path(entry.pw_dir),entry.pw_name,
+                            str(cloud.parent/'node/bin/node')+' '+str(cloud/cloud_script))
+        with tempfile.TemporaryDirectory(prefix='desktop-api-repair-input-',dir=STATE) as folder:
+            source=Path(folder)
+            gateway_install_files(options,source)
+            revision=installed_gateway_revision(source/'server.py')
+            previous=installed_gateway_revision(API_DIRECTORY/'server.py')
+            if revision is None or previous is not None and previous>revision:
+                raise ValueError('VPS 网关版本比客户端内置版本新，或安装组件版本未知。请先更新 Safe Code 客户端。')
+            return replace_gateway_programs(entry,command,source,state,work_python,revision,
+                                            (cloud,cloud_unit,cloud_script) if with_cloud else None)
+
+# Use the installed Safe Code module under the work account so the same private-file and
+# credential checks apply. Print only the outcome and the verified web login over SSH.
+REPAIRED_CLOUDCLI_LOGIN = r"""
+import json
+import sys
+
+sys.path.insert(0, sys.argv[1])
+from desktop_gateway import GatewayError, cloudcli_web_login, load_cloudcli_config
+
+
+def read_login(port):
+    config = load_cloudcli_config()
+    login = config['desktopQuestions'] if config and config['port'] == port else None
+    if not login or 'password' not in login:
+        return {'state': 'unavailable'}
+    try:
+        cloudcli_web_login(port, login)
+    except GatewayError:
+        return {'state': 'unverified'}
+    return {'state': 'verified', **login}
+
+
+try:
+    print(json.dumps(read_login(int(sys.argv[2]))))
+except GatewayError:
+    print(json.dumps({'state': 'unavailable'}))
+"""
+
+
+def repaired_cloudcli_login(work_python, port):
+    # Never write a credential response into a repair job's result or log files.
+    if JOB_DIR is not None or type(port) is not int or not 1 <= port <= 65535:
+        raise ValueError('CloudCLI 登录信息只能在重装完成后读取。')
+    try:
+        checked = run([*work_python, '-IB', '-c', REPAIRED_CLOUDCLI_LOGIN, str(API_DIRECTORY), str(port)],
+                      check=False, timeout=12)
+        if checked.returncode == 0:
+            return json.loads(checked.stdout)
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        pass
+    return {'state': 'unavailable'}
+
+def provision_gateway_devices(entry, state):
+    run(['/usr/bin/python3','-B',str(API_DIRECTORY/'device_service.py'),
+         entry.pw_name,str(API_DIRECTORY),str(state)],timeout=250)
+
+def replace_gateway_programs(entry, command, source, state, work_python, revision, cloud_install):
+    log('正在准备当前客户端内置的网关安装组件…')
+    program=Path(tempfile.mkdtemp(prefix='.desktop-api-repair-',dir=API_DIRECTORY.parent))
+    replacements=[(API_DIRECTORY,program)]
+    units=[API_UNIT]
+    keep_backups=False
+    swapped=[]
+    stopped=[]
+    previously_active={}
+    try:
+        service=Path(tempfile.mkdtemp(prefix='.desktop-api-repair-',dir=API_UNIT.parent))
+        replacements.append((API_UNIT,service))
+        run(['/bin/bash',str(source/'install.sh'),'--prepare-repair',entry.pw_name,str(API_DIRECTORY),
+             str(state),str(program/'new'),str(service/'new')],timeout=45)
+        for script in (program/'new').glob('*.py'):
+            compile(script.read_bytes(),script.name,'exec')
+        if cloud_install:
+            cloud,cloud_unit,cloud_script=cloud_install
+            package=Path(tempfile.mkdtemp(prefix='.cloudcli-repair-',dir=cloud.parent))
+            replacements.append((cloud,package))
+            units.append(cloud_unit)
+            raw_env=run(['systemctl','show','-p','Environment','--value',cloud_unit.name],timeout=8).stdout
+            cloud_env=dict(item.split('=',1) for item in shlex.split(raw_env) if '=' in item)
+            env_files=run(['systemctl','show','-p','EnvironmentFiles','--value',cloud_unit.name],timeout=8).stdout
+            database=Path(cloud_env.get('DATABASE_PATH',''))
+            cloud_home=Path(cloud_env.get('HOME',entry.pw_dir))
+            if env_files.strip() or any(not path.is_absolute() or path.resolve().is_relative_to(cloud.resolve())
+                                        for path in (database,cloud_home)):
+                raise RuntimeError('无法确认 CloudCLI 的账号和对话数据位于程序目录外，未更改服务。')
+            port=cloud_env.get('SERVER_PORT','3001')
+            if not port.isdecimal() or not 1<=int(port)<=65535:
+                raise ValueError('CloudCLI 的服务端口无效。')
+            (package/'new').mkdir(mode=0o755)
+            stage_cloudcli_repair(cloud,package/'new')
+            if not (package/'new'/cloud_script).is_file():
+                raise RuntimeError('CloudCLI 安装包缺少服务入口。')
+        previously_active={unit:active(unit.name) for unit in units}
+        try:
+            settings=safe_code_api_admin(command,{'action':'settings'},timeout=3)
+        except (RuntimeError,subprocess.TimeoutExpired):
+            settings={}  # A broken admin socket is one reason to run repair.
+        if settings.get('busy'):
+            raise RuntimeError('网关还有任务正在处理，请等任务完成后再修复。')
+        log('正在停止旧服务并更换程序文件，原有网关数据保留…')
+        for unit in units:
+            run(['systemctl','stop',unit.name],timeout=30)
+            stopped.append(unit)
+        for target,backup in replacements:
+            if target.exists():
+                target.rename(backup/'previous')
+            swapped.append((target,backup))
+            (backup/'new').rename(target)
+        run(['systemctl','daemon-reload'],timeout=15)
+        provision_gateway_devices(entry,state)
+        for unit in reversed(units):
+            run(['systemctl','start',unit.name],timeout=30)
+        deadline=time.monotonic()+20
+        while time.monotonic()<deadline:
+            try:
+                cloud_check = {}
+                if cloud_install:
+                    probe = run([*work_python,'-B',str(API_DIRECTORY/'configure_cloudcli.py'),'--check-cloudcli',port],timeout=5)
+                    cloud_check = {'cloudcliPort': int(port), 'cloudcliNeedsSetup': json.loads(probe.stdout)['needsSetup']}
+                status=safe_code_api_admin(command,{'action':'public_status'},timeout=3)
+                if status.get('backend')=='cloudcli' and status.get('gatewayRevision')==revision:
+                    log('网关重装完成，服务检查通过。')
+                    return {**status, 'cloudcliReinstalled': bool(cloud_install), **cloud_check}
+            except (RuntimeError,subprocess.TimeoutExpired):
+                pass
+            time.sleep(.5)
+        raise RuntimeError('重装后的网关或 CloudCLI 未通过就绪检查。')
+    except Exception as error:
+        if not stopped:
+            raise
+        try:
+            if swapped:
+                for unit in stopped:
+                    run(['systemctl','stop',unit.name],timeout=30)
+                for target,backup in reversed(swapped):
+                    if target.exists():target.rename(backup/'failed')
+                    if (backup/'previous').exists():(backup/'previous').rename(target)
+                run(['systemctl','daemon-reload'],timeout=15)
+            for unit in reversed(stopped):
+                if previously_active[unit]:
+                    run(['systemctl','start',unit.name],timeout=30)
+        except Exception:
+            keep_backups=True
+            raise RuntimeError('网关重装失败，自动回滚未完成。VPS 上的原程序备份目录 '+', '.join(
+                str(backup) for _,backup in replacements)+'。') from error
+        raise RuntimeError(str(error)+' 已恢复原有程序文件和服务设置。') from error
+    finally:
+        if not keep_backups:
+            for _,backup in replacements:
+                shutil.rmtree(backup)
+
+def install_safe_code_api(entry, command, options, work_python):
+    if options.get('accepted') is not True:
+        raise ValueError('请先确认安装 Safe Code API 服务。')
     secure_root_directory(STATE,0o700)
     with (STATE/'install.lock').open('a') as guard:
         try:fcntl.flock(guard,fcntl.LOCK_EX|fcntl.LOCK_NB)
@@ -1501,11 +1850,7 @@ def install_safe_code_api(entry, command, options, work_python):
                 or run(['systemctl','show','-p','User','--value',API_UNIT.name]).stdout.strip()!=entry.pw_name):
                 raise RuntimeError('无法确认现有 Safe Code API 服务归属，请检查 VPS 服务配置。')
         with tempfile.TemporaryDirectory(prefix='desktop-api-install-',dir=STATE) as folder:
-            for name,data in files.items():
-                source = Path(folder)/name
-                source.write_bytes(base64.b64decode(data,validate=True))
-            if hashlib.sha256((Path(folder)/'codex_bridge.zip').read_bytes()).hexdigest()!=CODEX_BRIDGE_SOURCE_HASH:
-                raise ValueError('Safe Code API 安装组件校验失败。')
+            gateway_install_files(options,Path(folder))
             # Stage code under a root-owned directory and send credentials only over stdin.
             credentials = options.get('cloudcli') or {}
             if not isinstance(credentials,dict):
@@ -1570,10 +1915,10 @@ def install_safe_code_api(entry, command, options, work_python):
                     if existing.get('enabled') and safe_code_api_admin(command, {'action':'settings'}).get('busy'):
                         rollback_config()
                         raise RuntimeError('网关还有请求正在处理，请等网关空闲后再升级。')
-                    return installed(upgrade_safe_code_api(command, Path(folder), rollback_config))
+                    return installed(upgrade_safe_code_api(command, Path(folder), rollback_config, entry))
                 try:
                     run(['/bin/bash',str(Path(folder)/'install.sh'),entry.pw_name,bind,'45143'],
-                        env={**os.environ,'SAFECODE_INITIAL_API_INSTALL':'1'},timeout=60)
+                        env={**os.environ,'SAFECODE_INITIAL_API_INSTALL':'1'},timeout=250)
                     deadline=time.monotonic()+8
                     while time.monotonic()<deadline:
                         try:
@@ -1594,7 +1939,7 @@ def install_safe_code_api(entry, command, options, work_python):
                     rollback_config()
                     raise
 
-def upgrade_safe_code_api(command, source, rollback_config):
+def upgrade_safe_code_api(command, source, rollback_config, entry):
     names = sorted(name for name in API_FILES if name.endswith('.py'))
     original = {}
     for name in names:
@@ -1606,6 +1951,10 @@ def upgrade_safe_code_api(command, source, rollback_config):
     try:
         for name in names:
             write_api_component(API_DIRECTORY/name, (source/name).read_bytes())
+        try:
+            provision_gateway_devices(entry,Path(entry.pw_dir)/API_STATE)
+        except (OSError,RuntimeError,subprocess.TimeoutExpired):
+            log('设备服务尚未就绪。请在网关设置中运行故障修复后配对设备。')
         run(['systemctl','restart',API_UNIT.name],timeout=30)
         deadline = time.monotonic()+8
         while time.monotonic()<deadline:
@@ -1692,14 +2041,6 @@ def restart_safe_code_api(command, port):
             pass
         time.sleep(0.2)
     raise RuntimeError('Safe Code API 未在预期端口启动。')
-
-def desktop_gateway(options):
-    client=options.get('clientId','')
-    if not re.fullmatch('[a-f0-9]{32}',client):raise ValueError('Desktop 网关客户端标识无效。')
-    action=options.get('action','')
-    if action not in ['start','stop']:raise ValueError('Desktop 网关操作无效。')
-    if action=='start' and (not re.fullmatch('[A-Za-z0-9_-]{43}',options.get('token','')) or not re.fullmatch('[a-f0-9]{32}',options.get('instance',''))):raise ValueError('Desktop 本机通道凭据无效。')
-    return json.loads(user_files('desktop_gateway','.local/state/safe-code/desktop-gateway/'+client,**options).stdout)
 
 def host_bridge(options):
     client=options.get('clientId','');action=options.get('action','')
@@ -1878,7 +2219,7 @@ def start_job(request):
     request={**request,'background':False,'jobId':job}
     write(directory/'request.json',json.dumps(request),0o600)
     write(directory/'metadata.json',json.dumps({'jobId':job,'operation':operation,'created':time.time()}),0o600)
-    for name in ['agent.py','network.py']:
+    for name in ['agent.py','network.py','socks_egress.py']:
         shutil.copy2(Path(__file__).parent/name,directory/name);(directory/name).chmod(0o600)
     write(directory/'output.log','',0o600)
     run(['systemd-run','--quiet','--collect','--unit=safe-code-job-'+job,'--property=Type=exec','--property=StandardOutput=append:'+str(directory/'output.log'),'--property=StandardError=append:'+str(directory/'output.log'),'/usr/bin/python3','-u',str(directory/'agent.py'),str(directory/'request.json')])
@@ -1901,6 +2242,21 @@ def active_jobs():
         if status in ['active','activating']:values.append({'jobId':directory.name,'operation':metadata['operation']})
     return values
 
+def job_outcome(directory):
+    value=directory/'result.json'
+    failure=directory/'error.json'
+    if value.is_file():return json.loads(value.read_text()),{}
+    if failure.is_file():return None,json.loads(failure.read_text())
+    return None,{}
+
+def install_in_progress():
+    try:
+        with (STATE/'install.lock').open('rb') as lock:
+            fcntl.flock(lock,fcntl.LOCK_SH|fcntl.LOCK_NB)
+    except BlockingIOError:return True
+    except FileNotFoundError:pass
+    return False
+
 def poll_job(job,offset):
     directory=job_directory(job);offset=max(0,int(offset));lines=[];next_offset=offset
     path=directory/'output.log'
@@ -1911,13 +2267,21 @@ def poll_job(job,offset):
         if complete:
             data=data[:complete];next_offset=offset+len(data)
             lines=[x for x in data.decode('utf-8',errors='replace').splitlines() if not x.startswith(('SC_RESULT:','SC_ERROR:','SC_ERROR_JSON:','SC_ERROR_CODE:'))]
-    value=json.loads((directory/'result.json').read_text()) if (directory/'result.json').exists() else None
-    failure=json.loads((directory/'error.json').read_text()) if (directory/'error.json').exists() else {}
+    value,failure=job_outcome(directory)
+    if value is None and not failure:
+        try:status=run(['systemctl','is-active','safe-code-job-'+job+'.service'],False,timeout=8)
+        except subprocess.TimeoutExpired:status=None
+        # A job can write its result and exit between our first read and systemctl.
+        value,failure=job_outcome(directory)
+        if value is None and not failure and status is not None:
+            metadata=json.loads((directory/'metadata.json').read_text())
+            last_activity=max(metadata['created'],path.stat().st_mtime if path.is_file() else 0)
+            inactive=status.returncode in [3,4] and status.stdout.strip() in ['inactive','failed','unknown']
+            if inactive and time.time()-last_activity>15 and not install_in_progress():
+                value,failure=job_outcome(directory)
+                if value is None and not failure:
+                    failure={'error':'服务器上的部署任务已停止，未写入结果。请检查实际安装状态后重试。'}
     error=failure.get('error')
-    if value is None and error is None:
-        status=run(['systemctl','is-active','safe-code-job-'+job+'.service'],False).stdout.strip()
-        age=time.time()-json.loads((directory/'metadata.json').read_text())['created']
-        if status not in ['active','activating'] and age>3:error='远端任务意外结束，重连后可检查实际安装状态。'
     return {'lines':lines,'nextOffset':next_offset,'done':value is not None or error is not None,'value':value,'error':error,'errorCode':failure.get('code')}
 
 def probe_egress_ip():
@@ -1947,14 +2311,29 @@ def main():
         request_path.unlink(missing_ok=True)
     if request.get('jobId'):JOB_DIR=job_directory(request['jobId'])
     op=request.get('op','inspect')
+    if op in ('socks_probe','socks_enable'):
+        Path(sys.argv[1]).unlink(missing_ok=True)
     if op=='inspect':result(inspect());return
     if op=='egress_probe':
         value=probe_egress_ip()
         result({'ip':str(ipaddress.IPv4Address(value))});return
     if os.geteuid()!=0:raise RuntimeError('安装需要 root 或免密 sudo 权限。')
+    if op=='socks_status':
+        import socks_egress
+        result(socks_egress.status());return
+    if op=='socks_probe':
+        import socks_egress
+        if socks_egress.load_state():raise RuntimeError('请先停用已配置的 SOCKS5 出口。')
+        result(socks_egress.probe(socks_egress.parse_proxy((request.get('options') or {}).get('proxyUrl'))));return
     if op=='account_info':result(account());return
     if op=='list_directories':result(list_directories(request.get('options') or {}));return
     if op=='create_directory':result(create_directory(request.get('options') or {}));return
+    if op=='safe_code_api_repair':
+        options=request.get('options') or {}
+        if options.get('action')!='repair' or options.get('accepted') is not True:
+            raise ValueError('请先确认故障修复范围。')
+        secure_root_directory(STATE,0o700)
+        result(start_job(request) if request.get('background') else safe_code_api(options));return
     if op=='safe_code_api':result(safe_code_api(request.get('options') or {}));return
     if op=='desktop_login_probe':
         options=request.get('options') or {};path=Path('/var/log/xrdp-sesman.log');size=path.stat().st_size if path.exists() else 0
@@ -1977,16 +2356,24 @@ def main():
         except BlockingIOError:raise OperationError('deployment_busy','另一个部署正在运行，请等待完成。')
         options=request.get('options') or {}
         if options.get('password'):REDACTIONS.append(options['password'])
+        if op in ('socks_enable','socks_disable'):
+            import network,socks_egress
+            with network.transaction_lock():
+                if op=='socks_enable':
+                    proxy=socks_egress.parse_proxy(options.get('proxyUrl'))
+                    if not shutil.which('nft'):apt(['nftables'])
+                    result(socks_egress.enable(proxy));return
+                result(socks_egress.disable());return
         if op.startswith('ip_'):
             import network
             if op=='ip_prepare':
+                if (STATE/'socks-egress.json').exists():raise RuntimeError('请先停用开发模式的 SOCKS5 出口，再更换已绑定的 IP。')
                 apt(['nftables','curl']);result(network.prepare(options));return
             if op=='ip_apply':result(network.schedule_apply(options['token']));return
             if op=='ip_commit':result(network.commit(options['token']));return
             if op=='ip_rollback':result(network.rollback(options['token']));return
             raise RuntimeError('未知网络操作。')
         if op=='codex_bridge':result(codex_bridge(options));return
-        if op=='desktop_gateway':result(desktop_gateway(options));return
         if op=='host_bridge':result(host_bridge(options));return
         if op=='mount_apply':result(apply_mounts(options));return
         if op=='mount_recover':result(apply_mounts(options,recover=True));return
@@ -1998,7 +2385,7 @@ def main():
             try:scale_value=int(raw_scale)
             except (TypeError,ValueError):raise RuntimeError('不支持的桌面缩放比例，仅支持 100、150 或 200。')
             result(apply_desktop_scale(scale_value,live=True));return
-        mapping={'account':setup_account,'localization':setup_locale,'desktop':setup_desktop,'chrome':setup_chrome,'input':setup_input,'claude':setup_claude,'ssh':setup_ssh,'mount_install':install_mount,'cloud':setup_cloud,'cloud_public':setup_cloud_public,'cloud_setup':setup_cloud_onboarding}
+        mapping={'account':setup_account,'localization':setup_locale,'desktop':setup_desktop,'chrome':setup_chrome,'input':setup_input,'input_remove':remove_input,'claude':setup_claude,'ssh':setup_ssh,'mount_install':install_mount,'cloud':setup_cloud,'cloud_public':setup_cloud_public,'cloud_setup':setup_cloud_onboarding}
         if op not in mapping:raise RuntimeError('未知部署操作。')
         log('开始部署：'+op)
         if (op=='account' and not read_config()) or op in ['localization','desktop','chrome','input','claude','cloud','mount_install']:

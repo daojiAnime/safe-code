@@ -31,11 +31,15 @@ public sealed class ServerInfo
     public string ClaudeVersion { get; set; } = "";
     public string HerdrVersion { get; set; } = "";
     public bool HerdrReady { get; set; }
+    public bool RebootRequired { get; set; }
+    public bool InputManaged { get; set; }
+    public bool InputPinyinInstalled { get; set; }
     public bool DesktopReady { get; set; }
     public int DesktopScale { get; set; } = 100;
     public bool CloudReady { get; set; }
     public bool MountReady { get; set; }
     public IpPolicySettings? IpPolicy { get; set; }
+    public SocksEgressStatus? SocksEgress { get; set; }
     public List<RemoteJob> ActiveJobs { get; set; } = [];
 }
 public sealed record DeploymentStep(string Id, string Title, string Description);
@@ -57,12 +61,14 @@ public static class DeploymentCatalog
         new("新加坡", "Asia/Singapore", "en_US.UTF-8", "英语"),
         new("英国", "Europe/London", "en_US.UTF-8", "英语"),
         new("德国", "Europe/Berlin", "en_US.UTF-8", "英语"),
-        new("韩国", "Asia/Seoul", "en_US.UTF-8", "英语")
+        new("韩国", "Asia/Seoul", "en_US.UTF-8", "英语"),
+        new("德国 · 法兰克福", "Europe/Berlin", "en_US.UTF-8", "英语")
     ];
     public static LocaleSettings? FindLocale(string region) => region switch
     {
         "jp" => Locales[0], "us_la" => Locales[1], "us_ny" => Locales[2],
         "sg" => Locales[3], "gb" => Locales[4], "de" => Locales[5], "kr" => Locales[6],
+        "de_fra" => Locales[7],
         _ => null
     };
 }
@@ -75,6 +81,9 @@ public static class JsonDefaults
 public sealed record IpPolicySettings(string IngressIp,string EgressIp,bool LockIngress,bool LockEgress,int SshPort=22);
 public sealed record IpPrepareResult(string Token,IpPolicySettings Policy);
 public sealed record IpCommitResult(IpPolicySettings Policy,string ObservedEgress,bool Committed);
+
+public sealed record SocksEgressStatus(bool Enabled, bool GuardActive, bool TunnelRunning, string? Endpoint, string? ObservedIp, string? Issue);
+public sealed record SocksEgressProbe(bool Tcp, bool Udp, string? ObservedIp, string? TcpMessage, string? UdpMessage);
 
 public sealed record RemoteJob(string JobId,string Operation);
 public sealed class JobPoll { public List<string> Lines{get;set;}=[]; public long NextOffset{get;set;} public bool Done{get;set;} public JsonElement? Value{get;set;} public string? Error{get;set;} public string? ErrorCode{get;set;} }

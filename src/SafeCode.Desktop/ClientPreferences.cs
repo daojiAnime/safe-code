@@ -11,13 +11,6 @@ public sealed record DesktopResolution(int Width=1280,int Height=800);
 internal sealed class ClientPreferences(string directory)
 {
     internal static readonly DesktopResolution[] Resolutions=[new(1024,768),new(1280,800),new(1366,768),new(1440,900),new(1512,982),new(1600,900),new(1920,1080),new(2560,1440),new(2560,1600)];
-    private string ClaudeDesktopWarningPath=>Path.Combine(directory,"claude-desktop-warning-accepted-v1");
-    public bool ClaudeDesktopWarningAccepted=>File.Exists(ClaudeDesktopWarningPath);
-    public void AcceptClaudeDesktopWarning()
-    {
-        Directory.CreateDirectory(directory);
-        using var marker=new FileStream(ClaudeDesktopWarningPath,FileMode.OpenOrCreate,FileAccess.Write,FileShare.ReadWrite);
-    }
     private string DraftPath(SshSession session)=>Path.Combine(directory,"account-drafts",Convert.ToHexString(SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(session.Host+":"+session.Port+":"+session.Fingerprint)))+(OperatingSystem.IsMacOS()?".aes":".dpapi"));
     private string DeploymentLocalePath(SshSession session)=>DraftPath(session)+".locale";
     public DeploymentChoices ReadDeploymentChoices(SshSession session)
@@ -54,8 +47,8 @@ internal sealed class ClientPreferences(string directory)
     }
     public void SaveDraft(SshSession session,AccountDraft draft)
     {
-        if(!Regex.IsMatch(draft.Username,"^[a-z][a-z0-9_-]{1,30}$"))throw new ArgumentException("用户名须为 2–31 位小写字母、数字、下划线或短横线。");
-        if(!Regex.IsMatch(draft.Hostname,"^[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$"))throw new ArgumentException("机器名称须为 1–63 位字母、数字或短横线。");
+        if(!Regex.IsMatch(draft.Username,"^[a-z][a-z0-9_-]{1,30}$"))throw new ArgumentException("用户名须为 2–31 位小写字母、数字、下划线或短横线，以小写字母开头。");
+        if(!Regex.IsMatch(draft.Hostname,"^[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$"))throw new ArgumentException("机器名称须为 1–63 位字母、数字或短横线，首尾须为字母或数字。");
         if(draft.Password.Length>0&&(draft.Password.Length<12||draft.Password.Length>256||draft.Password.IndexOfAny(['\r','\n','\0'])>=0))throw new ArgumentException("工作密码须为 12–256 位，不能包含换行或空字符。");
         string path=DraftPath(session);Directory.CreateDirectory(Path.GetDirectoryName(path)!);byte[] data=JsonSerializer.SerializeToUtf8Bytes(draft,JsonDefaults.Options);
         try{File.WriteAllBytes(path+".new",LocalSecrets.Protect(data));File.Move(path+".new",path,true);File.WriteAllText(path+".configured","1");}finally{CryptographicOperations.ZeroMemory(data);}
@@ -66,6 +59,17 @@ internal sealed class ClientPreferences(string directory)
         try{File.Delete(DraftPath(session));}catch(DirectoryNotFoundException){}
     }
     private static DesktopResolution DefaultResolution()=>new(RdpDisplayConstants.DefaultResolution.Width,RdpDisplayConstants.DefaultResolution.Height);
+    private string ApiAccessModePath => Path.Combine(directory,"api-access-mode");
+    public bool PrefersApiAccess => File.Exists(ApiAccessModePath);
+    public void SetApiAccessMode(bool enabled)
+    {
+        if (enabled)
+        {
+            Directory.CreateDirectory(directory);
+            using var marker = File.Open(ApiAccessModePath,FileMode.OpenOrCreate,FileAccess.Write,FileShare.ReadWrite);
+        }
+        else if (PrefersApiAccess) File.Delete(ApiAccessModePath);
+    }
     public DesktopResolution ReadResolution()
     {
         try{var value=JsonSerializer.Deserialize<DesktopResolution>(File.ReadAllText(Path.Combine(directory,"desktop-resolution.json")),JsonDefaults.Options);return value!=null&&Resolutions.Contains(value)?value:DefaultResolution();}catch(IOException){return DefaultResolution();}catch(JsonException){return DefaultResolution();}

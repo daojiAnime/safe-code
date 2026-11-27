@@ -47,7 +47,6 @@ public sealed class MainWindow : Window
     private SshSession? keyStartedHost;
     private WindowsHostControl? hostControl;
     private ClaudeCodexBridge? claudeBridge;
-    private ClaudeDesktopBridge? claudeDesktop;
     private string? acceptanceFingerprint;
     private readonly string[] arguments;
     private readonly ConnectionSettings? supportSettings;
@@ -98,28 +97,38 @@ public sealed class MainWindow : Window
         });
         Content = browser;
         logTimer.Tick+=async(_,_)=>await FlushLogsAsync();logTimer.Start();
+        void PowerChanged(object sender,PowerModeChangedEventArgs args)
+        {
+            if(args.Mode is PowerModes.Suspend or PowerModes.Resume)
+            {
+                keyDeviceTunnel?.Invalidate();
+                session?.InvalidateHostVerification();
+            }
+        }
+        SystemEvents.PowerModeChanged+=PowerChanged;
+        Closed+=(_,_)=>SystemEvents.PowerModeChanged-=PowerChanged;
         Loaded += async (_, _) => await InitializeAsync();
         if(!IsAcceptance)
         {
-            keyAccess=new DesktopKeyAccess(dataDirectory,LocalSecrets.Protect,LocalSecrets.Unprotect,diagnostics:CanReportDiagnostics?services:null);
-            claudeBridge=new ClaudeCodexBridge(dataDirectory);claudeDesktop=new ClaudeDesktopBridge(dataDirectory);
+            keyAccess=new DesktopKeyAccess(dataDirectory,LocalSecrets.Protect,LocalSecrets.Unprotect,diagnostics:CanReportDiagnostics?services:null,openBash:OpenBashDetailAsync);
+            claudeBridge=new ClaudeCodexBridge(dataDirectory);
             integrationTimer.Tick+=async(_,_)=>
             {
                 if(integrationSampling)return;integrationSampling=true;
-                try{await claudeBridge.RefreshAsync(lifetime.Token);await claudeBridge.TickAsync(lifetime.Token);if(claudeDesktop!=null)await claudeDesktop.TickAsync(lifetime.Token);}
+                try{await claudeBridge.RefreshAsync(lifetime.Token);await claudeBridge.TickAsync(lifetime.Token);}
                 catch(OperationCanceledException){}
                 catch(Exception){}
                 finally{integrationSampling=false;}
             };
             integrationTimer.Start();
-            mountTray=new MountTray(this,()=>session?.GetMountStatus()??new(0,"idle","未挂载目录",0,0,0,0,0),ShowMainWindow,ReconnectMountsFromTrayAsync,()=>{exitRequested=true;Close();},PublishMountStatus,()=>keyDeviceTunnel?.Status(hostControl?.Enabled==true)??hostControl?.Status,()=>claudeBridge?.Status,()=>claudeDesktop?.Status,
-                ()=>keyAccess?.Running==true,()=>KeyAccess.ReadBalanceAsync(lifetime.Token));
+            mountTray=new MountTray(this,()=>session?.GetMountStatus()??new(0,"idle","未挂载目录",0,0,0,0,0),ShowMainWindow,ReconnectMountsFromTrayAsync,()=>{exitRequested=true;Close();},PublishMountStatus,TrayStatus,()=>KeyAccess.ListKeysAsync(lifetime.Token),
+                async id=>await KeyAccess.SavedBalanceAsync(id,lifetime.Token),dataDirectory);
             StateChanged+=(_,_)=>{if(WindowState==WindowState.Minimized){ShowInTaskbar=false;Hide();}};
         }
         Closing += async (_, e) =>
         {
             if(!closingApproved&&(exitInProgress||installingUpdate)){e.Cancel=true;return;}
-            if(!closingApproved&&!IsAcceptance&&!exitRequested&&(session?.HasMounts==true||hostControl?.Enabled==true||claudeBridge?.Running==true||claudeDesktop?.Status.Managed==true||keyAccess?.Running==true||deploying))
+            if(!closingApproved&&!IsAcceptance&&!exitRequested&&(session?.HasMounts==true||hostControl?.Enabled==true||claudeBridge?.Running==true||keyAccess?.Running==true||deploying))
             {e.Cancel=true;ShowInTaskbar=false;Hide();mountTray?.NotifyHidden();return;}
             if(!closingApproved&&(connectionPending||deploying||maintenanceOperations>0||gatewayWindow?.Busy==true))
             {e.Cancel=true;exitRequested=false;ShowMainWindow();MessageBox.Show(this,"任务正在执行，请等待完成后退出。","Safe Code");return;}
@@ -135,7 +144,6 @@ public sealed class MainWindow : Window
                     // Confirm synchronization before releasing the authenticated file channel.
                     if(session is {HasMounts:true} mounted)await Task.Run(()=>mounted.UnmountAsync(lifetime.Token));
                     if(claudeBridge?.Running==true)await claudeBridge.StopAsync(lifetime.Token,suspend:true);
-                    if(claudeDesktop?.Status.Managed==true)await claudeDesktop.StopAsync(lifetime.Token,suspend:true);
                     await StopKeyDeviceAsync();
                     if(hostControl?.Enabled==true)await hostControl.DisableAsync(lifetime.Token);
                     if(keyAccess!=null)await keyAccess.StopAsync();
@@ -155,7 +163,7 @@ public sealed class MainWindow : Window
                 if(closingApproved)Close();
                 return;
             }
-            claudeBridge?.Dispose();claudeDesktop?.Dispose();hostControl?.Dispose();mountTray?.Dispose();integrationTimer.Stop();logTimer.Stop();lifetime.Cancel();services.Dispose();clients.Dispose();session?.Dispose();browser.Dispose();
+            claudeBridge?.Dispose();hostControl?.Dispose();mountTray?.Dispose();integrationTimer.Stop();logTimer.Stop();lifetime.Cancel();services.Dispose();clients.Dispose();session?.Dispose();browser.Dispose();
         };
     }
     private void ShowMainWindow(){ShowInTaskbar=true;Show();WindowState=WindowState.Normal;Activate();}
@@ -203,6 +211,14 @@ public sealed class MainWindow : Window
                 if(changed)_=services.SendDiagnosticAsync(trace,failure,lifetime.Token);
             }
         }
+    }
+    private object TrayStatus()
+    {
+        var host=keyDeviceTunnel?.Status(hostControl?.Enabled==true)??hostControl?.Status;
+        var c=claudeBridge?.Status;
+        return new {apiMode=preferences.PrefersApiAccess,running=keyAccess?.Running==true,startedAt=keyAccess?.StartedAt,connection=keyAccess?.ConnectionStatus,
+            mount=session?.GetMountStatus(),host=new{enabled=host?.Enabled==true},exiting=exitInProgress,
+            codex=IntegrationTrayPresenter.Codex(c?.Running==true,c?.Connected==true,c?.StartedAt,c?.StoppedAt,c?.Usage,c?.UsageSource??"",DateTimeOffset.UtcNow)};
     }
     private void PublishMountStatus(MountStatus status)
     {
@@ -274,7 +290,9 @@ public sealed class MainWindow : Window
             var args = root.TryGetProperty("args", out var value) ? value : default;
             if(exitInProgress)throw new InvalidOperationException("正在安全退出，请稍候。");
             if(installingUpdate)throw new InvalidOperationException("正在准备安装更新，请稍候。");
-            bool maintenance=operation is "cloud.install" or "cloud.expose" or "mount.install" or "mount.apply" or "ip.apply" or "terminal" or "host.enable" or "host.disable" or "bridge.start" or "bridge.stop" or "claudeDesktop.start" or "claudeDesktop.stop" or "desktopKey.enable" or "desktopKey.authorizeDevice" or "desktopKey.disable" or "connection.reauthenticate";
+            bool maintenance=operation is "cloud.install" or "cloud.expose" or "mount.install" or "mount.apply" or "ip.apply" or "terminal" or "host.enable" or "host.disable" or "bridge.start" or "bridge.stop" or "safeCodeApi.enablePublic" or "safeCodeApi.repair" or "desktopKey.enable" or "desktopKey.authorizeDevice" or "desktopKey.refreshModels" or "desktopKey.disable" or "connection.reauthenticate";
+            bool keyChange=operation is "desktopKey.enable" or "desktopKey.authorizeDevice" or "desktopKey.disable" or "desktopKey.cancelDevice";
+            if(keyChange&&maintenanceOperations>0)throw new InvalidOperationException("请等待当前操作完成。");
             if(maintenance)maintenanceOperations++;
             if(CanReportDiagnostics)
             {
@@ -298,12 +316,27 @@ public sealed class MainWindow : Window
         }
     }
     private DesktopKeyAccess KeyAccess => keyAccess??=new DesktopKeyAccess(dataDirectory,LocalSecrets.Protect,
-        LocalSecrets.Unprotect,diagnostics:CanReportDiagnostics?services:null);
+        LocalSecrets.Unprotect,diagnostics:CanReportDiagnostics?services:null,openBash:OpenBashDetailAsync);
+
+    private Task OpenBashDetailAsync(string session,string call) => Dispatcher.InvokeAsync(async () =>
+    {
+        ShowMainWindow();
+        if(browser.CoreWebView2!=null)
+            await browser.CoreWebView2.ExecuteScriptAsync("window.safeCodeBashDetail?.("+JsonSerializer.Serialize(session)+","+JsonSerializer.Serialize(call)+")");
+    }).Task.Unwrap();
 
     private async Task<object> AuthorizeKeyDeviceAsync(CancellationToken ct)
     {
         var setup=pendingKeyDevice??throw new InvalidOperationException("请重新验证接入 Key。");
         if(deploying)throw new InvalidOperationException("请等待当前操作完成。");
+        if(setup.Switching)
+        {
+            try{await KeyAccess.DisableAsync(ct);}
+            finally{await StopKeyDeviceAsync();}
+            if(KeyAccess.Configured)throw new InvalidOperationException("原网关尚未确认解绑，请先点击「重试解绑」查看结果。");
+            setup=setup with {Switching=false};
+            pendingKeyDevice=setup;
+        }
         var control=hostControl??=new WindowsHostControl(dataDirectory);
         if(setup.HostSession is { } target)
             return await AuthorizeKeyHostControlAsync(setup,target,control,ct);
@@ -321,7 +354,10 @@ public sealed class MainWindow : Window
             startedLocal=true;
             tunnel=await WindowsDeviceTunnel.ConnectAsync(setup.Remote,device,ssh.Port,dataDirectory,ct);
             await tunnel.VerifyAsync(ssh,ct);
-            var result=await KeyAccess.EnableAsync("",ct,setup.Replace,setup.UseSaved,setup,device);
+            var activeTunnel=tunnel;
+            var path=new DesktopKeyAccess.DevicePath(()=>activeTunnel.ConnectionProblem(control.Enabled),
+                (force,token)=>activeTunnel.CheckReturnAsync(force,control.Enabled,token),()=>activeTunnel.Generation);
+            var result=await KeyAccess.EnableAsync("",ct,setup.Replace,setup.UseSaved,setup,device,devicePath:path);
             keyDeviceTunnel=tunnel;
             tunnel=null;
             pendingKeyDevice=null;
@@ -369,7 +405,9 @@ public sealed class MainWindow : Window
             var binding=await target.BindPublicGatewayHostAsync(setup.Remote,hostname,ct);
             var device=new DesktopKeyAccess.DeviceBinding(binding.GetProperty("deviceId").GetString()!,
                 binding.GetProperty("deviceProof").GetString()!,binding.GetProperty("alias").GetString()!,0,"");
-            var result=await KeyAccess.EnableAsync("",ct,setup.Replace,setup.UseSaved,setup,device,hostReady:HostReady);
+            var result=await KeyAccess.EnableAsync("",ct,setup.Replace,setup.UseSaved,setup,device,hostReady:HostReady,
+                devicePath:new(()=>HostReady()?null:target.HostControlStatus.State=="connected"?"本次授权的 SSH 会话已断开，请重新启用接入。":target.HostControlStatus.Message,
+                    (force,token)=>target.MaintainHostControlForChatAsync(token,force),()=>target.HostNetworkGeneration));
             if(startedHere)keyStartedHost=target;
             pendingKeyDevice=null;
             return result;
@@ -387,8 +425,8 @@ public sealed class MainWindow : Window
         if(keyDeviceTunnel is { } tunnel)
         {
             keyDeviceTunnel=null;
-            await tunnel.DisposeAsync();
-            if(hostControl?.Enabled==true)await hostControl.DisableAsync();
+            try{await tunnel.DisposeAsync();}
+            finally{if(hostControl?.Enabled==true)await hostControl.DisableAsync();}
         }
         if(keyStartedHost is { } target)
         {
@@ -411,29 +449,48 @@ public sealed class MainWindow : Window
             case "bridge.stop":
                 if(deploying)throw new InvalidOperationException("请等待当前操作完成。");deploying=true;activeStep="codex_bridge";
                 try{return claudeBridge==null?new ClaudeCodexStatus(false,false,false,18797,"sonnet",false,"未启动"):await claudeBridge.StopAsync(lifetime.Token);}finally{deploying=false;activeStep="";}
+            case "desktopKey.connection":return keyAccess?.ConnectionStatus;
+            case "desktopKey.mode":
+                if (args.ValueKind==JsonValueKind.Object && args.TryGetProperty("enabled",out var apiMode))
+                    preferences.SetApiAccessMode(apiMode.GetBoolean());
+                return preferences.PrefersApiAccess;
             case "desktopKey.status":
                 return await KeyAccess.RestoreAsync(lifetime.Token,
-                    interactive:args.TryGetProperty("interactive",out var interactive)&&interactive.ValueKind==JsonValueKind.True,
-                    requireDevice:true);
+                    interactive:args.TryGetProperty("interactive",out var interactive)&&interactive.ValueKind==JsonValueKind.True);
+            case "desktopKey.bashHistory": return await KeyAccess.BashHistoryAsync(Read("session"),lifetime.Token);
+            case "desktopKey.list": return await KeyAccess.ListKeysAsync(lifetime.Token);
+            case "desktopKey.save":
+                await KeyAccess.SaveKeyAsync(Read("key"),Read("name"),lifetime.Token);
+                return true;
+            case "desktopKey.rename":
+                await KeyAccess.RenameKeyAsync(Read("id"),Read("name"),lifetime.Token);
+                return true;
+            case "desktopKey.forget":
+                await KeyAccess.ForgetKeyAsync(Read("id"),lifetime.Token);
+                return true;
+            case "desktopKey.savedBalance": return await KeyAccess.SavedBalanceAsync(Read("id"),lifetime.Token);
             case "desktopKey.enable":
-                if(keyDeviceTunnel!=null&&hostControl?.Enabled==true)
+                if(Read("savedId")==""&&keyDeviceTunnel!=null&&hostControl?.Enabled==true)
                     throw new InvalidOperationException("请先停用当前 Key 接入，再更换 Key。");
-                claudeDesktop??=new ClaudeDesktopBridge(dataDirectory);
-                if((await claudeDesktop.RefreshAsync(lifetime.Token)).Managed)
-                    throw new InvalidOperationException("请先停止本机的 SSH Desktop 桥接再使用 Key。");
                 pendingKeyDevice=null;
-                pendingKeyDevice=await KeyAccess.VerifyDeviceGatewayAsync(Read("key"),
-                    args.TryGetProperty("replace",out var replaceKey)&&replaceKey.ValueKind==JsonValueKind.True,
-                    args.TryGetProperty("useSaved",out var useSavedKey)&&useSavedKey.ValueKind==JsonValueKind.True,
-                    !connectionPending&&session?.IsConnected==true&&session.Server!=null?session:null,lifetime.Token);
-                var keyHost=pendingKeyDevice.HostSession;
+                var keyResult=await KeyAccess.EnableAsync(Read("key"),lifetime.Token,
+                    replace:args.TryGetProperty("replace",out var replaceKey)&&replaceKey.ValueKind==JsonValueKind.True,
+                    useSaved:args.TryGetProperty("useSaved",out var useSavedKey)&&useSavedKey.ValueKind==JsonValueKind.True,
+                    savedId:Read("savedId"),checkDevice:true,deviceSession:!connectionPending&&session?.IsConnected==true&&session.Server!=null?session:null);
+                if(keyResult is not DesktopKeyAccess.DeviceSetup setup)return keyResult;
+                pendingKeyDevice=setup;
+                if(Read("savedId")!=""&&await KeyAccess.HasDeviceConsentAsync(setup.Remote,lifetime.Token))
+                    return await AuthorizeKeyDeviceAsync(lifetime.Token);
+                var keyHost=setup.HostSession;
                 bool existingControl=keyHost!=null&&hostControl?.IsEnabledFor(keyHost)==true;
                 return new { requiresDevice=true, reuseControl=keyHost!=null, existingControl,
-                    alias=existingControl?keyHost!.HostControlStatus.Alias:pendingKeyDevice.Existing?.Alias };
+                    alias=existingControl?keyHost!.HostControlStatus.Alias:setup.Existing?.Alias };
             case "desktopKey.authorizeDevice":
                 if(!args.TryGetProperty("riskAccepted",out var deviceConsent)||deviceConsent.ValueKind!=JsonValueKind.True)
                     throw new InvalidOperationException("请先阅读并同意本机远程控制权限说明。");
                 return await AuthorizeKeyDeviceAsync(lifetime.Token);
+            case "desktopKey.refreshModels": return await KeyAccess.RefreshModelsAsync(lifetime.Token);
+            case "desktopKey.balance": return await KeyAccess.ReadBalanceAsync(lifetime.Token);
             case "desktopKey.cancelDevice":
                 pendingKeyDevice=null;
                 return true;
@@ -441,9 +498,8 @@ public sealed class MainWindow : Window
                 return keyDeviceTunnel?.Status(hostControl?.Enabled==true);
             case "desktopKey.disable":
                 pendingKeyDevice=null;
-                var disabledKey=await KeyAccess.DisableAsync(lifetime.Token);
-                await StopKeyDeviceAsync();
-                return disabledKey;
+                try{return await KeyAccess.DisableAsync(lifetime.Token);}
+                finally{await StopKeyDeviceAsync();}
             case "safeCodeApi.refreshSubscription":
                 return await RequireGatewaySession().RefreshPublicGatewaySubscriptionAsync(lifetime.Token);
             case "safeCodeApi.publicStatus":
@@ -457,9 +513,19 @@ public sealed class MainWindow : Window
                 try{return await installSession.InstallPublicGatewayAsync(lifetime.Token,
                     args.TryGetProperty("cloudcli",out var cloudcliInstall)?cloudcliInstall:null);}
                 finally{deploying=false;activeStep="";}
+            case "safeCodeApi.repair":
+                if (!args.TryGetProperty("accepted",out var repairAccepted) || repairAccepted.ValueKind!=JsonValueKind.True)
+                    throw new InvalidOperationException("请先确认故障修复范围。");
+                if(deploying||gatewayWindow?.Busy==true)throw new InvalidOperationException("请等待当前操作完成。");
+                var repairSession=RequireGatewaySession();
+                deploying=true;activeStep="gateway_repair";
+                try{return await repairSession.RepairPublicGatewayAsync(
+                    args.TryGetProperty("reinstallCloudCLI",out var reinstallCloud) && reinstallCloud.ValueKind==JsonValueKind.True,lifetime.Token);}
+                finally{deploying=false;activeStep="";}
             case "safeCodeApi.enablePublic":
                 if (!args.TryGetProperty("accepted", out var publicAccepted) || publicAccepted.ValueKind != JsonValueKind.True)
-                    throw new InvalidOperationException("请先确认「保证自用」。");
+                    throw new InvalidOperationException("请先点击公网网关的「启用」。");
+                if(deploying)throw new InvalidOperationException("请等待当前操作完成。");
                 return await RequireGatewaySession().EnablePublicGatewayAsync(lifetime.Token);
             case "window.gateway.open":
                 var gatewaySession=RequireGatewaySession();
@@ -474,7 +540,6 @@ public sealed class MainWindow : Window
                         if(installingUpdate||!ReferenceEquals(gatewaySession,RequireGatewaySession()))
                             throw new InvalidOperationException("SSH 会话已变更，请重新打开网关管理。");
                         var request=options.Deserialize<Dictionary<string,JsonElement>>()!;
-                        request.Remove("background");
                         return gatewaySession.ManagePublicGatewayAsync(request,lifetime.Token);
                     }
                     var diagnostic=DiagnosticTrace.GatewayOperation(options);
@@ -484,18 +549,8 @@ public sealed class MainWindow : Window
                 gateway.Closed+=(_,_)=>gatewayWindow=null;
                 gateway.Show();
                 return true;
-            case "claudeDesktop.status": claudeDesktop??=new ClaudeDesktopBridge(dataDirectory);return await claudeDesktop.RefreshAsync(lifetime.Token);
-            case "claudeDesktop.start":
-                if(keyAccess?.Configured==true)throw new InvalidOperationException("请先停用 API Key 接入。");
-                if(!args.TryGetProperty("accepted",out var claudeAccepted)||!claudeAccepted.GetBoolean())throw new InvalidOperationException("请先确认通过 VPS 上的 CloudCLI 接入。");
-                if(deploying)throw new InvalidOperationException("请等待当前操作完成。");
-                claudeDesktop??=new ClaudeDesktopBridge(dataDirectory);deploying=true;activeStep="claude_desktop";
-                try{return await claudeDesktop.StartAsync(RequireSession(),true,lifetime.Token);}finally{deploying=false;activeStep="";}
-            case "claudeDesktop.stop":
-                if(deploying)throw new InvalidOperationException("请等待当前操作完成。");
-                deploying=true;activeStep="claude_desktop";
-                try{return claudeDesktop==null?null:await claudeDesktop.StopAsync(lifetime.Token);}finally{deploying=false;activeStep="";}
-            case "claudeDesktop.open": claudeDesktop??=new ClaudeDesktopBridge(dataDirectory);return claudeDesktop.OpenClient();
+            case "claudeDesktop.reopen": return await WindowsClaudeDesktop.OpenAsync(KeyAccess,true,lifetime.Token);
+            case "claudeDesktop.open": return await WindowsClaudeDesktop.OpenAsync(KeyAccess,false,lifetime.Token);
             case "codex.open": return WindowsClients.OpenCodex();
             case "bridge.copy-config": if(claudeBridge==null)throw new InvalidOperationException("请先启动适配器。");Clipboard.SetText(claudeBridge.Configuration);return true;
             case "bridge.copy-key": if(claudeBridge==null)throw new InvalidOperationException("请先启动适配器。");Clipboard.SetText(claudeBridge.Token);return true;
@@ -509,8 +564,8 @@ public sealed class MainWindow : Window
                 if(deploying)throw new InvalidOperationException("请等待当前操作完成。");
                 if(keyDeviceTunnel!=null)
                 {
-                    await KeyAccess.DisableAsync(lifetime.Token);
-                    await StopKeyDeviceAsync();
+                    try{await KeyAccess.DisableAsync(lifetime.Token);}
+                    finally{await StopKeyDeviceAsync();}
                 }
                 if(keyAccess?.ReusesHostControl==true)
                 {
@@ -519,12 +574,15 @@ public sealed class MainWindow : Window
                 }
                 return hostControl==null?new HostControlStatus(false,"disabled","","","未启用"):await hostControl.DisableAsync(lifetime.Token);
             case "preview.begin":
-                if(connectionPending||deploying||maintenanceOperations>0||session?.HasMounts==true||hostControl?.Enabled==true||claudeBridge?.Running==true||claudeDesktop?.Status.Managed==true)throw new InvalidOperationException("请先结束当前操作并卸载目录，再进入开发预览。");
+                if(connectionPending||deploying||maintenanceOperations>0||session?.HasMounts==true||hostControl?.Enabled==true||claudeBridge?.Running==true)throw new InvalidOperationException("请先结束当前操作并卸载目录，再进入开发预览。");
                 if(gatewayWindow?.Busy==true)throw new InvalidOperationException("请等待当前密钥操作完成。");
                 gatewayWindow?.Close();
                 connecting?.Cancel();pendingHostTrust=null;clients.Dispose();session?.Dispose();session=null;return true;
             case "window.resize":
-                Width = args.GetProperty("wide").GetBoolean() ? 740 : 360; Height = args.GetProperty("wide").GetBoolean() ? 634 : 536;
+                var api = Read("layout") == "api";
+                MinHeight = api ? 495 : 500;
+                Width = api ? 660 : args.GetProperty("wide").GetBoolean() ? 740 : 360;
+                Height = api ? 495 : args.GetProperty("wide").GetBoolean() ? 634 : 536;
                 Left = Math.Max(0, (SystemParameters.WorkArea.Width - Width) / 2); Top = Math.Max(0, (SystemParameters.WorkArea.Height - Height) / 2); return true;
             case "window.drag":
                 ReleaseCapture(); SendMessage(new System.Windows.Interop.WindowInteropHelper(this).Handle, 0xA1, (IntPtr)2, IntPtr.Zero); return true;
@@ -544,13 +602,13 @@ public sealed class MainWindow : Window
                 if(deploying||maintenanceOperations>0)throw new InvalidOperationException("请等待当前操作完成后安装更新。");
                 if(downloadedUpdate==null||!File.Exists(downloadedUpdate.Path))throw new InvalidOperationException("请先下载并校验安装包。");
                 installingUpdate=true;
-                try{await ClientServices.VerifyInstallerAsync(downloadedUpdate,lifetime.Token);LocalSecrets.CheckpointLogin();if(claudeBridge?.Running==true)await claudeBridge.StopAsync(suspend:true);if(claudeDesktop?.Status.Managed==true)await claudeDesktop.StopAsync(suspend:true);if(hostControl?.Enabled==true)await hostControl.DisableAsync();if(session?.HasMounts==true)await session.UnmountAsync();await StopKeyDeviceAsync();if(keyAccess!=null)await keyAccess.StopAsync();
+                try{await ClientServices.VerifyInstallerAsync(downloadedUpdate,lifetime.Token);LocalSecrets.CheckpointLogin();if(claudeBridge?.Running==true)await claudeBridge.StopAsync(suspend:true);if(hostControl?.Enabled==true)await hostControl.DisableAsync();if(session?.HasMounts==true)await session.UnmountAsync();await StopKeyDeviceAsync();if(keyAccess!=null)await keyAccess.StopAsync();
                 Process.Start(new ProcessStartInfo(downloadedUpdate.Path){UseShellExecute=true});closingApproved=true;Close();return true;}
                 catch{installingUpdate=false;throw;}
             case "gateways.resume-settings":
                 if(IsAcceptance)return null;
                 var remembered=LocalSecrets.Load();
-                return remembered!=null&&(claudeDesktop?.Preference.Matches(remembered)==true||claudeBridge?.Preference.Matches(remembered)==true||SshSession.CanResumePublicGateway(dataDirectory,remembered))?remembered:null;
+                return remembered!=null&&(claudeBridge?.Preference.Matches(remembered)==true||SshSession.CanResumePublicGateway(dataDirectory,remembered))?remembered:null;
             case "login.restoreAvailable": return LocalSecrets.HasSavedLogin;
             case "login.load": case "login.restoreSaved": return LocalSecrets.Load();
             case "connection.info": return session==null?null:new{host=session.Host,port=session.Port,username=session.LoginUsername};
@@ -594,16 +652,31 @@ public sealed class MainWindow : Window
                 Environment.ExitCode = args.GetProperty("success").GetBoolean() ? 0 : 1;
                 _ = Dispatcher.BeginInvoke(() => Close()); return true;
             case "connection.cancel": connecting?.Cancel();pendingHostTrust=null;return true;
+            case "connection.disconnect":
+                if(connectionPending||deploying||maintenanceOperations>0||gatewayWindow?.Busy==true)
+                    throw new InvalidOperationException("请等待当前操作完成后再退出登录。");
+                exitInProgress=true;
+                try
+                {
+                    if(session is {HasMounts:true} mounted)await mounted.UnmountAsync(lifetime.Token);
+                    if(claudeBridge?.Running==true)await claudeBridge.StopAsync(lifetime.Token,suspend:true);
+                    if(keyAccess?.ReusesHostControl==true)await keyAccess.StopAsync();
+                    if(hostControl?.Enabled==true)await hostControl.DisableAsync(lifetime.Token);
+                    gatewayWindow?.Close();
+                    clients.Dispose();
+                    if(session is {} disconnected)await Task.Run(disconnected.Dispose);
+                    session=null;pendingHostTrust=null;gatewayObservation=null;keyStartedHost=null;
+                    return true;
+                }
+                finally{exitInProgress=false;}
             case "host.trust":
                 if(pendingHostTrust is not {} challenge||challenge.Token!=Read("token"))throw new InvalidOperationException("服务器身份确认已失效，请重新连接。");
                 new HostTrustStore(dataDirectory).Accept(challenge.Key);pendingHostTrust=null;return true;
             case "notice.state":
                 string noticePath=Path.Combine(dataDirectory,"notice-accepted-v2");bool noticeAccepted=File.Exists(noticePath)||services.NoticeWasConfirmed;if(noticeAccepted&&!File.Exists(noticePath))File.WriteAllText(noticePath,DateTimeOffset.UtcNow.ToString("O"));return new{accepted=noticeAccepted};
             case "notice.accept": File.WriteAllText(Path.Combine(dataDirectory,"notice-accepted-v2"),DateTimeOffset.UtcNow.ToString("O"));return true;
-            case "notice.claudeDesktop.state": return preferences.ClaudeDesktopWarningAccepted;
-            case "notice.claudeDesktop.accept": preferences.AcceptClaudeDesktopWarning();return true;
             case "connect":
-                if(session?.HasMounts==true||hostControl?.Enabled==true||claudeBridge?.Running==true||claudeDesktop?.Running==true)throw new InvalidOperationException("正在保护挂载目录或本机控制通道，请先停用并安全卸载再更换连接。");
+                if(session?.HasMounts==true||hostControl?.Enabled==true||claudeBridge?.Running==true)throw new InvalidOperationException("正在保护挂载目录或本机控制通道，请先停用并安全卸载再更换连接。");
                 if(connectionPending)throw new InvalidOperationException("连接正在处理中，请稍候。");
                 if(gatewayWindow?.Busy==true)throw new InvalidOperationException("请等待当前密钥操作完成。");
                 gatewayWindow?.Close();
@@ -625,8 +698,6 @@ public sealed class MainWindow : Window
                         deploying=true;
                         try
                         {
-                            if(keyAccess?.Configured!=true && claudeDesktop?.Preference.Matches(current)==true)
-                                try{await RunWithDiagnosticAsync("claude_desktop_restore",()=>claudeDesktop.StartAsync(current,true,connecting.Token),background:true);}catch(Exception error){gatewayWarnings.Add("Claude 网关恢复失败："+error.Message);}
                             if(claudeBridge?.Preference is {} bridgePreference&&bridgePreference.Matches(current))
                                 try{await RunWithDiagnosticAsync("codex_bridge_restore",()=>claudeBridge.StartAsync(current,bridgePreference.LocalPort,bridgePreference.Model,bridgePreference.Writable,connecting.Token),background:true);}catch(Exception error){gatewayWarnings.Add("Codex 网关恢复失败："+error.Message);}
                         }
@@ -653,13 +724,13 @@ public sealed class MainWindow : Window
             case "resources": return await RequireSession().ReadResourceStatsAsync(lifetime.Token);
             case "environment.assess": return await RequireSession().AssessEnvironmentAsync(lifetime.Token);
             case "deploy":
-                if(Read("step")=="account"&&(claudeBridge?.Running==true||claudeDesktop?.Status.Managed==true))throw new InvalidOperationException("请先停止模型适配器和 Desktop 桥接，再更新工作账户。");
+                if(Read("step")=="account"&&claudeBridge?.Running==true)throw new InvalidOperationException("请先停止 Codex 模型适配器，再更新工作账户。");
                 if (deploying) throw new InvalidOperationException("另一个任务正在执行，请等待。");
                 deploying = true; activeStep = Read("step");
                 try
                 {
                     var target = RequireSession();
-                    var locale = preferences.RequireDeploymentChoices(target);
+                    var locale = activeStep=="input_remove" ? null : preferences.RequireDeploymentChoices(target);
                     var draft = activeStep=="account" ? preferences.ReadDraft(target) ?? throw new InvalidOperationException("请先保存工作账户设置。") : null;
                     var result = await target.DeployAsync(activeStep, locale, draft?.Username??"workspace", lifetime.Token, draft?.Password??"", draft?.Hostname??"");
                     if(activeStep=="account"&&result.Statuses.GetValueOrDefault("account"))preferences.ClearDraft(target);
@@ -719,6 +790,22 @@ public sealed class MainWindow : Window
                     return changed;
                 }
                 finally{deploying=false;activeStep="";}
+            case "socks.status":
+                return await RequireSession().RequestAsync<SocksEgressStatus>("socks_status",null,lifetime.Token);
+            case "socks.probe":
+            case "socks.enable":
+            case "socks.disable":
+                if(deploying)throw new InvalidOperationException("已有任务正在执行，请等待完成。");
+                deploying=true;
+                try
+                {
+                    var target=RequireSession();
+                    if(operation=="socks.probe")return await target.ProbeSocksEgressAsync(Read("proxyUrl"),lifetime.Token);
+                    if(operation=="socks.enable"&&(!args.TryGetProperty("accepted",out var acceptedSocks)||acceptedSocks.ValueKind!=JsonValueKind.True))
+                        throw new InvalidOperationException("请先确认整机代理的影响。");
+                    return await target.SetSocksEgressAsync(operation=="socks.enable"?Read("proxyUrl"):null,lifetime.Token);
+                }
+                finally{deploying=false;}
             default: throw new InvalidOperationException("未知客户端操作。");
         }
     }

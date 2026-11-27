@@ -7,12 +7,19 @@ if ((window.chrome?.webview && (location.host === 'safe-code.local' || (window._
     const postNativeMessage=isWebHost?window.__safeCodeWebPostMessage:message=>window.chrome.webview.postMessage(message);
     const servicesWindow=isMac&&window.__safeCodeServicesWindow;
     const pending = new Map();
-    const native = (op,args={}) => new Promise((resolve,reject) => {
+    const native = (op,args={},deadline) => new Promise((resolve,reject) => {
       if(developerPreview&&!/^(window\.|services\.|diagnostics\.|notice\.|updates\.|feedback\.|copy$|mount\.status\.open$|preview\.|acceptance\.|claudeDesktop\.open$|desktopKey\.|codex\.open$)/.test(op))return reject(new Error('开发预览未连接服务器，此操作仅在真实连接后可用。'));
-      const id=crypto.randomUUID();pending.set(id,{resolve,reject});postNativeMessage({id,op,args});
+      const id=crypto.randomUUID();
+      const timer=deadline&&setTimeout(()=>{
+        if(pending.delete(id))reject(new Error(deadline.message));
+      },deadline.ms);
+      pending.set(id,{resolve,reject,timer});
+      try{postNativeMessage({id,op,args});}
+      catch(error){pending.delete(id);clearTimeout(timer);reject(error);}
     });
     window.safeCodeNativeResponse = ({id,result,error}) => {
-      const item=pending.get(id);if(!item)return;pending.delete(id);error?item.reject(new Error(error)):item.resolve(result);
+      const item=pending.get(id);if(!item)return;pending.delete(id);clearTimeout(item.timer);
+      error?item.reject(new Error(error)):item.resolve(result);
     };
     let developerPreview=false;
     const consentIds=['usage-consent','settings-usage-consent','diagnostics-consent','settings-diagnostics-consent'];
@@ -94,12 +101,12 @@ if ((window.chrome?.webview && (location.host === 'safe-code.local' || (window._
       };
       const sizes={
         'mount-dialog':[540,510],'client-window':[745,490],
-        'login-help-dialog':[620,495],'ip-policy-dialog':[490,495],
+        'login-help-dialog':[620,495],'ip-policy-dialog':[490,495],'socks-dialog':[490,505],
         'remote-folder-dialog':[460,435],'operation-log-dialog':[540,425],
-        'claude-desktop-dialog':[490,510],'cloud-remote-dialog':[470,445],
+        'claude-desktop-dialog':[450,320],'gateway-repair-dialog':[450,320],'cloud-remote-dialog':[470,445],
         'advanced-dialog':[355,235],'resolution-dialog':[440,560],
-        'create-folder-dialog':[380,250],'desktop-key-dialog':[360,190],
-        'app-message-dialog':[400,300]
+        'create-folder-dialog':[380,250],'desktop-key-dialog':[360,190],'key-list-dialog':[480,265],
+        'app-message-dialog':[400,300],'bash-history-dialog':[540,440]
       };
       const observer=new MutationObserver(()=>{
         stack=stack.filter(dialog=>dialog.open);
@@ -144,13 +151,15 @@ if ((window.chrome?.webview && (location.host === 'safe-code.local' || (window._
       };
     }
     if(isMac)window.safeCodeShowUpdateNotice=showUpdateNotice;
-    let hostBusy=false,hostStatus=null,hostStatusTask,hostChange=0,requiredHostControl;
+    let hostBusy=false,hostStatus=null,hostStatusTask,hostChange=0;
     let bridgeBusy=false,bridgeStatus=null,bridgePolling=false;
-    let claudeDesktopBusy=false,claudeDesktopStatus=null,claudeDesktopPolling=false;
+    let publicGatewayOperation='',publicGatewayStatusError='';
+    let publicGatewayError;
+    let publicGatewayCreatedAccount;
     let publicGatewayEnabled=false,publicGatewayLoading=false,publicGatewayReachable=false,publicGatewayMissing=false;
     let publicGatewayUpgrade=false,publicGatewayNeedsCloudKey=false;
-    const requiredGatewayRevision=3;
-    let publicGatewaySetupOnly=false;
+    const minimumGatewayRevision=23;
+    let bundledGatewayRevision=minimumGatewayRevision, publicGatewayLegacy=false;
     let publicGatewayTask,publicGatewayTimer;
     let publicGatewaySubscription;
     let startupRetryTimer;
@@ -160,14 +169,15 @@ if ((window.chrome?.webview && (location.host === 'safe-code.local' || (window._
     let sshPort = 22;
     let resolutionSaving=false,resolutionLoading=false,resolutionDesktopReady=null;
     let metricsTask = Promise.resolve();
-    let metricsTimer=null;let metricsBusy=false;
-    let resourceTimer=null;let resourceBusy=false;
-    let environmentTimer=null;let environmentBusy=false;
+    let metricsTimer=null;
+    let resourceTimer=null;
+    let environmentTimer=null;
     let accountOptions={};
     const originalRenderTasks=renderTasks;renderTasks=function(){originalRenderTasks();syncAdvancedButtons();};
     const ids = ['account','localization','desktop','chrome','input','claude','ssh'];
     window.safeCodeNativeLog = (step,line) => {
-      if(step==='codex_bridge'&&bridgeBusy){$('#bridge-progress').textContent=line;}
+      if(step==='gateway_repair'&&repairing&&repairDialog.open){repairStatus.textContent=line;}
+      else if(step==='codex_bridge'&&bridgeBusy){$('#bridge-progress').textContent=line;}
       else if(step==='mount_apply'&&mountSaving){mountProgressText.textContent=line;}
       else if(step==='folder'&&$('#remote-folder-dialog').open){appendFolderLog(line);}
       else if(step==='cloud_public'||(cloudRemoteRunning&&$('#cloud-remote-dialog').open)){appendCloudRemoteLog(line);}
@@ -188,7 +198,7 @@ if ((window.chrome?.webview && (location.host === 'safe-code.local' || (window._
       if($('#minimize'))$('#minimize').onclick=()=>native('window.minimize');
       if($('#maximize'))$('#maximize').onclick=()=>native('window.maximize');
       if($('#close'))$('#close').onclick=()=>native('window.close');
-      $('#exit').onclick=()=>native('window.close');
+      $('#exit').onclick=()=>native(isMac?'window.quit':'window.close');
       if(mainTitlebar){
         mainTitlebar.addEventListener('mousedown',e=>{if(e.button===0&&!e.target.closest('button'))native('window.drag');});
         mainTitlebar.addEventListener('dblclick',e=>{if(!e.target.closest('button'))native('window.maximize');});
@@ -200,8 +210,8 @@ if ((window.chrome?.webview && (location.host === 'safe-code.local' || (window._
     $('#client-window').addEventListener('close',()=>$('#client-frame').removeAttribute('src'));
     const originalShowScreen=showScreen;showScreen=function(name){
       originalShowScreen(name);
-      if(isAppShell){try{window.resizeTo(name==='workspace'?920:460,name==='workspace'?760:640);}catch{}}
-      native('window.resize',{wide:name==='workspace'}).catch(()=>{});
+      if(isAppShell){try{window.resizeTo(name==='workspace'?920:name==='api'?720:460,name==='workspace'?760:name==='api'?560:640);}catch{}}
+      native('window.resize',{wide:name==='workspace',layout:name}).catch(()=>{});
     };
     const advanced=$('#advanced-connect');
     advanced.onclick=()=>{$('#ssh-port').value=String(sshPort);$('#advanced-dialog').showModal();$('#ssh-port').focus();};
@@ -209,20 +219,20 @@ if ((window.chrome?.webview && (location.host === 'safe-code.local' || (window._
     $('#advanced-form').onsubmit=e=>{e.preventDefault();const input=$('#ssh-port');const port=Number(input.value);input.setCustomValidity(Number.isInteger(port)&&port>=1&&port<=65535?'':'SSH 端口必须在 1 到 65535 之间。');if(!$('#advanced-form').reportValidity())return;sshPort=port;$('#advanced-dialog').close();};
     async function beginPreview(){
       await native('preview.begin');
-      developerPreview=true;connectionAttempt++;clearInterval(metricsTimer);clearInterval(resourceTimer);clearInterval(environmentTimer);connectionReady=false;connectionInFlight=false;nativeServer=null;
+      developerPreview=true;connectionAttempt++;stopConnectionMonitors();connectionReady=false;connectionInFlight=false;nativeServer=null;
       resetHostControl();
       $('#advanced-dialog').close();enterDeveloperPreview();lockWorkspace(false);$('#connection-progress').hidden=true;
       setMetrics(null);for(const value of $$('.network-top strong'))value.textContent='—';
       setResources(null,'预览模式未连接服务器，不显示模拟的监控数值。');
       setEnvironmentAssessment(null,'未连接');
-      $('.server-metadata').textContent='界面预览 / 未连接服务器';
     }
     $('#enter-preview').onclick=async()=>{try{await beginPreview();}catch(error){await showAppMessage(error.message);}};
     $('#login-help').onclick=async()=>{if(!window.__safeCodeNativeDialogs)await native('window.resize',{wide:true});$('#login-help-dialog').showModal();};
     $('#login-help-dialog').addEventListener('close',()=>{if(!window.__safeCodeNativeDialogs&&!$('#login-screen').hidden)native('window.resize',{wide:false});});
     function applyServer(server){
       const hadAccount=!!nativeServer?.statuses?.account;
-      nativeServer=server;$('#update-login-password').hidden=false;$('#host-manage').disabled=!server.statuses?.account;$('#claude-desktop-manage').disabled=!server.statuses?.account;states=ids.map(id=>server.statuses?.[id]?'done':'pending');
+      inputManaged=!!server.inputManaged;rebootRequired=!!server.rebootRequired;
+      nativeServer=server;$('#update-login-password').hidden=false;$('#disconnect-server').hidden=false;$('#host-manage').disabled=!server.statuses?.account;states=ids.map(id=>server.statuses?.[id]?'done':'pending');
       if(currentTask>=0&&states[currentTask]!=='done')states[currentTask]='running';
       const desired=currentLocale();if(desired&&(server.timezone!==desired.timezone||server.systemLocale!==desired.locale))states[1]='pending';
       if(server.ipPolicy){ipPolicy=server.ipPolicy;$('#ip-policy-state').textContent=server.ipPolicyHealthy?(ipPolicy.lockIngress&&ipPolicy.lockEgress?'已锁定':ipPolicy.lockIngress||ipPolicy.lockEgress?'部分锁定':'未锁定'):'待检查';}
@@ -231,10 +241,7 @@ if ((window.chrome?.webview && (location.host === 'safe-code.local' || (window._
       if(server.observedEgressIp){serverConnection.egressIp=server.observedEgressIp;$('#server-address').textContent=server.observedEgressIp;}
       if(server.ipPolicy)serverConnection.ingressIp=server.ipPolicy.ingressIp;
       $('#ip-policy-summary').textContent=server.ipPolicy?.lockEgress?'住宅出口已固定；外部检测：'+(server.observedEgressIp||'待确认'):'未固定出口，当前实际出口：'+(server.observedEgressIp||'待确认');
-      $('#server-user').textContent=$('#username').value.trim();
-      const meta=$('.server-metadata');const user=$('#server-user');
-      const osLabel=(server.osId==='debian'?'Debian ':(server.osName?server.osName+' ':'Debian '))+(server.osVersion||'13');
-      meta.replaceChildren(user,document.createTextNode(' / '+osLabel.trim()+' / SSH'));
+      updateSocksCard(server.socksEgress);
       if(typeof server.desktopReady==='boolean')resolutionDesktopReady=server.desktopReady;
       const serverScale=Number(server.desktopScale);
       if([100,150,200].includes(serverScale)&&!$('#resolution-dialog')?.open&&$('#rdp-remote-scale')){$('#rdp-remote-scale').value=String(serverScale);updateResolutionHint();}
@@ -257,6 +264,7 @@ if ((window.chrome?.webview && (location.host === 'safe-code.local' || (window._
       $('#server-resources').title=message||'服务器实时监控，每5秒更新；内存按已用量显示（扣除可回收缓存），硬盘为根分区；容量按 GiB 显示。';
     }
     function startResourceMonitor(attempt){
+      let resourceBusy=false;
       const refresh=async()=>{
         if(resourceBusy||!connectionReady||developerPreview||attempt!==connectionAttempt||document.hidden||$('#workspace-screen').hidden)return;
         resourceBusy=true;
@@ -274,6 +282,7 @@ if ((window.chrome?.webview && (location.host === 'safe-code.local' || (window._
       $('.environment-rating').title='在VPS工作用户的Chrome环境检测，每分钟刷新。风险分越低越好，属于非官方估计。'+(result?.username?'\nVPS用户：'+result.username:'')+(result?.signals?.length?'\n'+result.signals.map(s=>s.label+'：'+s.value+'（+'+s.contribution+'）').join('\n'):'');
     }
     function startEnvironmentMonitor(attempt){
+      let environmentBusy=false;
       const refresh=async()=>{
         if(environmentBusy||!connectionReady||developerPreview||attempt!==connectionAttempt||document.hidden||$('#workspace-screen').hidden)return;
         environmentBusy=true;
@@ -303,18 +312,27 @@ if ((window.chrome?.webview && (location.host === 'safe-code.local' || (window._
     }
     function lockWorkspace(locked){for(const id of ['deployment-panel','maintenance-panel'])$( '#'+id).inert=locked;$('#workspace-screen').classList.toggle('is-connecting',locked);$('#maintenance-mode').disabled=locked;}
     function connectionProgress(text,failed=false){$('#connection-progress').hidden=false;$('#connection-progress').classList.toggle('failed',failed);$('#connection-progress-text').textContent=text;$('#cancel-connect').hidden=failed;$('#retry-connect').hidden=!failed;$('#edit-connection').hidden=!failed;if(failed){busy=false;renderTasks();const values=$$('.network-top strong');for(const value of values)value.textContent='—';$('#rating-state').textContent='未连接';$('#ip-location').textContent='等待连接服务器';$('#server-address').textContent='待确认';}}
-    function prepareWorkspace(settings){
+    function stopConnectionMonitors(){
+      clearInterval(metricsTimer);clearInterval(resourceTimer);clearInterval(environmentTimer);
       clearTimeout(publicGatewayTimer);
+    }
+    function prepareWorkspace(settings){
+      stopConnectionMonitors();
       publicGatewayEnabled=false;publicGatewayReachable=false;publicGatewayLoading=false;publicGatewayMissing=false;
       publicGatewayUpgrade=false;publicGatewayNeedsCloudKey=false;
+      bundledGatewayRevision=minimumGatewayRevision;publicGatewayLegacy=false;
+      publicGatewayOperation=publicGatewayStatusError='';
+      publicGatewayError=undefined;
+      publicGatewayCreatedAccount=undefined;
+      $('#gateway-repair-dialog').close();
+      $('#claude-desktop-dialog').close();
       publicGatewaySubscription=undefined;
       $('#public-gateway-footer').hidden=true;
-      clearInterval(metricsTimer);clearInterval(resourceTimer);clearInterval(environmentTimer);setResources(null,'等待服务器连接完成。');setEnvironmentAssessment(null,'等待连接');$('#update-login-password').hidden=true;nativeServer=null;connectionReady=false;connectionInFlight=true;busy=false;currentTask=-1;accountOptions={};resetDeploymentSettings();ipPolicy={lockIngress:false,lockEgress:false};
+      setResources(null,'等待服务器连接完成。');setEnvironmentAssessment(null,'等待连接');$('#update-login-password').hidden=true;$('#disconnect-server').hidden=true;nativeServer=null;connectionReady=false;connectionInFlight=true;busy=false;currentTask=-1;accountOptions={};resetDeploymentSettings();ipPolicy={lockIngress:false,lockEgress:false};
       resetHostControl();
       $('#account-settings').close();$('#localization-dialog').close();
       states=Array(tasks.length).fill('pending');taskLogs=Array(tasks.length).fill('等待连接完成。');selectedTasks.clear();selecting=false;renderTasks();
-      serverConnection={ingressIp:settings.host,egressIp:''};$('#server-ingress').textContent=settings.host;$('#server-address').textContent='正在检查…';$('#server-user').textContent=settings.username;
-      const user=$('#server-user');$('.server-metadata').replaceChildren(user,document.createTextNode(' / 系统待检查 / SSH'));
+      serverConnection={ingressIp:settings.host,egressIp:''};$('#server-ingress').textContent=settings.host;$('#server-address').textContent='正在检查…';
       $('#ip-location').textContent='等待连接';$('#ip-score').textContent='—';$('#score-unit').textContent='';$('#rating-state').textContent='待检查';setMetrics(null);
       switchMode('deployment');lockWorkspace(true);showScreen('workspace');connectionProgress('正在连接服务器…');
     }
@@ -364,14 +382,23 @@ if ((window.chrome?.webview && (location.host === 'safe-code.local' || (window._
         $('#password').value='';serverConnection={ingressIp:result.ipPolicy?.ingressIp||settings.host,egressIp:result.ipPolicy?.egressIp||result.observedEgressIp||''};$('#server-ingress').textContent=serverConnection.ingressIp;$('#server-address').textContent=serverConnection.egressIp||'待确认';
         taskLogs=Array(tasks.length).fill('');busy=false;connectionReady=true;connectionInFlight=false;lockWorkspace(false);applyServer(result);
         $('#connection-progress').hidden=true;
-        const measure=async()=>{if(metricsBusy||!connectionReady)return;metricsBusy=true;try{setMetrics(await native('metrics'));}catch{setMetrics({latencyMs:null,lossPercent:100});}finally{metricsBusy=false;}};metricsTask=measure();metricsTimer=setInterval(measure,5000);
+        let metricsBusy=false;
+        const measure=async()=>{
+          if(metricsBusy||!connectionReady||attempt!==connectionAttempt)return;
+          metricsBusy=true;
+          try{const stats=await native('metrics');if(attempt===connectionAttempt)setMetrics(stats);}
+          catch{if(attempt===connectionAttempt)setMetrics({latencyMs:null,lossPercent:100});}
+          finally{metricsBusy=false;}
+        };
+        metricsTask=measure();metricsTimer=setInterval(measure,5000);
         startResourceMonitor(attempt);
         startEnvironmentMonitor(attempt);
         // 评分不会阻塞连接完成或部署操作。
         void queryIpInfo(serverConnection.egressIp);
-        await Promise.all([pollClaudeBridge(),pollClaudeDesktop()]);
+        await pollClaudeBridge();
+        if(attempt!==connectionAttempt)return null;
         if(response.gatewayWarnings?.length)void showAppMessage(response.gatewayWarnings.join('\n'),{title:'网关未恢复'});
-        if(result.activeJobs?.length)resumeJob(result.activeJobs[0]);return result;
+        if(result.activeJobs?.length)void resumeJob(result.activeJobs[0]);return result;
       }catch(error){
         if(attempt!==connectionAttempt)return null;
         connectionReady=false;connectionInFlight=false;lockWorkspace(true);connectionProgress(error.message,true);
@@ -381,6 +408,31 @@ if ((window.chrome?.webview && (location.host === 'safe-code.local' || (window._
     $('#cancel-connect').onclick=async()=>{clearTimeout(startupRetryTimer);connectionAttempt++;resetHostControl();connectionInFlight=false;connectionProgress('正在取消连接…');await native('connection.cancel');connectionProgress('已取消连接。',true);};
     $('#edit-connection').onclick=()=>{clearTimeout(startupRetryTimer);connectionAttempt++;resetHostControl();native('connection.cancel');showScreen('login');resetLogin();};
     $('#retry-connect').onclick=()=>{if(lastSettings)void connect(lastSettings);};
+    $('#disconnect-server').onclick=async()=>{
+      if(!connectionReady||busy)return;
+      const button=$('#disconnect-server'), label=button.textContent;
+      button.textContent='正在退出…';
+      busy=true;lockWorkspace(true);renderTasks();
+      try{
+        await native('connection.disconnect');
+        connectionAttempt++;
+        connectionReady=false;nativeServer=null;lastSettings=null;sshPort=22;
+        accountOptions={};resetDeploymentSettings();resetHostControl();
+        clearTimeout(startupRetryTimer);stopConnectionMonitors();
+        advancedOperation=null;displayedOperation=null;operationHistory.clear();
+        $('#cloud-live-log').hidden=true;$('#mount-live-log').hidden=true;
+        $('#mount-summary').textContent='将本机目录挂载到服务器，支持多组目录。';
+        window.safeCodeMountStatus({count:0,message:'未挂载目录'});
+        $('#public-gateway-footer').hidden=true;
+        $('#ssh-port').setCustomValidity('');
+        returnToServerLogin();
+      }catch(error){
+        void showAppMessage(error.message,{title:'尚未退出服务器'});
+      }finally{
+        button.textContent=label;
+        busy=false;lockWorkspace(false);renderTasks();
+      }
+    };
     $('#login-form').onsubmit=async e=>{
       e.preventDefault();
       const host=$('#ip').value.trim();
@@ -396,26 +448,72 @@ if ((window.chrome?.webview && (location.host === 'safe-code.local' || (window._
       }
       await connect({host,username,password,port:sshPort});
     };
-    async function resumeJob(job){
-      busy=true;const advanced=job.operation==='cloud'||job.operation==='mount_install';if(advanced)beginOperation(job.operation,job.operation==='cloud'?'恢复 CloudCLI 安装进度':'恢复目录挂载安装进度');currentTask=ids.indexOf(job.operation);
-      if(currentTask>=0){states[currentTask]='running';taskLogs[currentTask]='恢复远端部署监控…';}renderTasks();
-      try{applyServer(await native('job.resume',job));if(advanced){appendOperationLog('后台安装任务已完成。');advancedOperation.status='安装完成。';}}
-      catch(e){if(advanced){appendOperationLog('安装未完成：'+e.message);advancedOperation.status='安装未完成，请查看日志后重试。';}else showAppMessage(e.message);}
-      finally{if(advanced){advancedOperation.done=true;if(displayedOperation===advancedOperation)$('#operation-log-status').textContent=advancedOperation.status;}currentTask=-1;busy=false;renderTasks();}
+    function inputRemovalMessage(server){
+      return server.inputPinyinInstalled
+        ? '已卸载当前工作用户的中文输入法配置，系统拼音包仍保留。重新登录远程桌面后生效。'
+        : '中文输入法已卸载，重新登录远程桌面后生效。';
     }
-    async function runTask(index){
-      if(!connectionReady||!deploymentSettingsReady())throw new Error('请先保存工作用户和本土化设置。');
+    async function resumeJob(job){
+      busy=true;
+      const removal=job.operation==='input_remove';
+      const advanced=job.operation==='cloud'||job.operation==='mount_install';
+      if(advanced)beginOperation(job.operation,job.operation==='cloud'?'恢复 CloudCLI 安装进度':'恢复目录挂载安装进度');
+      currentTask=ids.indexOf(removal?'input':job.operation);
+      if(currentTask>=0){states[currentTask]='running';taskLogs[currentTask]='恢复远端部署监控…';}renderTasks();
+      try{
+        const server=await native('job.resume',job);applyServer(server);
+        if(currentTask>=0){
+          states[currentTask]=server.statuses?.[ids[currentTask]]?'done':'pending';
+          taskLogs[currentTask]=removal?inputRemovalMessage(server):'部署完成，已检查服务器状态。';
+        }
+        if(advanced){appendOperationLog('后台安装任务已完成。');advancedOperation.status='安装完成。';}
+      }catch(error){
+        if(advanced){appendOperationLog('安装未完成：'+error.message);advancedOperation.status='安装未完成，请查看日志后重试。';}
+        else{
+          if(currentTask>=0){
+            states[currentTask]=nativeServer?.statuses?.[ids[currentTask]]?'done':'pending';
+            taskLogs[currentTask]=error.message;
+          }
+          showAppMessage(error.message);
+        }
+      }finally{
+        if(advanced){advancedOperation.done=true;if(displayedOperation===advancedOperation)$('#operation-log-status').textContent=advancedOperation.status;}
+        currentTask=-1;busy=false;renderTasks();
+      }
+    }
+    async function runTask(index,removal=false){
+      if(!connectionReady||(!removal&&!deploymentSettingsReady()))throw new Error('请先保存工作用户和本土化设置。');
       const previousState=states[index];currentTask=index;states[index]='running';taskLogs[index]='正在连接 Debian 13 部署模块…';renderTasks();
       try{
         const preset=currentLocale();
         const locale=preset?{region:preset.name,timezone:preset.timezone,locale:preset.locale,language:preset.language}:null;
-        const result=await native('deploy',{step:ids[index],locale,username:accountOptions.username||nativeServer?.username||'workspace',hostname:accountOptions.hostname||'',password:accountOptions.password||''});applyServer(result);
-        if(!result.statuses?.[ids[index]])throw new Error(tasks[index][0]+'验证未通过，请查看日志。');
-        taskLogs[index]='部署完成，已通过实际状态检查。';if(index===0){accountOptions={};accountDraftPending=false;}
-      }catch(error){states[index]=index===0&&previousState==='done'?'done':'pending';taskLogs[index]='失败：'+error.message;throw error;}
-      finally{currentTask=-1;renderTasks();}
+        const step=removal?'input_remove':ids[index];
+        const result=await native('deploy',removal?{step}:{step,locale,username:accountOptions.username||nativeServer?.username||'workspace',hostname:accountOptions.hostname||'',password:accountOptions.password||''});
+        applyServer(result);
+        if(removal){
+          if(result.inputManaged||result.statuses?.input)throw new Error('中文输入法卸载验证未通过，请查看日志。');
+          states[index]='pending';taskLogs[index]=inputRemovalMessage(result);
+        }else{
+          if(!result.statuses?.[step])throw new Error(tasks[index][0]+'验证未通过，请查看日志。');
+          taskLogs[index]='部署完成，已通过实际状态检查。';
+          if(index===0){accountOptions={};accountDraftPending=false;}
+        }
+      }catch(error){
+        states[index]=removal||index===0?previousState:'pending';
+        taskLogs[index]=error.message;
+        throw error;
+      }finally{currentTask=-1;renderTasks();}
     }
     deployOne=async function(index){if(busy||!connectionReady||!deploymentSettingsReady()||!canDeployTask(index))return;selecting=false;selectedTasks.clear();busy=true;try{await runTask(index);}catch(error){showAppMessage(error.message);}finally{busy=false;renderTasks();}};
+    removeChineseInput=async()=>{
+      if(busy||!connectionReady||!inputManaged)return;
+      const attempt=connectionAttempt;
+      const confirmed=await showAppMessage('将卸载当前工作用户的 SafeCode 中文输入法。中文字体、词库和其他输入法会保留。卸载后请重新登录远程桌面。',{title:'卸载中文输入法',confirm:'卸载',cancel:'取消'});
+      if(!confirmed||busy||attempt!==connectionAttempt||!connectionReady||!inputManaged)return;
+      busy=true;
+      try{await runTask(ids.indexOf('input'),true);}catch(error){showAppMessage(error.message);}
+      finally{busy=false;renderTasks();}
+    };
     $('#deploy-all').onclick=async()=>{
       if(busy||!connectionReady||!deploymentSettingsReady())return;if(!selecting){selecting=true;selectedTasks.clear();renderTasks();return;}
       const queue=[...selectedTasks].filter(i=>states[i]!=='done').sort((a,b)=>a-b);if(!queue.length)return;
@@ -445,9 +543,11 @@ if ((window.chrome?.webview && (location.host === 'safe-code.local' || (window._
     }
     function beginOperation(key,label){advancedOperation={key,label,lines:[],started:Date.now(),done:false,status:'正在准备…'};operationHistory.set(key,advancedOperation);displayedOperation=advancedOperation;$('#operation-log-title').textContent=label;$('#operation-log-status').textContent='正在准备…';$('#operation-log-output').textContent='';$('#operation-log-dialog').showModal();appendOperationLog('已开始，请等待服务器返回实际进度。');}
     function syncAdvancedButtons(){
+      $('#disconnect-server').disabled=busy;
+      $('#update-login-password').disabled=busy;
       if(document.querySelector('#bridge-manage'))$('#bridge-manage').disabled=busy||bridgeBusy||(!isMac&&!nativeServer?.statuses?.account);
       if(document.querySelector('#host-manage'))$('#host-manage').disabled=busy||hostBusy||!nativeServer?.statuses?.account;
-      if(document.querySelector('#claude-desktop-manage'))$('#claude-desktop-manage').disabled=busy||claudeDesktopBusy||(!nativeServer?.statuses?.account&&!(isMac&&claudeDesktopStatus?.managed));
+      renderDesktopAccess();
       for(const [key,ready] of [['mount',nativeServer?.mountReady],['cloud',nativeServer?.cloudReady]]){const button=$('#install-'+key);button.disabled=!!ready||busy;button.title=busy?'有任务正在执行，请查看进度。':'';button.textContent=advancedOperation&&!advancedOperation.done&&advancedOperation.key===(key==='cloud'?'cloud':'mount_install')?'安装中…':ready?'已安装':'安装';}
       if($('#open-cloud-remote'))$('#open-cloud-remote').disabled=!nativeServer?.cloudReady||busy;
     }
@@ -548,10 +648,17 @@ if ((window.chrome?.webview && (location.host === 'safe-code.local' || (window._
     openAccountSettings=async function(){
       const attempt=connectionAttempt;
       try{const draft=await native('account.draft.get',isMac?{interactive:true}:{});if(attempt!==connectionAttempt)return;accountOptions=draft||{};accountDraftPending=!!draft;
-        $('#custom-hostname').value=draft?.hostname||nativeServer?.hostname||'safe-workstation';$('#custom-username').value=draft?.username||nativeServer?.username||'workspace';$('#custom-password').type='password';$('#custom-password').value=draft?.password||'';setEye($('#account-settings [data-reveal]'),false);
+        $('#custom-hostname').value=draft?.hostname||nativeServer?.hostname||'safe-workstation';$('#custom-username').value=draft?.username||nativeServer?.username||'workspace';$('#custom-password').type='password';$('#custom-password').value=draft?.password||'';validateWorkPassword();setEye($('#account-settings [data-reveal]'),false);
         $('#account-custom-hint').textContent='工作密码用于工作用户和远程桌面。保存工作用户和本土化设置后即可部署。更换用户名会创建新环境，保留旧项目，需先注销旧桌面并卸载目录，旧 CloudCLI 将停止。';$('#account-settings').showModal();
       }catch(e){showAppMessage(e.message);}
     };
+    const workPassword=$('#custom-password');
+    function validateWorkPassword(){
+      const password=workPassword.value;
+      workPassword.setCustomValidity(password && (password.length<12||password.length>256||password.includes('\0'))
+        ? '工作密码须为 12–256 位，不能包含空字符。' : '');
+    }
+    workPassword.addEventListener('input',validateWorkPassword);
     let accountSaving=false;
     $('#account-settings-form').onsubmit=async e=>{
       e.preventDefault();if(!connectionReady||busy||accountSaving||!$('#account-settings-form').reportValidity())return;
@@ -735,8 +842,10 @@ if ((window.chrome?.webview && (location.host === 'safe-code.local' || (window._
     }
     const restore=$('#restore-saved-login');
     async function loadLoginForm(){
+      const attempt=connectionAttempt;
       try{
         const saved=await native('login.load');
+        if(attempt!==connectionAttempt)return;
         if(saved){
           if(!['#ip','#username','#password'].some(id=>$(id).value))fillSavedLogin(saved);
           return;
@@ -795,7 +904,13 @@ if ((window.chrome?.webview && (location.host === 'safe-code.local' || (window._
       $('#bridge-copy-config').disabled=!ready||bridgeBusy;$('#bridge-copy-key').disabled=!ready||bridgeBusy;$('#bridge-dialog-state').textContent=$('#bridge-state').textContent;
     }
     window.safeCodeClaudeBridgeStatus=renderClaudeBridge;
-    async function pollClaudeBridge(){if(bridgePolling||bridgeBusy||!nativeServer)return;bridgePolling=true;try{renderClaudeBridge(await native('bridge.status'));}catch{}finally{bridgePolling=false;}}
+    async function pollClaudeBridge(){
+      if(bridgePolling||bridgeBusy||!nativeServer)return;
+      const attempt=connectionAttempt;
+      bridgePolling=true;
+      try{const status=await native('bridge.status');if(attempt===connectionAttempt)renderClaudeBridge(status);}
+      catch{}finally{bridgePolling=false;}
+    }
     $('#bridge-manage').onclick=async()=>{
       if(isMac){
         await showAppMessage(codexWarning+'\n\n当前适配器仅支持 Windows，macOS 暂不可用。',{title:'第三方功能警告'});
@@ -823,65 +938,80 @@ if ((window.chrome?.webview && (location.host === 'safe-code.local' || (window._
     $('#bridge-copy-key').onclick=async()=>{try{await native('bridge.copy-key');$('#bridge-progress').textContent='本机适配器密钥已复制。只填写到本机 CC Switch/Codex，勿发给他人。';}catch(error){$('#bridge-progress').textContent=error.message;}};
     setInterval(()=>{if(!$('#workspace-screen').hidden)pollClaudeBridge();},4000);
 
-    function renderClaudeDesktop(value){
-      if(value)claudeDesktopStatus=value;
-      const current=claudeDesktopStatus,active=!!current?.active,managed=!!current?.managed,installed=!!current?.installed;
-      const launchReady=(active||keyState.running)&&!claudeDesktopBusy&&!keyBusy;
-      renderGatewayBadge('claude-gateway-status','Claude',active||keyState.running);
-      setLaunchAvailability('claude-desktop-launch',launchReady);
-      $('#claude-desktop-state').textContent=current?.state==='attention'?'需处理':(active||keyState.running)?'已接入':'未启用';
-      $('#claude-desktop-summary').textContent=isMac?'通过 SSH 或 API Key 连接服务器上的 Claude。':'习惯本地 Claude 客户端？在里面连接服务器上的 Claude。';
-      $('#claude-desktop-manage').disabled=claudeDesktopBusy||busy||(!nativeServer?.statuses?.account&&!(isMac&&managed));
-      $('#claude-desktop-close').disabled=claudeDesktopBusy;
-      $('#claude-desktop-consent').disabled=claudeDesktopBusy||managed;
-      if(managed)$('#claude-desktop-consent').checked=true;
-      $('#claude-desktop-open').hidden=!installed;$('#claude-desktop-install').hidden=installed;
-      setLaunchAvailability('claude-desktop-open',launchReady);
-      $('#claude-desktop-start').hidden=publicGatewaySetupOnly||managed&&(active||(!isMac&&!!current?.endpoint));
-      $('#claude-desktop-start').textContent=managed?'恢复接入':current?.oldProfile?'重新配置 SSH 接入':'部署并启用';
-      $('#claude-desktop-start').disabled=claudeDesktopBusy||!$('#claude-desktop-consent').checked||
-        !nativeServer?.statuses?.account||keyState.configured||(isMac&&!installed);
-      const gatewayUnavailable=claudeDesktopBusy||busy||publicGatewayLoading||!nativeServer?.statuses?.account;
-      $('#public-gateway-runtime').disabled=gatewayUnavailable;
-      $('#safe-code-api-enable').disabled=gatewayUnavailable||publicGatewayEnabled||!publicGatewayReachable;
-      $('#safe-code-api-enable').textContent=publicGatewayMissing?'安装 API 服务':publicGatewayUpgrade?'升级 CloudCLI 网关':publicGatewayEnabled?'公网已启用':'公网启用';
+    function connectionLabel(){
+      if(!keyState.running)return keyState.configured?'待恢复':'未接入';
+      if(keyState.deviceProblem)return '设备回连待确认';
+      if(keyState.requestError)return '接入异常';
+      return keyState.clientConnected?'Claude 已连接':'网关已就绪';
+    }
+    function renderDesktopAccess(){
+      const ready=connectionReady&&!!nativeServer?.statuses?.account;
+      const checking=publicGatewayLoading&&!publicGatewayReachable&&!publicGatewayStatusError&&!publicGatewayError;
+      const unavailable=!ready||busy||!!publicGatewayOperation;
+      $('#claude-gateway-status').textContent=keyState.running?connectionLabel():'Claude 未接入';
+      $('#claude-gateway-status').classList.toggle('inactive',!keyState.running||!!keyState.deviceProblem||!!keyState.requestError);
+      $('#claude-connection-reason').textContent=keyState.deviceProblem||keyState.requestError||'';
+      const updateAvailable=publicGatewayReachable&&publicGatewayUpgrade;
+      $('#claude-desktop-manage').textContent=updateAvailable?'网关设置 · 有更新':'网关设置';
+      $('#claude-desktop-manage').disabled=!ready;
+      const updateButton=$('#safe-code-api-update');
+      updateButton.hidden=!updateAvailable;
+      updateButton.type=updateAvailable?'submit':'button';
+      updateButton.disabled=unavailable||!updateAvailable;
+      $('#public-gateway-runtime').disabled=!ready;
+      $('#safe-code-api-enable').disabled=unavailable||checking||publicGatewayEnabled||updateAvailable;
+      $('#safe-code-api-enable').textContent=publicGatewayEnabled?'已启用':'启用';
+      $('#safe-code-api-manage').disabled=unavailable||!publicGatewayEnabled||publicGatewayLegacy;
+      $('#safe-code-api-repair').disabled=unavailable||publicGatewayMissing;
       $('#safe-code-cloudcli-config').hidden=!publicGatewayNeedsCloudKey;
-      $('#safe-code-api-manage').disabled=gatewayUnavailable||!publicGatewayEnabled;
-      $('#claude-desktop-stop').hidden=publicGatewaySetupOnly||!managed;$('#claude-desktop-stop').disabled=claudeDesktopBusy;
-      $('#claude-desktop-dialog').classList.toggle('public-api-only',publicGatewaySetupOnly);
-      $('#claude-desktop-title').textContent=publicGatewaySetupOnly?'Safe Code API · 公网网关':'本地 Claude Desktop 接入 VPS';
-      $('#claude-desktop-close').setAttribute('aria-label',publicGatewaySetupOnly?'关闭公网网关设置':'关闭 Claude Desktop 接入设置');
-      $('#safe-code-api-intro').hidden=!publicGatewaySetupOnly;
-      $('#claude-desktop-dialog-state').textContent=publicGatewaySetupOnly
-        ? (publicGatewayEnabled?'已启用':publicGatewayMissing?'待安装':publicGatewayReachable?'未启用':'待确认')
-        : $('#claude-desktop-state').textContent;
-      const existing=$('#claude-desktop-existing');existing.hidden=!current?.configured;
-      existing.textContent=active?'当前入口：'+current.endpoint:isMac?'SSH 接入绑定到原服务器。停用后可重新设置。':'检测到已有网关策略。启用后会替换为 VPS 桥接并加密归档旧配置；停止不会恢复旧外部直连。';
+      $('#safe-code-cloudcli-api-key').disabled=!!publicGatewayOperation;
+      $('#claude-desktop-dialog-state').textContent=publicGatewayOperation?'处理中…':checking?'正在读取…':
+        !publicGatewayReachable?'状态待确认':publicGatewayEnabled?'公网已启用':publicGatewayUpgrade?'待升级':
+        publicGatewayMissing?'待安装':'未启用';
+      $('#safe-code-api-progress').textContent=gatewayInstructions(ready,checking);
     }
-    function fillClaudeDesktopForm(){
-      const current=claudeDesktopStatus;
-      $('#claude-desktop-consent').checked=!!current?.managed;
-      $('#claude-desktop-progress').textContent=isMac&&keyState.configured?'请先停用 API Key 接入，再启用 SSH 接入。':
-        current?.oldProfile?'Claude Desktop 仍选中了旧的 SafeCode SSH 配置，可以重新配置接入。':
-        (current?.message||'请先连接目标 VPS，再部署并启用。');
+    function gatewayInstructions(ready,checking){
+      if(publicGatewayOperation)return publicGatewayOperation+' 可以关闭此窗口，稍后从「网关设置」查看。';
+      if(!ready)return '服务器连接尚未就绪。请关闭窗口，重新连接服务器。';
+      if(busy)return '服务器正在执行其他任务。请关闭窗口，任务完成后再打开「网关设置」。';
+      if(checking)return '正在读取公网网关状态。可以关闭此窗口。';
+      if(publicGatewayError){
+        if(publicGatewayError.action==='manage')return publicGatewayError.message+
+          (publicGatewayEnabled?' 点击「管理网关」重试。':' 点击「启用」重新检查公网网关。');
+        return publicGatewayError.message;
+      }
+      if(!publicGatewayReachable&&publicGatewayStatusError)return publicGatewayStatusError+
+        (publicGatewayEnabled?' 点击「管理网关」重试，也可以关闭窗口后检查 SSH 连接。':' 检查 SSH 连接后，点击「启用」重试。');
+      if(publicGatewayNeedsCloudKey)return '填写下方的 CloudCLI API Key，再点击「'+(publicGatewayUpgrade?'更新网关':'启用')+'」。';
+      if(publicGatewayUpgrade)return '当前客户端包含新版网关。点击「更新网关」更新 VPS，保留已有 API Key。';
+      if(publicGatewayEnabled)return '点击「管理网关」创建 API Key，再回到主界面粘贴。';
+      if(publicGatewayMissing)return '点击「启用」安装并开放公网网关。首次安装可能需要几分钟。';
+      return '点击「启用」开放公网网关。';
     }
-    window.safeCodeClaudeDesktopStatus=renderClaudeDesktop;
-    async function pollClaudeDesktop(){if(claudeDesktopPolling||claudeDesktopBusy||(!nativeServer&&!isMac))return;claudeDesktopPolling=true;try{renderClaudeDesktop(await native('claudeDesktop.status'));}catch{}finally{claudeDesktopPolling=false;}}
-    function publicGatewayNotice(message){
-      const status=$('#safe-code-api-progress');
-      status.textContent=message;status.hidden=!message;
+    function setPublicGatewayOperation(message){
+      publicGatewayOperation=message;
+      renderDesktopAccess();
     }
-    function renderPublicGatewayStatus(status,error){
+    function readPublicGatewayStatus(){
+      return native('safeCodeApi.publicStatus',{},{
+        ms:12000,message:'读取公网网关状态超时。'
+      });
+    }
+    function renderPublicGatewayStatus(status,error=''){
       const footer=$('#public-gateway-footer'),badge=$('#public-gateway-runtime'),quota=$('#footer-claude-limits');
       footer.hidden=!connectionReady||!nativeServer?.statuses?.account;
       const reachable=Boolean(status);
       if(reachable) {
         publicGatewayMissing=status.installed===false;
-        publicGatewayUpgrade=!publicGatewayMissing&&(status.backend!=='cloudcli'||(status.gatewayRevision??0)<requiredGatewayRevision);
-        if(status.cloudcliConfigured||status.backend==='cloudcli')publicGatewayNeedsCloudKey=false;
-        publicGatewayEnabled=status.enabled===true&&!publicGatewayUpgrade;
+        if(Number.isInteger(status.bundledGatewayRevision))bundledGatewayRevision=status.bundledGatewayRevision;
+        publicGatewayLegacy=!publicGatewayMissing&&(status.backend!=='cloudcli'||(status.gatewayRevision??0)<minimumGatewayRevision);
+        publicGatewayUpgrade=!publicGatewayMissing&&(publicGatewayLegacy||(status.gatewayRevision??0)<bundledGatewayRevision);
+        publicGatewayEnabled=status.enabled===true;
+        if(status.cloudcliConfigured===true||(publicGatewayEnabled&&!publicGatewayLegacy))publicGatewayNeedsCloudKey=false;
+        if(!publicGatewayUpgrade&&(publicGatewayError?.action==='update'||(publicGatewayEnabled&&publicGatewayError?.action==='enable')))publicGatewayError=undefined;
       }
       publicGatewayReachable=reachable;
+      publicGatewayStatusError=error;
       badge.classList.toggle('inactive',!reachable||!publicGatewayEnabled);
       badge.title=error||(publicGatewayEnabled?'打开 Safe Code API 网关管理':'打开 Safe Code API 公网设置');
       if(!reachable)badge.textContent=/SSH 认证失败|服务器身份已变化/.test(error||'')
@@ -894,12 +1024,12 @@ if ((window.chrome?.webview && (location.host === 'safe-code.local' || (window._
         const limit=String(status.concurrency_text??status.concurrency);
         badge.textContent='公网网关 · 并发 '+status.active+(limit==='0'?'（不限）':'/'+limit)+' · 排队 '+status.waiting;
       }
-      if(isMac){renderClaudeDesktop();return;}
+      if(isMac){renderDesktopAccess();return;}
       if(reachable)publicGatewaySubscription=status.subscription;
       quota.hidden=!publicGatewayEnabled;
       renderClaudeSubscription(quota,!reachable&&publicGatewaySubscription
         ?{...publicGatewaySubscription,state:'stale'}:publicGatewaySubscription);
-      renderClaudeDesktop();
+      renderDesktopAccess();
     }
     if(!isMac)bindClaudeUsageRefresh($('#footer-claude-limits'), async()=>{
       const attempt=connectionAttempt;
@@ -912,31 +1042,23 @@ if ((window.chrome?.webview && (location.host === 'safe-code.local' || (window._
     });
     function refreshPublicGateway(interactive=false){
       const attempt=connectionAttempt;
-      if(!connectionReady||!nativeServer?.statuses?.account)return;
-      if(publicGatewayTask?.attempt===attempt)return publicGatewayTask.promise;
+      if(publicGatewayOperation||!connectionReady||!nativeServer?.statuses?.account)return;
       clearTimeout(publicGatewayTimer);
       if(interactive){
         publicGatewayLoading=true;
-        publicGatewayNotice('正在读取公网状态…');
-        renderClaudeDesktop();
+        renderDesktopAccess();
       }
+      if(publicGatewayTask?.attempt===attempt)return publicGatewayTask.promise;
       const promise=(async()=>{
         try{
-          const status=await native('safeCodeApi.publicStatus');
-          if(attempt!==connectionAttempt)return;
-          renderPublicGatewayStatus(status);
-          if(!claudeDesktopBusy&&(interactive||publicGatewayMissing||publicGatewayUpgrade))
-            publicGatewayNotice(publicGatewayNeedsCloudKey?'请填写 CloudCLI API Key。'
-              :publicGatewayUpgrade?'当前网关有更新。升级会保留已有 Safe Code Key 和用量。'
-              :publicGatewayMissing?'安装时会自动检查并准备 CloudCLI。':'');
+          const status=await readPublicGatewayStatus();
+          if(attempt===connectionAttempt)renderPublicGatewayStatus(status);
         }catch(error){
-          if(attempt!==connectionAttempt)return;
-          renderPublicGatewayStatus(null,error.message);
-          if(!claudeDesktopBusy&&(interactive||$('#claude-desktop-dialog').open))publicGatewayNotice(error.message);
+          if(attempt===connectionAttempt)renderPublicGatewayStatus(null,error.message);
         }finally{
           if(attempt===connectionAttempt){
             publicGatewayLoading=false;
-            renderClaudeDesktop();
+            renderDesktopAccess();
             const delay=publicGatewayReachable&&publicGatewayEnabled?6000:20000;
             publicGatewayTimer=setTimeout(()=>void refreshPublicGateway(),delay);
           }
@@ -947,119 +1069,472 @@ if ((window.chrome?.webview && (location.host === 'safe-code.local' || (window._
     }
     window.addEventListener('online',()=>void refreshPublicGateway());
     document.addEventListener('visibilitychange',()=>{if(!document.hidden)void refreshPublicGateway();});
-    let claudeDesktopOpening=false;
-    $('#public-gateway-runtime').onclick=()=>{
-      const dialog=$('#claude-desktop-dialog');
-      if(claudeDesktopOpening||dialog.open||!connectionReady||!nativeServer?.statuses?.account)return;
-      if(publicGatewayEnabled)return native('window.gateway.open').catch(error=>showAppMessage(error.message));
-      publicGatewaySetupOnly=true;
-      renderClaudeDesktop();
-      dialog.showModal();
+    const publicGatewayDialog=$('#claude-desktop-dialog');
+    function showCreatedGatewayAccount(){
+      if(!publicGatewayDialog.open||!publicGatewayCreatedAccount||publicGatewayOperation)return;
+      const {username,password}=publicGatewayCreatedAccount;
+      publicGatewayCreatedAccount=undefined;
+      void showAppMessage('已创建 VPS 上的 CloudCLI 网页账户，请妥善保存。\n\n账号 '+username+'\n密码 '+password,
+        {title:'CloudCLI 账户已创建',confirm:'已保存',clearOnClose:true});
+    }
+    function openPublicGatewaySettings(){
+      if(publicGatewayDialog.open||$('#claude-desktop-manage').disabled)return;
+      renderDesktopAccess();
+      publicGatewayDialog.showModal();
       void refreshPublicGateway(true);
+      showCreatedGatewayAccount();
+    }
+    $('#claude-desktop-manage').onclick=openPublicGatewaySettings;
+    $('#public-gateway-runtime').onclick=()=>{
+      openPublicGatewaySettings();
+      if(!publicGatewayCreatedAccount&&!$('#app-message-dialog').open&&publicGatewayEnabled&&!publicGatewayLegacy)
+        void openManagedGateway();
     };
-    $('#claude-desktop-manage').onclick=async()=>{
-      const dialog=$('#claude-desktop-dialog');
-      if(claudeDesktopOpening||dialog.open)return;
-      claudeDesktopOpening=true;
-      const attempt=connectionAttempt;
-      try{
-        if(!await native('notice.claudeDesktop.state')){
-          if(!await showAppMessage('⚠️本功能未经过大范围验证，如果担心你的账户安全，请不要启用，除非您有非用不可桌面端的需求，否则请使用CloudCLI 网页界面',
-            {title:'Claude Desktop 接入提醒',confirm:'我知道我在做什么',cancel:'我手滑了'}))return;
-          await native('notice.claudeDesktop.accept');
-        }
-        if(attempt!==connectionAttempt)return;
-        await pollClaudeDesktop();
-        if(attempt!==connectionAttempt)return;
-        if(isHostSetupCurrent(attempt)&&(!isMac||claudeDesktopStatus?.installed)&&!claudeDesktopStatus?.managed&&!keyState.configured){
-          if(!await requireHostControl(attempt)||!isHostSetupCurrent(attempt))return;
-        }
-        publicGatewaySetupOnly=false;
-        fillClaudeDesktopForm();
-        renderClaudeDesktop();
-        dialog.showModal();
-        void refreshPublicGateway(true);
-      }catch(error){if(attempt===connectionAttempt)await showAppMessage(error.message);}
-      finally{claudeDesktopOpening=false;}
-    };
-    $('#claude-desktop-close').onclick=()=>{if(!claudeDesktopBusy)$('#claude-desktop-dialog').close();};
-    $('#claude-desktop-dialog').addEventListener('cancel',event=>{if(claudeDesktopBusy)event.preventDefault();});
-    $('#claude-desktop-dialog').addEventListener('close',()=>{
-      if($('#claude-desktop-dialog').open)return;
-      $('#safe-code-cloudcli-api-key').value='';
-      publicGatewaySetupOnly=false;renderClaudeDesktop();
+    $('#claude-desktop-close').onclick=()=>publicGatewayDialog.close();
+    publicGatewayDialog.addEventListener('close',()=>{
+      if(!publicGatewayDialog.open)$('#safe-code-cloudcli-api-key').value='';
     });
-    $('#safe-code-open-cloudcli').onclick=()=>native('cloud.open').then(res=>{if(isWebHost&&res?.url)window.open(res.url,'_blank','noopener,noreferrer');}).catch(e=>publicGatewayNotice(e.message));
-    $('#claude-desktop-consent').onchange=()=>renderClaudeDesktop();
-    $('#safe-code-api-enable').onclick=async()=>{
-      if($('#safe-code-api-enable').disabled)return;
-      const attempt=connectionAttempt;
-      if(publicGatewayMissing||publicGatewayUpgrade){
-        const upgrade=publicGatewayUpgrade;
-        const keyField=$('#safe-code-cloudcli-api-key');
-        const apiKey=keyField.value.trim();
-        if(publicGatewayNeedsCloudKey&&!apiKey){
-          publicGatewayNotice('请填写 CloudCLI API Key。');keyField.focus();return;
+    const repairDialog=$('#gateway-repair-dialog'), repairStatus=$('#gateway-repair-status');
+    const repairCloud=$('#gateway-repair-cloudcli'), repairStart=$('#gateway-repair-start');
+    const repairBack=$('#gateway-repair-back');
+    let repairing=false;
+    function setRepairBusy(value){
+      repairing=value;
+      repairCloud.disabled=repairStart.disabled=value;
+      for(const button of repairDialog.querySelectorAll('[data-close-gateway-repair]'))button.disabled=value;
+    }
+    $('#safe-code-api-repair').onclick=()=>{
+      if($('#safe-code-api-repair').disabled||repairDialog.open)return;
+      repairCloud.checked=false;
+      setRepairBusy(false);
+      repairStart.hidden=false;
+      repairBack.textContent='取消';
+      repairStatus.textContent='重装期间服务会短暂中断，建议等正在运行的请求完成。';
+      repairDialog.showModal();
+    };
+    for(const button of repairDialog.querySelectorAll('[data-close-gateway-repair]')){
+      button.onclick=()=>{if(!repairing)repairDialog.close();};
+    }
+    repairDialog.addEventListener('cancel',event=>{if(repairing)event.preventDefault();});
+    function showRepairedCloudCliLogin(status){
+      const login=status.cloudcliLogin;
+      let message='请使用原有 CloudCLI 网页账号登录。Safe Code 未能确认可显示的登录密码。';
+      if(status.cloudcliNeedsSetup){
+        message='CloudCLI 尚未创建网页账号。请打开 CloudCLI，按网页提示完成首次注册。';
+      }else if(login?.state==='unverified'){
+        message='Safe Code 保存的密码未通过 CloudCLI 验证。请使用该账号的当前密码登录。';
+      }else if(login?.state==='verified'&&login.username&&login.password){
+        message='CloudCLI 已重装，以下登录信息已通过验证。\n\n用户名 '+login.username+'\n密码 '+login.password;
+      }
+      void showAppMessage(message,{title:'CloudCLI 登录信息',confirm:'完成',clearOnClose:true,preserveWhitespace:true});
+    }
+    $('#gateway-repair-form').onsubmit=async event=>{
+      event.preventDefault();
+      if(repairing||repairStart.hidden||!connectionReady||publicGatewayOperation)return;
+      const attempt=connectionAttempt, reinstallCloudCLI=repairCloud.checked;
+      setRepairBusy(true);
+      setPublicGatewayOperation('正在修复网关。');
+      repairStatus.textContent=reinstallCloudCLI?'正在重装网关和 CloudCLI，下载安装可能需要几分钟。':'正在重装网关并检查服务。';
+      try{
+        await publicGatewayTask?.promise;
+        if(attempt!==connectionAttempt)return;
+        const status=await native('safeCodeApi.repair',{accepted:true,reinstallCloudCLI});
+        if(attempt!==connectionAttempt)return;
+        publicGatewayError=undefined;
+        renderPublicGatewayStatus(status);
+        repairStatus.textContent=status.cloudcliReinstalled?'网关和 CloudCLI 已重装，服务检查通过。':'网关已重装，服务检查通过。';
+        repairStart.hidden=true;
+        repairBack.textContent='完成';
+        if(reinstallCloudCLI&&status.cloudcliReinstalled&&repairDialog.open)showRepairedCloudCliLogin(status);
+      }catch(error){
+        if(attempt===connectionAttempt)repairStatus.textContent=error.message;
+      }finally{
+        setRepairBusy(false);
+        if(attempt===connectionAttempt){
+          setPublicGatewayOperation('');
+          void refreshPublicGateway();
         }
-        if(!await showAppMessage(upgrade?'将在当前 VPS 验证 CloudCLI 并重启 API 服务。已有 Safe Code Key 和用量会保留。':'将在当前 VPS 验证 CloudCLI 并安装 API 服务。安装完成后可确认启用公网。',
-          {title:upgrade?'升级 CloudCLI 网关':'安装 Safe Code API',confirm:upgrade?'升级网关':'安装 API 服务',cancel:'取消'}))return;
-        if(attempt!==connectionAttempt||(!publicGatewayMissing&&!publicGatewayUpgrade)||$('#safe-code-api-enable').disabled||!$('#claude-desktop-dialog').open)return;
-        const options=apiKey?{accepted:true,cloudcli:{apiKey}}:{accepted:true};
-        keyField.value='';
-        claudeDesktopBusy=true;renderClaudeDesktop();publicGatewayNotice('正在准备 CloudCLI 并部署 API 服务…');
-        try{
-          const status=await native('safeCodeApi.install',options);
+      }
+    };
+    $('#safe-code-open-cloudcli').onclick=event=>{
+      event.preventDefault();
+      const attempt=connectionAttempt;
+      if(!publicGatewayOperation)native('cloud.open').then(res=>{
+        if(isWebHost&&res?.url)window.open(res.url,'_blank','noopener,noreferrer');
+      }).catch(error=>{
+        if(attempt!==connectionAttempt)return;
+        publicGatewayError={message:error.message};renderDesktopAccess();
+      });
+    };
+    $('#safe-code-api-form').onsubmit=async event=>{
+      event.preventDefault();
+      const updating=event.submitter?.id==='safe-code-api-update';
+      if($(updating?'#safe-code-api-update':'#safe-code-api-enable').disabled)return;
+      const attempt=connectionAttempt, keyField=$('#safe-code-cloudcli-api-key');
+      const apiKey=publicGatewayNeedsCloudKey?keyField.value.trim():'';
+      if(publicGatewayNeedsCloudKey&&!apiKey){
+        publicGatewayError={message:'请填写 CloudCLI API Key。'};renderDesktopAccess();keyField.focus();return;
+      }
+      publicGatewayError=undefined;
+      let needsCloudKey=false;
+      setPublicGatewayOperation('正在确认服务器上的网关状态。');
+      try{
+        await publicGatewayTask?.promise;
+        if(attempt!==connectionAttempt)return;
+        if(updating||!publicGatewayReachable){
+          const status=await readPublicGatewayStatus();
           if(attempt!==connectionAttempt)return;
-          if(nativeServer&&(status.cloudcliKeyRequired||status.backend==='cloudcli')&&!nativeServer.cloudReady)
+          renderPublicGatewayStatus(status);
+        }
+        if(updating!==publicGatewayUpgrade)return;
+        if(publicGatewayMissing||publicGatewayUpgrade){
+          keyField.value='';
+          setPublicGatewayOperation(updating?'正在更新公网网关。':'正在准备 CloudCLI 并部署公网网关，可能需要几分钟。');
+          const status=updating&&!publicGatewayLegacy?
+            await native('safeCodeApi.repair',{accepted:true,reinstallCloudCLI:false}):
+            await native('safeCodeApi.install',apiKey?{accepted:true,cloudcli:{apiKey}}:{accepted:true},{
+            ms:13*60000,message:'等待网关部署结果超时，服务器可能仍在处理。'
+          });
+          if(attempt!==connectionAttempt)return;
+          if((status.cloudcliKeyRequired||status.backend==='cloudcli')&&!nativeServer.cloudReady)
             applyServer({...nativeServer,cloudReady:true});
           if(status.cloudcliKeyRequired){
-            publicGatewayNeedsCloudKey=true;
-            publicGatewayNotice('请填写 CloudCLI API Key。');
-            renderClaudeDesktop();keyField.focus();return;
+            publicGatewayNeedsCloudKey=needsCloudKey=true;
+            return;
           }
+          publicGatewayCreatedAccount=status.cloudcliAccount;
           renderPublicGatewayStatus(status);
+        }
+        if(updating){
+          if(publicGatewayUpgrade)throw new Error('网关仍报告旧版本，请重试更新。');
+          return;
+        }
+        if(!publicGatewayEnabled){
+          setPublicGatewayOperation('正在启用公网网关。');
+          const status=await native('safeCodeApi.enablePublic',{accepted:true},{
+            ms:35000,message:'等待公网网关启用结果超时。'
+          });
+          if(attempt!==connectionAttempt)return;
+          renderPublicGatewayStatus(status);
+        }
+        if(!publicGatewayEnabled)publicGatewayError={action:'enable',message:'未能确认公网已启用，点击「启用」重试。'};
+      }catch(error){
+        if(attempt===connectionAttempt){
+          publicGatewayReachable=false;
+          publicGatewayError={action:updating?'update':'enable',message:error.message+(updating?' 检查连接后重试更新。':' 检查连接后，点击「启用」重试。')};
+        }
+      }finally{
+        if(attempt===connectionAttempt){
+          setPublicGatewayOperation('');
+          if(needsCloudKey&&publicGatewayDialog.open)keyField.focus();
+          showCreatedGatewayAccount();
           void refreshPublicGateway();
-          publicGatewayNotice(publicGatewayEnabled?'API 服务已启用，可以管理网关。':'API 服务已安装，可以启用公网。');
-          if(status.cloudcliAccount){
-            const {username,password}=status.cloudcliAccount;
-            await showAppMessage('已创建 VPS 上的 CloudCLI 网页账户，请妥善保存。\n\n账号 '+username+'\n密码 '+password,
-              {title:'CloudCLI 账户已创建',confirm:'已保存',clearOnClose:true});
-          }
-        }catch(error){if(attempt===connectionAttempt)publicGatewayNotice(error.message);}
-        finally{claudeDesktopBusy=false;renderClaudeDesktop();}
-        return;
+        }
       }
-      if(!await showAppMessage('公网 Key 仅供自用。请妥善保管，持有者可在 VPS 工作账户的权限内通过 CloudCLI 执行任务。高并发和大量调用会增加账户风险。',
-        {title:'⚠️ 公网启用警告',confirm:'保证自用',cancel:'我点错了'}))return;
-      if(attempt!==connectionAttempt||publicGatewayMissing||publicGatewayUpgrade||$('#safe-code-api-enable').disabled||!$('#claude-desktop-dialog').open)return;
-      claudeDesktopBusy=true;renderClaudeDesktop();publicGatewayNotice('正在启用公网…');
-      try{
-        const status=await native('safeCodeApi.enablePublic',{accepted:true});
-        if(attempt!==connectionAttempt)return;
-        renderPublicGatewayStatus(status);
-        void refreshPublicGateway();
-        publicGatewayNotice(publicGatewayEnabled?'已启用公网，可以管理网关和创建 API Key。':'未能确认公网已启用。');
-      }catch(error){publicGatewayNotice(error.message);}
-      finally{claudeDesktopBusy=false;renderClaudeDesktop();}
     };
-    $('#safe-code-api-manage').onclick=async()=>{
+    async function openManagedGateway(){
       if($('#safe-code-api-manage').disabled)return;
-      try{await native('window.gateway.open');}
-      catch(error){await refreshPublicGateway();publicGatewayNotice(error.message);}
-    };
+      const attempt=connectionAttempt;
+      publicGatewayError=undefined;
+      setPublicGatewayOperation('正在打开网关管理。');
+      try{
+        await native('window.gateway.open',{},{
+          ms:35000,message:'打开网关管理超时。'
+        });
+        if(attempt===connectionAttempt)publicGatewayDialog.close();
+      }catch(error){
+        if(attempt===connectionAttempt)publicGatewayError={action:'manage',message:error.message};
+      }finally{
+        if(attempt===connectionAttempt){
+          setPublicGatewayOperation('');
+          void refreshPublicGateway();
+        }
+      }
+    }
+    $('#safe-code-api-manage').onclick=openManagedGateway;
     async function openLocalClient(button,operation,onSettled,progress){
       if(button.disabled)return;openingClients.add(button);button.disabled=true;
-      try{const message=await native(operation);if(progress)progress.textContent=message;}
+      try{
+        const result=await native(operation);
+        if(result?.installationRequired)await showAppMessage(result.message);
+        else if(progress)progress.textContent=result;
+      }
       catch(error){if(progress)progress.textContent=error.message;else showAppMessage(error.message);}
       finally{openingClients.delete(button);onSettled();}
     }
     const keyDialog=$('#desktop-key-dialog'), keyInput=$('#desktop-key-input'), keyProgress=$('#desktop-key-progress');
     const keyEnable=$('#desktop-key-enable'), keyReplace=$('#desktop-key-replace'), keyResume=$('#desktop-key-resume');
     let keyReplacing=false, keyDeviceSetup=null;
+    const apiScreen=$('#api-screen'), apiUsage=$('#api-usage-message'), apiTable=$('#api-model-table');
+    let apiModeWrite=Promise.resolve();
+    function rememberApiMode(enabled){
+      apiModeWrite=apiModeWrite.then(()=>native('desktopKey.mode',{enabled})).catch(()=>{});
+    }
+    let apiReturn='login', apiRequest=0, apiFetching=false;
+    const usd=new Intl.NumberFormat('en-US',{style:'currency',currency:'USD',minimumFractionDigits:2,maximumFractionDigits:4});
+    const tokens=new Intl.NumberFormat('zh-CN');
+    function money(value){
+      return value>0&&value<100000?'< $0.0001':usd.format(value/1e9);
+    }
+    function renderApiDuration(){
+      const start=keyState.startedAt;
+      if(!keyState.running||!Number.isFinite(start)){ $('#api-duration').textContent='—';return; }
+      const elapsed=Math.max(0,Math.floor((Date.now()-start)/1000));
+      const hours=Math.floor(elapsed/3600), minutes=Math.floor(elapsed/60)%60, seconds=elapsed%60;
+      $('#api-duration').textContent=hours?`${hours} 小时 ${minutes} 分`:minutes?`${minutes} 分 ${seconds} 秒`:`${seconds} 秒`;
+    }
+    function renderApi(){
+      $('#api-state-label').textContent=connectionLabel();
+      $('#api-state').classList.toggle('connected',!!keyState.running&&!keyState.deviceProblem&&!keyState.requestError);
+      $('#api-device').textContent=[keyState.deviceAlias,keyState.deviceProblem||keyState.requestError].filter(Boolean).join(' · ');
+      $('#api-manage-key').textContent=keyState.running?'接入设置':'恢复接入';
+      setLaunchAvailability('api-open-claude',!!keyState.running&&!keyBusy);
+      $('#api-usage-refresh').disabled=!keyState.running||apiFetching;
+      renderApiDuration();
+    }
+    function resetApiUsage(message){
+      apiRequest++;apiFetching=false;
+      $('#api-balance').textContent=$('#api-spend').textContent='—';
+      $('#api-models').replaceChildren();apiTable.hidden=true;
+      apiUsage.hidden=false;apiUsage.textContent=message;
+    }
+    async function refreshApiUsage(){
+      if(apiScreen.hidden||!keyState.running||apiFetching)return;
+      apiFetching=true;renderApi();
+      const request=++apiRequest;
+      try{
+        const data=await native('desktopKey.balance');
+        if(request!==apiRequest)return;
+        $('#api-balance').textContent=data.remainingNanos===null?'不限额':money(data.remainingNanos);
+        $('#api-spend').textContent=money(data.usedNanos);
+        const rows=Array.isArray(data.models)?data.models:[];
+        const elements=rows.map(model=>{
+          const row=document.createElement('tr');
+          const count=model.input+model.output+model.cacheRead+model.cacheWrite;
+          const fee=model.unpricedTokens>0?(model.costNanos?money(model.costNanos)+' + 未计价':'未计价'):money(model.costNanos);
+          for(const [index,value] of [model.model,tokens.format(count),fee].entries()){
+            const cell=document.createElement(index===0?'th':'td');
+            if(index===0)cell.scope='row';
+            cell.textContent=value;row.append(cell);
+          }
+          return row;
+        });
+        $('#api-models').replaceChildren(...elements);
+        apiTable.hidden=!rows.length;apiUsage.hidden=!!rows.length;
+        apiUsage.textContent=Array.isArray(data.models)?'当前 Key 暂无模型用量。':'当前网关版本暂不提供模型明细。';
+      }catch{
+        if(request!==apiRequest)return;
+        apiUsage.hidden=false;
+        apiUsage.textContent=apiTable.hidden?'暂时无法获取用量，请点击「刷新用量」重试。':'刷新失败，已保留上次查询的数据。';
+      }finally{
+        if(request===apiRequest){apiFetching=false;renderApi();}
+      }
+    }
+    function showApiAccess(remember=true){
+      if(apiScreen.hidden){
+        apiReturn=$('#workspace-screen').hidden?'login':'workspace';
+        if(remember)rememberApiMode(true);
+        showScreen('api');$('#api-title').focus();
+      }
+      if(keyDialog.open)keyDialog.close();
+      resetApiUsage(keyState.running?'正在查询用量…':'恢复接入后即可查看用量。');
+      renderApi();void refreshApiUsage();
+    }
+    function closeApiAccess(){
+      rememberApiMode(false);
+      resetApiUsage('正在查询用量…');
+      showScreen(apiReturn==='workspace'&&connectionReady?'workspace':'login');
+    }
+    $('#api-server-mode').onclick=closeApiAccess;
+    $('#api-usage-refresh').onclick=refreshApiUsage;
+    $('#api-open-claude').onclick=()=>openLocalClient($('#api-open-claude'),'claudeDesktop.open',renderApi);
+    const keyListDialog=$('#key-list-dialog'), keyList=$('#key-list'), keyForm=$('#key-add-form');
+    const keyMessage=$('#key-list-status');
+    let libraryBusy=false, switchPending=false, listGeneration=0;
+    let editingKeyId=null;
+    function editKeyForm(entry){
+      editingKeyId=entry?.id??null;
+      keyForm.reset();
+      keyForm.hidden=false;
+      const code=$('#key-code'), label=$('#key-label');
+      code.hidden=code.labels[0].hidden=!!entry;
+      code.required=!entry;
+      label.labels[0].textContent=entry?'编辑备注':'名称';
+      label.value=entry?.name??'';
+      keyForm.querySelector('[type=submit]').textContent=entry?'保存备注':'保存 Key';
+      keyMessage.textContent='';
+      label.focus();label.select();
+    }
+    function lockLibrary(busy){
+      libraryBusy=busy;
+      for(const field of keyListDialog.querySelectorAll('button,input'))field.disabled=busy;
+    }
+    async function loadKeyList(){
+      const generation=++listGeneration;
+      const rows=await native('desktopKey.list');
+      if(!keyListDialog.open||generation!==listGeneration)return;
+      keyList.replaceChildren();
+      if(!rows.length)keyMessage.textContent='尚未保存 Key。';
+      for(const entry of rows){
+        const row=document.createElement('div'), info=document.createElement('div');
+        row.className='key-row'+(entry.running?' current':'');
+        const name=document.createElement('strong'), balance=document.createElement('small');
+        const heading=document.createElement('div'), edit=document.createElement('button');
+        heading.className='key-row-name';edit.className='text-button';edit.type='button';
+        name.textContent=entry.name;edit.textContent='编辑备注';
+        edit.setAttribute('aria-label','编辑备注：'+entry.name);
+        edit.onclick=()=>editKeyForm(entry);
+        heading.append(name,edit);balance.textContent='余额查询中…';info.append(heading,balance);
+        const action=document.createElement(entry.running?'span':'button');
+        action.className=entry.running?'key-current':'key-secondary';
+        action.textContent=entry.running?'正在使用':'切换';
+        if(!entry.running){
+          action.type='button';action.setAttribute('aria-label','切换到 '+entry.name);
+          action.onclick=()=>switchSavedKey(entry);
+        }
+        const actions=document.createElement('div');actions.className='key-row-actions';
+        if(!entry.current){
+          const forget=document.createElement('button');
+          forget.type='button';forget.className='text-button';forget.textContent='移除';
+          forget.setAttribute('aria-label','移除 '+entry.name);
+          forget.onclick=async()=>{
+            if(libraryBusy||!await showAppMessage('从本机移除「'+entry.name+'」？',{confirm:'移除',cancel:'取消'}))return;
+            lockLibrary(true);
+            try{await native('desktopKey.forget',{id:entry.id});await loadKeyList();}
+            catch(error){keyMessage.textContent=error.message;}
+            finally{lockLibrary(false);}
+          };
+          actions.append(forget);
+        }
+        actions.append(action);row.append(info,actions);keyList.append(row);
+        native('desktopKey.savedBalance',{id:entry.id}).then(data=>{
+          balance.textContent=data.remainingNanos===null?'不限额':'余额 '+money(data.remainingNanos);
+        }).catch(()=>{balance.textContent='余额暂不可用';});
+      }
+    }
+    async function openKeyList(){
+      if(keyBusy||libraryBusy)return;
+      keyForm.hidden=true;keyForm.reset();keyMessage.textContent='';keyList.replaceChildren();
+      keyListDialog.showModal();keyListDialog.scrollTop=0;
+      try{await loadKeyList();}catch(error){keyMessage.textContent=error.message;}
+    }
+    async function finishKeySwitch(){
+      switchPending=false;keyListDialog.close();showApiAccess();
+      try{const result=await native('claudeDesktop.reopen');if(result?.installationRequired)await showAppMessage(result.message);}
+      catch(error){await showAppMessage('已切换 Key。'+error.message);}
+    }
+    async function refreshSwitchState(){
+      keyState=await native('desktopKey.status');
+      if(!keyState.running)resetApiUsage('选择已保存的 Key 恢复接入。');
+      renderKey();
+      await loadKeyList();
+    }
+    async function switchSavedKey(entry){
+      if(libraryBusy)return;
+      lockLibrary(true);keyMessage.textContent='正在连接 '+entry.name+'…';
+      try{
+        const result=await native('desktopKey.enable',{savedId:entry.id,replace:true});
+        if(result.requiresDevice){
+          switchPending=true;keyDeviceSetup=result;openHostControl();return;
+        }
+        keyState=result;
+        if(!keyState.running)throw new Error(keyState.error||'接入未启动。');
+        await finishKeySwitch();
+      }catch(error){
+        keyMessage.textContent=error.message;
+        try{await refreshSwitchState();}catch{}
+      }finally{lockLibrary(false);}
+    }
+    const bashDialog=$('#bash-history-dialog'), bashSelect=$('#bash-history-session'), bashRows=$('#bash-history-rows');
+    let bashVersion=0;
+    async function readBashRows(){
+      const version=++bashVersion;
+      const openIds=new Set(Array.from(bashRows.querySelectorAll('details[open]'),row=>row.dataset.call));
+      try{
+        const rows=bashSelect.value?await native('desktopKey.bashHistory',{session:bashSelect.value}):[];
+        if(version!==bashVersion||!bashDialog.open)return;
+        bashRows.replaceChildren();
+        for(const row of rows){
+          const detail=document.createElement('details'), summary=document.createElement('summary');
+          detail.dataset.call=row.id;detail.open=openIds.has(row.id);
+          const state=row.output==null?'等待结果':row.exitCode===0?'已完成':'退出码 '+(row.exitCode??'未知');
+          summary.textContent=state+' · '+row.command.split('\n')[0];detail.append(summary);
+          for(const [label,value] of [['命令',row.command],['输出',row.output??'等待结果']]){
+            const heading=document.createElement('strong'), content=document.createElement('pre');
+            heading.textContent=label;content.textContent=value||'（无输出）';detail.append(heading,content);
+          }
+          bashRows.append(detail);
+        }
+        if(!rows.length)bashRows.textContent='此对话暂无 Bash 执行记录。';
+      }catch(error){if(version===bashVersion)bashRows.textContent=error.message;}
+    }
+    async function openBashHistory(session,call){
+      if(!bashDialog.open)bashDialog.showModal();bashSelect.replaceChildren();bashRows.textContent='正在读取当前 Key 的对话…';
+      const version=++bashVersion;
+      try{
+        const sessions=await native('desktopKey.bashHistory',{session:''});
+        if(!bashDialog.open||version!==bashVersion)return;
+        sessions.forEach(row=>bashSelect.add(new Option(row.title,row.id)));
+        if(session){
+          bashSelect.value=session;
+          if(!bashSelect.value){bashRows.textContent='当前 Key 中找不到这条桌面对话。';return;}
+        }
+        await readBashRows();
+        if(call){
+          const detail=Array.from(bashRows.querySelectorAll('details')).find(item=>item.dataset.call===call);
+          if(detail){detail.open=true;detail.scrollIntoView({block:'nearest'});}
+          else if(bashDialog.open)bashRows.textContent='这条记录尚未写入当前对话。请稍后刷新。';
+        }
+      }catch(error){if(version===bashVersion)bashRows.textContent=error.message;}
+    };
+    window.safeCodeBashDetail=openBashHistory;
+    $('#api-bash-history').onclick=()=>openBashHistory();
+    bashDialog.addEventListener('close',()=>{++bashVersion;bashRows.replaceChildren();bashSelect.replaceChildren();});
+    bashSelect.onchange=readBashRows;$('#bash-history-refresh').onclick=readBashRows;
+    $('#api-switch-key').onclick=openKeyList;
+    $('#key-library-entry').onclick=openKeyList;
+    $('#key-list-close').onclick=()=>keyListDialog.close();
+    keyListDialog.addEventListener('cancel',event=>{if(libraryBusy)event.preventDefault();});
+    keyListDialog.addEventListener('close',()=>{keyForm.reset();listGeneration++;});
+    $('#key-add').onclick=()=>editKeyForm(null);
+    $('#key-add-cancel').onclick=()=>{keyForm.hidden=true;keyForm.reset();};
+    keyForm.onsubmit=async event=>{
+      event.preventDefault();if(libraryBusy)return;
+      lockLibrary(true);
+      try{
+        const name=$('#key-label').value.trim();
+        if(editingKeyId)await native('desktopKey.rename',{id:editingKeyId,name});
+        else await native('desktopKey.save',{name,key:$('#key-code').value.trim()});
+        keyForm.reset();keyForm.hidden=true;keyMessage.textContent='';
+        await loadKeyList();
+      }catch(error){keyMessage.textContent=error.message;}
+      finally{lockLibrary(false);}
+    };
+    $('#api-manage-key').onclick=()=>{
+      keyDialog.showModal();void keyAction('status',{interactive:true});
+    };
+    setInterval(()=>{if(!apiScreen.hidden)renderApiDuration();},1000);
+    setInterval(refreshApiUsage,30000);
+    let readingConnection=false;
+    async function refreshDesktopConnection(){
+      if(document.hidden||!keyState.running||keyBusy||readingConnection)return;
+      const start=keyState.startedAt;
+      readingConnection=true;
+      try{
+        const state=await native('desktopKey.connection');
+        if(state && keyState.running && !keyBusy && start===keyState.startedAt && state.startedAt===start){
+          Object.assign(keyState,state);
+          renderApi();renderDesktopAccess();
+        }
+      }catch{}finally{readingConnection=false;}
+    }
+    setInterval(refreshDesktopConnection,3000);
+    document.addEventListener('visibilitychange',refreshDesktopConnection);
     function describeKey(op,args){
+      const target=keyState.deviceAlias?'\n工具目标：已授权的本机设备 '+keyState.deviceAlias:'';
+      if(keyState.unbindPending)return keyState.error;
       if(keyState.error)return (keyState.configured?'已保存 Key，暂未恢复接入。\n':'')+keyState.error;
-      if(keyState.running)return args?.replace||args?.useSaved?'已启用。\n请完全退出并重新打开 Claude Desktop 以应用更改。':
-        '已启用。\n首次接入请完全退出并重新打开 Claude Desktop。';
+      if(keyState.running)return connectionLabel()+'。'+(keyState.deviceProblem||keyState.requestError||'')+target+'\n'+(args?.replace||args?.useSaved?'请完全退出并重新打开 Claude Desktop 以应用更改。':'首次接入请完全退出并重新打开 Claude Desktop。');
       if(keyState.configured)return '已保存 Key，当前 Claude 配置未启用此接入。';
       return op==='disable'?'已停用。\n请重新打开 Claude Desktop 以应用更改。':'尚未启用。';
     }
@@ -1071,22 +1546,27 @@ if ((window.chrome?.webview && (location.host === 'safe-code.local' || (window._
       keyEnable.hidden=!editing;
       keyEnable.disabled=keyBusy;
       keyEnable.textContent=keyReplacing?'验证并更换':'验证并启用';
-      keyReplace.hidden=!configured;
+      keyReplace.hidden=!configured||keyState.unbindPending;
       keyReplace.disabled=keyBusy;
       keyReplace.textContent=keyReplacing?'取消更换':'更换 Key';
-      keyResume.hidden=!configured||keyState.running||keyReplacing;
+      keyResume.hidden=!configured||keyState.running||keyReplacing||keyState.unbindPending;
       keyResume.disabled=keyBusy;
+      $('#desktop-key-refresh').hidden=!keyState.running||keyReplacing;
+      $('#desktop-key-refresh').disabled=keyBusy;
       $('#desktop-key-disable').hidden=!configured||keyReplacing;
       $('#desktop-key-disable').disabled=keyBusy;
+      $('#desktop-key-disable').textContent=keyState.unbindPending?'重试解绑':'停用接入';
       $('#desktop-key-open').hidden=!keyState.running||keyReplacing;
       setLaunchAvailability('desktop-key-open',keyState.running&&!keyBusy&&!keyReplacing);
       $('#desktop-key-close').disabled=keyBusy;
-      renderClaudeDesktop();
+      renderDesktopAccess();
+      if(!apiScreen.hidden)renderApi();
     }
     async function keyAction(op,args={}){
       if(keyBusy)return;
       keyBusy=true;
       if(op==='enable')keyProgress.textContent=args.useSaved?'正在重新启用已保存的 Key…':'正在验证 Key 并获取模型…';
+      else if(op==='refreshModels')keyProgress.textContent='正在更新模型列表…';
       else keyProgress.textContent=op==='disable'?'正在停用接入…':'正在读取接入状态…';
       renderKey();
       try{
@@ -1094,12 +1574,14 @@ if ((window.chrome?.webview && (location.host === 'safe-code.local' || (window._
         if(result?.requiresDevice){
           keyProgress.textContent='网关已验证，请确认本机远程控制。';
           keyDeviceSetup=result;
-          openHostControl(true);
+          openHostControl();
           return;
         }
         keyState=result;
         if(op==='enable'&&keyState.running)keyReplacing=false;
-        keyProgress.textContent=describeKey(op,args);
+        keyProgress.textContent=op==='refreshModels'?'模型列表已更新。请完全退出并重新打开 Claude Desktop。':describeKey(op,args);
+        if(op==='enable'&&keyState.running)showApiAccess();
+        if(op==='disable'&&!keyState.unbindPending&&!apiScreen.hidden){keyDialog.close();closeApiAccess();}
       }catch(error){
         keyProgress.textContent=error.message;
       }finally{keyBusy=false;renderKey();}
@@ -1108,6 +1590,7 @@ if ((window.chrome?.webview && (location.host === 'safe-code.local' || (window._
       const button=$('#'+id);button.hidden=false;
       button.onclick=()=>{
         if(keyDialog.open)return;
+        if(keyState.running){showApiAccess();return;}
         keyDialog.showModal();
         keyAction('status',{interactive:true});
       };
@@ -1129,41 +1612,13 @@ if ((window.chrome?.webview && (location.host === 'safe-code.local' || (window._
       if(keyReplacing)keyInput.focus();
     };
     keyResume.onclick=()=>keyAction('enable',{useSaved:true});
+    $('#desktop-key-refresh').onclick=()=>keyAction('refreshModels');
     $('#desktop-key-disable').onclick=()=>keyAction('disable');
     $('#desktop-key-open').onclick=()=>openLocalClient($('#desktop-key-open'),'claudeDesktop.open',renderKey,keyProgress);
     $('#desktop-key-close').onclick=()=>keyDialog.close();
     keyDialog.addEventListener('cancel',event=>{if(keyBusy)event.preventDefault();});
     keyDialog.addEventListener('close',()=>{keyInput.value='';keyReplacing=false;});
-    $('#claude-desktop-launch').onclick=()=>openLocalClient($('#claude-desktop-launch'),'claudeDesktop.open',renderClaudeDesktop);
     $('#codex-launch').onclick=()=>openLocalClient($('#codex-launch'),'codex.open',renderClaudeBridge);
-    $('#claude-desktop-open').onclick=()=>openLocalClient($('#claude-desktop-open'),'claudeDesktop.open',renderClaudeDesktop,$('#claude-desktop-progress'));
-    $('#claude-desktop-form').onsubmit=async event=>{
-      event.preventDefault();if(publicGatewaySetupOnly||claudeDesktopBusy||!$('#claude-desktop-consent').checked||!$('#claude-desktop-form').reportValidity())return;
-      const attempt=connectionAttempt,progress=$('#claude-desktop-progress');
-      const oldProfile=isMac?claudeDesktopStatus?.oldProfile:null;
-      if(oldProfile&&!await showAppMessage('将创建并选中新配置。旧的 SafeCode SSH 配置会保留在 Claude Desktop 中。',
-        {title:'重新配置 SSH 接入',confirm:'重新配置',cancel:'取消'}))return;
-      if(attempt!==connectionAttempt||claudeDesktopBusy||!$('#claude-desktop-dialog').open)return;
-      claudeDesktopBusy=true;renderClaudeDesktop();progress.textContent='正在检查本机远程控制…';
-      try{
-        if(!await requireHostControl(attempt)||!isHostSetupCurrent(attempt)){
-          progress.textContent='本机远程控制尚未验证，请完成验证后再部署 Claude Desktop SSH 接入。';
-          return;
-        }
-        progress.textContent='正在部署 VPS 网关、验证 SSH 通道并保存本机策略…';
-        claudeDesktopStatus=await native('claudeDesktop.start',oldProfile?{accepted:true,replaceOldProfile:oldProfile}:{accepted:true});
-        progress.textContent=claudeDesktopStatus.message+'。请重启 Claude Desktop。';
-      }
-      catch(error){if(attempt===connectionAttempt)progress.textContent=error.message;}
-      finally{claudeDesktopBusy=false;renderClaudeDesktop();}
-    };
-    $('#claude-desktop-stop').onclick=async()=>{
-      if(claudeDesktopBusy)return;claudeDesktopBusy=true;renderClaudeDesktop();$('#claude-desktop-progress').textContent='正在关闭本机入口和本次 VPS 网关…';
-      try{claudeDesktopStatus=await native('claudeDesktop.stop');$('#claude-desktop-consent').checked=false;$('#claude-desktop-progress').textContent=claudeDesktopStatus?.message||'VPS 桥接已停止。';}
-      catch(error){$('#claude-desktop-progress').textContent=error.message;}
-      finally{claudeDesktopBusy=false;renderClaudeDesktop();}
-    };
-    setInterval(()=>{if(!$('#workspace-screen').hidden&&!$('#claude-desktop-dialog').open)pollClaudeDesktop();},5000);
     const hostDialog=$('#host-dialog');
     const hostVerified=status=>status?.enabled===true&&status.state==='connected';
     const isHostSetupCurrent=attempt=>attempt===connectionAttempt&&connectionReady&&!!nativeServer?.statuses?.account;
@@ -1194,17 +1649,9 @@ if ((window.chrome?.webview && (location.host === 'safe-code.local' || (window._
       $('#host-command-area').hidden=!enabled;$('#host-command').value=hostStatus?.command||'';$('#host-copy').disabled=!connected||!hostStatus?.command||hostBusy;
       $('#host-dialog-state').textContent=$('#host-state').textContent;
     }
-    function completeHostSetup(verified){
-      const setup=requiredHostControl;
-      if(!setup)return;
-      requiredHostControl=null;
-      if(verified&&hostDialog.open)hostDialog.close();
-      setup.resolve(verified&&isHostSetupCurrent(setup.attempt));
-    }
     function resetHostControl(){
       hostChange++;
       hostStatus=null;
-      completeHostSetup(false);
       if(hostDialog.open)hostDialog.close();
       renderHostControl();
     }
@@ -1223,7 +1670,7 @@ if ((window.chrome?.webview && (location.host === 'safe-code.local' || (window._
         return status;
       }finally{if(hostStatusTask===task)hostStatusTask=null;}
     }
-    function openHostControl(required=false){
+    function openHostControl(){
       $('#host-risk').checked=false;
       $('#host-alias').value=keyDeviceSetup
         ? (keyDeviceSetup.alias??'由网关分配')
@@ -1236,24 +1683,17 @@ if ((window.chrome?.webview && (location.host === 'safe-code.local' || (window._
           ? (keyDeviceSetup.existingControl
             ? '这把 Key 由当前 VPS 签发。授权后将使用已验证的本机远程控制通道。'
             : '这把 Key 由当前 VPS 签发。授权后将通过当前 SSH 会话开启本机远程控制。')
-          : '将在 Key 所属的网关建立加密通道，并为此设备分配唯一连接别名。部署需要 Windows 管理员授权。')
-        : (required?'Claude Desktop SSH 接入需要先验证本机远程控制。':'')+instructions;
+          : (isMac
+            ? '将在 Key 所属的网关建立加密通道，并为此设备分配唯一连接别名。SafeCode 只会为当前 macOS 账户添加一把专用 SSH 公钥。'
+            : '将在 Key 所属的网关建立加密通道，并为此设备分配唯一连接别名。部署需要 Windows 管理员授权。'))
+        : instructions;
+      if(keyDeviceSetup)$('#host-progress').textContent+=' 下次在这台电脑选择同一把 Key 时，会使用本次授权重新连接。';
       renderHostControl();
       hostDialog.showModal();
     }
-    async function requireHostControl(attempt){
-      const status=await readHostControl(attempt);
-      if(!isHostSetupCurrent(attempt)||hostBusy)return false;
-      if(hostVerified(status))return true;
-      if(hostDialog.open)return false;
-      openHostControl(true);
-      const verified=await new Promise(resolve=>{requiredHostControl={attempt,resolve};});
-      return verified&&hostVerified(await readHostControl(attempt));
-    }
     async function pollHostControl(){
       if(keyDeviceSetup)return;
-      if(requiredHostControl&&!isHostSetupCurrent(requiredHostControl.attempt))resetHostControl();
-      try{if(hostVerified(await readHostControl(connectionAttempt)))completeHostSetup(true);}catch{}
+      try{await readHostControl(connectionAttempt);}catch{}
     }
     $('#host-manage').onclick=async()=>{
       const attempt=connectionAttempt;
@@ -1269,10 +1709,10 @@ if ((window.chrome?.webview && (location.host === 'safe-code.local' || (window._
       if(keyDeviceSetup){
         keyDeviceSetup=null;
         void native('desktopKey.cancelDevice').catch(()=>{});
-        keyDialog.close();
+        if(switchPending){switchPending=false;keyMessage.textContent='已取消切换。';}
+        else keyDialog.close();
         renderHostControl();
       }
-      completeHostSetup(false);
     });
     $('#host-risk').onchange=()=>renderHostControl();
     $('#host-form').onsubmit=async event=>{
@@ -1282,16 +1722,18 @@ if ((window.chrome?.webview && (location.host === 'safe-code.local' || (window._
         $('#host-progress').textContent=keyDeviceSetup.reuseControl
           ? (keyDeviceSetup.existingControl
             ? '正在检查已授权的本机控制通道并启用 Key…'
-            : '请完成 Windows 管理员授权。接下来会验证本机远程控制并启用 Key。')
-          : '请完成 Windows 管理员授权。接下来会建立 FRP 通道并验证 SSH 登录。';
+            : (isMac?'正在为系统远程登录添加专用公钥，接下来会验证本机远程控制并启用 Key。':'请完成 Windows 管理员授权。接下来会验证本机远程控制并启用 Key。'))
+          : (isMac?'正在为系统远程登录添加专用公钥，并建立 FRP 通道验证 SSH 登录。':'请完成 Windows 管理员授权。接下来会建立 FRP 通道并验证 SSH 登录。');
         try{
           keyState=await native('desktopKey.authorizeDevice',{riskAccepted:true});
           keyDeviceSetup=null;keyReplacing=false;
           keyProgress.textContent=describeKey('enable');
           hostDialog.close();renderKey();
+          if(keyState.running){if(switchPending)await finishKeySwitch();else showApiAccess();}
         }catch(error){
           $('#host-risk').checked=false;
           $('#host-progress').textContent=error.message;
+          if(switchPending)try{await refreshSwitchState();}catch{}
         }finally{hostBusy=false;renderHostControl();}
         return;
       }
@@ -1303,7 +1745,6 @@ if ((window.chrome?.webview && (location.host === 'safe-code.local' || (window._
         if(!isHostSetupCurrent(attempt))return;
         renderHostControl(status);
         $('#host-progress').textContent=hostVerified(status)?'部署完成，已通过实际 SSH 登录验证。复制下方命令发给服务器上的 AI。':(status?.message||'正在验证本机远程控制。');
-        if(hostVerified(status))completeHostSetup(true);
       }
       catch(error){if(attempt===connectionAttempt){$('#host-risk').checked=false;$('#host-progress').textContent=error.message;}}
       finally{hostBusy=false;renderHostControl();}
@@ -1325,9 +1766,10 @@ if ((window.chrome?.webview && (location.host === 'safe-code.local' || (window._
     const ipProgress=document.createElement('div');ipProgress.className='connection-progress';ipProgress.hidden=true;ipProgress.setAttribute('role','status');ipProgress.setAttribute('aria-live','polite');
     const ipSpinner=document.createElement('span');ipSpinner.className='connection-spinner';ipSpinner.setAttribute('aria-hidden','true');const ipProgressText=document.createElement('span'),ipElapsed=document.createElement('span');ipProgress.append(ipSpinner,ipProgressText,ipElapsed);$('#ip-policy-form .config-footer').before(ipProgress);
     $('#ip-policy-dialog').addEventListener('cancel',event=>{if(ipSaving)event.preventDefault();});
-    const originalOpenIpPolicy=openIpPolicy;openIpPolicy=function(change=false){
+    const originalOpenIpPolicy=openIpPolicy;openIpPolicy=function(){
       if(busy){showAppMessage('已有任务正在执行，请等待完成。');return;}
-      originalOpenIpPolicy(change);
+      if(nativeServer?.socksEgress?.enabled){showAppMessage('请先在「开发模式」停用 SOCKS5 出口，再更换 IP。');return;}
+      originalOpenIpPolicy();
       $('#ingress-ip-input').value=ipPolicy.ingressIp||serverConnection.ingressIp;
       const candidates=(nativeServer?.assignedIps||[]).filter(isPublicIpv4);
       $('#egress-ip-input').value=ipPolicy.egressIp||(candidates.length===2?candidates.find(ip=>ip!==serverConnection.ingressIp):serverConnection.egressIp)||'';
@@ -1355,6 +1797,103 @@ if ((window.chrome?.webview && (location.host === 'safe-code.local' || (window._
       finally{clearInterval(timer);ipSaving=false;busy=false;ipProgress.hidden=true;form.removeAttribute('aria-busy');for(const [control,disabled] of controls)control.disabled=disabled;button.textContent='保存设置';renderTasks();}
     };
     const originalNativeLog=window.safeCodeNativeLog;window.safeCodeNativeLog=function(step,line){if(ipSaving&&step==='ip_policy')ipProgressText.textContent=line;originalNativeLog?.(step,line);};
+
+    const socksDialog=$('#socks-dialog'), socksUrl=$('#socks-url'), socksConfirm=$('#socks-confirm');
+    let socksBusy=false, socksReading=false, socksResult=null;
+    function updateSocksCard(status){
+      if(!status?.enabled)return;
+      $('#ip-policy-state').textContent=status.guardActive?'SOCKS5 开发模式':'出口规则异常';
+      $('#ip-policy-summary').textContent=status.guardActive
+        ?'机房入口保留，SOCKS5 出站。'+(status.tunnelRunning?'':'隧道暂停，出站已阻断。')
+        :'SOCKS5 防火墙规则未生效，请检查服务器。';
+    }
+    function setSocksResult(id,value,state=''){
+      const element=$('#socks-'+id);
+      element.textContent=value;element.dataset.state=state;
+    }
+    function renderSocks(){
+      const status=nativeServer?.socksEgress;
+      const enabled=!!status?.enabled, available=connectionReady&&!developerPreview&&!socksBusy&&!socksReading;
+      const validated=!!(socksResult?.tcp&&socksResult?.udp);
+      $('#socks-setup').hidden=enabled;
+      socksUrl.disabled=!available||enabled;
+      $('#socks-test').disabled=!available||!socksUrl.value.trim();
+      socksConfirm.disabled=!available||!validated;
+      $('#socks-enable').hidden=enabled;
+      $('#socks-enable').disabled=!available||!validated||!socksConfirm.checked;
+      $('#socks-disable').hidden=!enabled;
+      $('#socks-disable').disabled=!available;
+      $('#socks-close').disabled=socksBusy;
+      $('#socks-form').setAttribute('aria-busy',String(socksBusy||socksReading));
+      for(const protocol of ['tcp','udp']){
+        const passed=socksResult?.[protocol];
+        setSocksResult(protocol,enabled?(status.observedIp?'上次验证通过':'待验证'):passed===undefined?'待检测':passed?'通过':'未通过',
+          !enabled&&passed!==undefined?(passed?'pass':'fail'):'');
+      }
+      setSocksResult('observed',(enabled?status.observedIp:socksResult?.observedIp)||'待检测');
+    }
+    function socksStatusText(){
+      if(!connectionReady||developerPreview)return '连接 Ubuntu 服务器后可检测和启用。';
+      const status=nativeServer?.socksEgress;
+      if(!status?.enabled)return '检测通过后可以启用。首次启用会下载隧道组件。';
+      if(!status.guardActive)return '阻断规则未生效，请检查服务器。';
+      return status.endpoint+' · '+(status.issue||(status.tunnelRunning?'已启用，代理不可用时阻断出站。':'隧道未运行，出站已阻断。'));
+    }
+    $('#socks-experimental').onclick=async()=>{
+      if(busy){showAppMessage('已有任务正在执行，请等待完成。');return;}
+      socksResult=null;
+      socksConfirm.checked=false;
+      socksUrl.value='';
+      const server=nativeServer;
+      socksReading=!!(connectionReady&&server&&!developerPreview);
+      $('#socks-status').textContent=socksReading?'正在读取服务器出口状态…':socksStatusText();
+      renderSocks();socksDialog.showModal();
+      if(!socksReading)return;
+      try{
+        const status=await native('socks.status');
+        if(server!==nativeServer)return;
+        server.socksEgress=status;
+        if(status?.enabled)updateSocksCard(status);
+        $('#socks-status').textContent=socksStatusText();
+      }catch(error){$('#socks-status').textContent=error.message;}
+      finally{socksReading=false;renderSocks();}
+    };
+    socksDialog.addEventListener('cancel',event=>{if(socksBusy)event.preventDefault();});
+    socksDialog.addEventListener('close',()=>{socksUrl.value='';socksConfirm.checked=false;socksResult=null;});
+    socksUrl.addEventListener('input',()=>{
+      socksResult=null;socksConfirm.checked=false;
+      $('#socks-status').textContent=socksStatusText();renderSocks();
+    });
+    socksConfirm.addEventListener('change',renderSocks);
+    async function runSocksOperation(message, action){
+      if(busy||!connectionReady||developerPreview||socksBusy||socksReading)return;
+      busy=socksBusy=true;$('#socks-status').textContent=message;
+      renderSocks();renderTasks();
+      try{await action();}
+      catch(error){$('#socks-status').textContent=error.message;}
+      finally{busy=socksBusy=false;renderSocks();renderTasks();}
+    }
+    $('#socks-test').onclick=()=>runSocksOperation('正在从服务器检测 TCP 和 UDP 转发…',async()=>{
+      socksResult=null;socksConfirm.checked=false;
+      socksResult=await native('socks.probe',{proxyUrl:socksUrl.value.trim()});
+      const failures=[socksResult.tcpMessage&&'TCP '+socksResult.tcpMessage,socksResult.udpMessage&&'UDP '+socksResult.udpMessage].filter(Boolean);
+      $('#socks-status').textContent=failures.join(' ')||'检测通过，可以启用。';
+    });
+    async function changeSocks(op,args){
+      const server=await native(op,args);
+      socksUrl.value='';socksConfirm.checked=false;socksResult=null;
+      applyServer(server);
+      serverConnection.egressIp=server.observedEgressIp||'';
+      $('#server-address').textContent=serverConnection.egressIp||'待确认';
+      $('#socks-status').textContent=socksStatusText();
+      if(serverConnection.egressIp)void queryIpInfo(serverConnection.egressIp);
+    }
+    $('#socks-form').onsubmit=event=>{
+      event.preventDefault();
+      if(!socksResult?.tcp||!socksResult?.udp||!socksConfirm.checked)return;
+      return runSocksOperation('正在部署隧道并验证整机出站…',()=>changeSocks('socks.enable',{proxyUrl:socksUrl.value.trim(),accepted:true}));
+    };
+    $('#socks-disable').onclick=()=>runSocksOperation('正在停用代理并恢复原出口…',()=>changeSocks('socks.disable',{}));
     // 验收入口仅在桌面启动参数指定了私密配置文件时由宿主调用。
     window.safeCodeRunAcceptance=async config=>{
       try{
@@ -1384,8 +1923,17 @@ if ((window.chrome?.webview && (location.host === 'safe-code.local' || (window._
       }catch{showAppMessage('无法保存声明确认，请检查本机存储空间。');}
     };
     const startupReady=preferencesReady.then(()=>native('notice.state')).then(state=>{if(state.accepted&&(!window.__safeCodeAcceptance||window.__safeCodeConnectionAcceptance)){showScreen('login');confirmServices().then(showPreferences).catch(()=>{});}else{showScreen('notice');}}).catch(()=>{showScreen('notice');});
-    startupReady.then(()=>{if(!window.__safeCodeAcceptance&&!window.__safeCodeConnectionAcceptance)return keyAction('status');});
-    startupReady.then(async()=>{if(window.__safeCodeAcceptance||window.__safeCodeConnectionAcceptance||!$('#notice-screen').hidden)return;const settings=await native('gateways.resume-settings');if(settings&&!$('#login-screen').hidden&&!connectionInFlight)await connect(settings,true);}).catch(()=>{});
+    startupReady.then(async()=>{
+      if(window.__safeCodeAcceptance||window.__safeCodeConnectionAcceptance||!$('#notice-screen').hidden)return;
+      const attempt=connectionAttempt;
+      await keyAction('status');
+      if(attempt!==connectionAttempt)return;
+      const prefersApi=keyState.configured&&await native('desktopKey.mode').catch(()=>false);
+      if(attempt!==connectionAttempt)return;
+      if(prefersApi&&!$('#login-screen').hidden){showApiAccess(false);return;}
+      const settings=await native('gateways.resume-settings');
+      if(attempt===connectionAttempt&&settings&&!$('#login-screen').hidden&&!connectionInFlight)await connect(settings,true);
+    }).catch(()=>{});
     for(const button of document.querySelectorAll('[data-open-services]')){
       if(isMac)button.onclick=()=>native('services.open').catch(error=>showAppMessage(error.message));
       else button.addEventListener('click',refreshPreferences);
@@ -1499,8 +2047,7 @@ if ((window.chrome?.webview && (location.host === 'safe-code.local' || (window._
       $('#host-alias').placeholder='例如 mac 或 local';
       renderClaudeBridge();
       $('#bridge-manage').title='查看第三方功能警告';
-      $('#claude-desktop-key-note').textContent='本机只保存回环通道凭据。已有的 Claude Desktop 配置会保留，启用前需先停用当前接入。';
-      renderClaudeDesktop();
+      renderDesktopAccess();
     }
     window.safeCodeNativeReady=true;
   })();

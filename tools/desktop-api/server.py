@@ -21,19 +21,28 @@ import subprocess
 import tempfile
 import threading
 import time
+import uuid
 from http.server import ThreadingHTTPServer
 from urllib.parse import urlsplit
 
 from claude_usage import read_subscription
-from desktop_gateway import CLOUDCLI_REQUIRED, COUNT_TOKENS_PATH, MAX_REQUEST, MESSAGES_PATH, GatewayError, Handler, Manager, diagnostic, load_cloudcli_config
-from device_bridge import DeviceError, Devices, OwnerHosts, SSH_DEVICE, read_json
+from desktop_gateway import CLOUDCLI_MODEL_ID, CLOUDCLI_REQUIRED, COUNT_TOKENS_PATH, MAX_MESSAGES_REQUEST, MESSAGES_PATH, CloudCliBackend, CloudCliError, GatewayError, Handler, Manager, diagnostic, load_cloudcli_config, valid_mac_workspace
+from desktop_gateway import IMPORTED_SESSION_NAMESPACE, IMPORTED_SESSIONS_FILE
+from device_bridge import (DeviceAlreadyBound, DeviceError, DeviceOffline, Devices, OwnerHosts, SSH_DEVICE,
+                           paired_device, pairing_lock, read_json, device_service_problem)
 from management import ANALYTICS_RANGES, KEY_ID, TOKEN_FIELDS, Capacity, KeyRegistry, RequestQueue, peer_disconnected, read_admin_line, send_admin
+from gateway_directory import DIRECTORY, REMOTE_FIELDS, DirectoryError, GatewayDirectory, installed_directory
+from pricing import usage_price
+from prompt_review import PromptReviewer
 
 PUBLIC_ENABLED = 'public-enabled'
 PUBLIC_ORIGIN = 'public-origin'
 PUBLIC_CONCURRENCY = 'public-concurrency'
-GATEWAY_REVISION = 3
-PUBLIC_DISABLED_MESSAGE = '请先在 Safe Code 中确认「保证自用」并启用公网。'
+GATEWAY_REVISION = 46
+DESKTOP_HISTORY = '/v1/desktop-history'
+DESKTOP_FOLLOWUPS = '/v1/desktop-followups'
+PUBLIC_KEY_QUEUE = 'public-key-queue'
+PUBLIC_DISABLED_MESSAGE = '请先在 Safe Code 中启用公网网关。'
 # A shared promotional code, checked only at the gateway.
 ACTIVATION_CODE_SHA256 = bytes.fromhex('89debb851e3fc69c8e163a3b6462a3493e93d38ae8cf0132e419bd9e0b32d2b9')
 # Shared with DesktopKeyAccess. These bundled keys deter casual inspection only.
@@ -42,8 +51,12 @@ TICKET_AUTH_KEY = bytes.fromhex('bf8145e375d11db0fdd2fb0d9734fdda504c5a480fc2eae
 
 
 class PublicManager(Manager):
-    def __init__(self, folder, config, *, require_cloudcli=True):
-        super().__init__(folder, config, require_cloudcli=require_cloudcli)
+    # Recovery uses only history supplied to this authenticated, per-key gateway.
+    restore_desktop_history = True
+    unrestricted_tools = True
+
+    def __init__(self, folder, config, *, require_cloudcli=True, review_prompt=None):
+        super().__init__(folder, config, require_cloudcli=require_cloudcli, review_prompt=review_prompt)
         self.lock = threading.RLock()
         self.accounting = threading.local()
 
@@ -127,20 +140,27 @@ class AdminHandler(socketserver.StreamRequestHandler):
 
 
 
-def relay_frp(client, upstream):
-    # The client starts the FRP protocol only after the CONNECT response.
-    # Read decrypted bytes already buffered by TLS before waiting on the socket.
+def relay_frp(client, upstream, still_authorized):
+    # FRP starts sending only after CONNECT. Check revocation even on an idle stream.
+    last_activity = time.monotonic()
+    next_check = last_activity + 2
     while True:
-        ready = [client] if client.pending() else []
-        readable, _, _ = select.select([client, upstream], [], [], 0 if ready else 90)
-        if not (ready or readable):
+        now = time.monotonic()
+        if now >= next_check:
+            if not still_authorized():
+                return
+            next_check = now + 2
+        if now - last_activity >= 90:
             return
+        ready = [client] if client.pending() else []
+        readable, _, _ = select.select([client, upstream], [], [], 0 if ready else max(0,next_check-now))
         for source in set(ready + readable):
             data = source.recv(65536)
             if not data:
                 return
             destination = upstream if source is client else client
             destination.sendall(data)
+            last_activity = time.monotonic()
 
 
 class PublicHandler(Handler):
@@ -154,12 +174,17 @@ class PublicHandler(Handler):
     def manager(self):
         return self.server.account(self.digest, self.platform, self.device)
 
-    def authorized(self):
+    def credential_digest(self):
         value = self.headers.get('Authorization', '')
         token = value[7:] if value.startswith('Bearer ') else self.headers.get('x-api-key', '')
         if not re.fullmatch(r'[A-Za-z0-9_-]{43}', token):
+            return None
+        return hashlib.sha256(token.encode()).hexdigest()
+
+    def authorized(self):
+        digest = self.credential_digest()
+        if digest is None:
             return False
-        digest = hashlib.sha256(token.encode()).hexdigest()
         if not self.server.registry.enabled(digest):
             return False
         platform = self.headers.get('X-SafeCode-Platform', 'windows')
@@ -168,13 +193,22 @@ class PublicHandler(Handler):
         self.digest, self.platform = digest, platform
         return True
 
+    def safecode_client(self):
+        return self.headers.get('X-SafeCode-Client') == 'safecode-desktop'
+
     def do_GET(self):
         self.device = None
+        if self.path == DESKTOP_HISTORY or self.path.startswith(DESKTOP_HISTORY+'/'):
+            return self.desktop_history()
+        if self.path == DESKTOP_FOLLOWUPS or self.path.startswith(DESKTOP_FOLLOWUPS+'/'):
+            return self.desktop_followups()
         if self.path == '/v1/key/balance':
             if not self.server.public_enabled:
                 return self.public_disabled()
             if not self.authorized():
                 return self.device_error(401, 'SafeCode Key required')
+            if not self.safecode_client():
+                return self.device_error(403, '请通过 Safe Code 客户端访问。', 'safecode_client_required')
             balance = self.server.registry.balance(self.digest)
             if balance is None:
                 return self.device_error(401, 'SafeCode Key required')
@@ -185,11 +219,93 @@ class PublicHandler(Handler):
             return self.reply(404, {'error':{'message':'Unknown endpoint'}})
         if not self.server.public_enabled:
             return self.public_disabled()
+        if not self.authorized():
+            return self.device_error(401, 'SafeCode Key required')
+        if not self.safecode_client():
+            return self.device_error(403, '请通过 Safe Code 客户端访问。', 'safecode_client_required')
         if self.server.config['cloudcli'] is None:
-            if not self.authorized():
-                return self.device_error(401, 'SafeCode Key required')
             return self.backend_required()
-        super().do_GET()
+        try:
+            allowed = self.server.registry.model_policy(self.digest)
+            manager = self.manager
+            return self.reply(200, manager.catalog() if allowed is None else manager.cloudcli.catalog(allowed))
+        except GatewayError as error:
+            return self.device_error(error.status, str(error))
+        except (OSError, ValueError, TypeError, AttributeError, sqlite3.Error):
+            return self.device_error(503, 'CloudCLI model discovery unavailable')
+
+    def desktop_history(self):
+        if not self.server.public_enabled:
+            return self.public_disabled()
+        if not self.authorized():
+            return self.device_error(401, 'SafeCode Key required')
+        try:
+            developer, _ = self.server.registry.desktop_policy(self.digest)
+            if not developer:
+                if self.path == DESKTOP_HISTORY:
+                    return self.reply(200, {'developer': False})
+                return self.device_error(403, '此 Key 未启用开发者模式。')
+            device = self.headers.get('X-SafeCode-Device')
+            proof = self.headers.get('X-SafeCode-Device-Proof')
+            binding = self.server.owner_hosts if SSH_DEVICE.fullmatch(device or '') else self.server.devices
+            if not binding or not device or not proof:
+                return self.device_error(403, '同步历史需要已配对的本机设备。')
+            self.device = binding.chat_binding(self.digest, self.platform, device, proof)
+            cloud = self.manager.cloudcli
+            if not cloud or not cloud.config.get('desktopQuestions'):
+                return self.device_error(503, CLOUDCLI_REQUIRED)
+            if self.path == DESKTOP_HISTORY:
+                if self.headers.get('X-SafeCode-History-Mirror') == '1':
+                    result = {'developer': True, **cloud.desktop_history_index(mirror=True)}
+                else:
+                    result = {'developer': True, 'projects': cloud.desktop_history_index()}
+            else:
+                path = re.fullmatch(r'/v1/desktop-history/([a-f0-9-]{36})/([a-f0-9-]{36})', self.path)
+                if path is None:
+                    return self.device_error(404, '找不到该网页会话。')
+                result = cloud.desktop_history_export(*path.groups())
+            if not self.server.registry.desktop_policy(self.digest)[0]:
+                return self.device_error(403, '此 Key 未启用开发者模式。')
+            return self.reply(200, result)
+        except DeviceError:
+            return self.device_error(403, '同步历史需要已配对的本机设备。')
+        except CloudCliError as error:
+            return self.device_error(error.status, str(error))
+        except (OSError, sqlite3.Error):
+            return self.device_error(503, '暂时无法同步网页历史。')
+
+    def desktop_followups(self):
+        if not self.server.public_enabled:
+            return self.public_disabled()
+        if not self.authorized():
+            return self.device_error(401, 'SafeCode Key required')
+        try:
+            device = self.headers.get('X-SafeCode-Device')
+            proof = self.headers.get('X-SafeCode-Device-Proof')
+            binding = self.server.owner_hosts if SSH_DEVICE.fullmatch(device or '') else self.server.devices
+            if not binding or not device or not proof:
+                return self.device_error(403, '回填后续回复需要已配对的本机设备。')
+            self.device = binding.chat_binding(self.digest, self.platform, device, proof)
+            cloud = self.manager.cloudcli
+            if not cloud or not cloud.config.get('desktopQuestions'):
+                return self.device_error(503, CLOUDCLI_REQUIRED)
+            developer = self.server.registry.desktop_policy(self.digest)[0]
+            if self.path == DESKTOP_FOLLOWUPS:
+                result = {'scopes': cloud.desktop_followup_scopes(developer)}
+            else:
+                scope = self.path.removeprefix(DESKTOP_FOLLOWUPS+'/')
+                if not re.fullmatch(r'[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}', scope):
+                    return self.device_error(404, '找不到该桌面会话。')
+                result = cloud.desktop_followup_export(scope, developer)
+            if not self.server.registry.enabled(self.digest) or developer and not self.server.registry.desktop_policy(self.digest)[0]:
+                return self.device_error(403, '此 Key 的回填权限已变更。')
+            return self.reply(200, result)
+        except DeviceError:
+            return self.device_error(403, '回填后续回复需要已配对的本机设备。')
+        except CloudCliError as error:
+            return self.device_error(error.status, str(error))
+        except (OSError, sqlite3.Error):
+            return self.device_error(503, '暂时无法读取后续回复。')
 
     def do_CONNECT(self):
         self.close_connection = True
@@ -216,9 +332,18 @@ class PublicHandler(Handler):
                 self.end_headers()
                 upstream.settimeout(10)
                 self.connection.settimeout(10)
-                relay_frp(self.connection, upstream)
+                relay_frp(self.connection, upstream,lambda: self.device_lease_active(row))
             except OSError:
                 pass
+
+    def device_lease_active(self, row):
+        try:
+            current = self.server.devices.enrolled(self.digest,self.platform,row['id'],
+                                                    self.headers.get('X-SafeCode-Device-Proof'))
+            return (self.server.public_enabled and current['expires'] > time.time()
+                    and self.server.registry.enabled(self.digest))
+        except (DeviceError,OSError,sqlite3.Error):
+            return False
 
     def do_POST(self):
         self.device = None
@@ -240,7 +365,7 @@ class PublicHandler(Handler):
         device = self.headers.get('X-SafeCode-Device')
         proof = self.headers.get('X-SafeCode-Device-Proof')
         if not self.authorized():
-            return self.reject_device_message(401, 'SafeCode Key required')
+            return self.reject_device_message(401, 'SafeCode API Key 无效或已停用。', 'key_rejected')
         if self.server.config['cloudcli'] is None:
             return self.reject_device_message(503, CLOUDCLI_REQUIRED)
         if self.headers.get('X-SafeCode-Diagnostics') == '1':
@@ -248,25 +373,52 @@ class PublicHandler(Handler):
             diagnostic(backend='cloudcli' if self.server.config['cloudcli'] else 'claude_code',
                        active=min(1000000, sum(active.values())), waiting=min(1000000, sum(waiting.values())),
                        slots=min(1000000, slots))
-        if device is None and proof is None:
-            if (self.server.root/'device-required'/self.digest).is_file():
-                return self.reject_device_message(403, 'Verify SafeCode local device control before starting a chat')
-        else:
-            diagnostic(stage='device_check')
-            try:
-                binding = self.server.owner_hosts if SSH_DEVICE.fullmatch(device or '') else self.server.devices
-                if binding is None:
-                    raise DeviceError('Device pairing is unavailable')
-                self.device = binding.chat_binding(self.digest, self.platform, device, proof)
-            except (DeviceError, sqlite3.Error):
-                return self.reject_device_message(403, 'SafeCode device authorization is unavailable')
+        if not self.safecode_client() or not device or not proof:
+            return self.reject_device_message(403, '请在 Safe Code 完成本机设备配对后发起请求。', 'device_pairing_required')
+        diagnostic(stage='device_check')
+        binding = self.server.owner_hosts if SSH_DEVICE.fullmatch(device or '') else self.server.devices
+        if binding is None:
+            return self.reject_device_message(503, '网关的本机连接服务尚未就绪，请联系管理员。',
+                                              'device_service_unavailable')
+        try:
+            self.device = binding.chat_binding(self.digest, self.platform, device, proof)
+        except DeviceOffline:
+            return self.reject_device_message(503, '本机连接暂不可用。请在 Safe Code 恢复设备连接后继续。',
+                                              'device_offline')
+        except DeviceAlreadyBound as error:
+            return self.reject_device_message(409, str(error), 'device_already_bound')
+        except DeviceError:
+            return self.reject_device_message(403, '本机设备授权无效。请在 Safe Code 重新验证设备。',
+                                              'device_pairing_rejected')
+        except (OSError, sqlite3.Error):
+            return self.reject_device_message(503, '暂时无法检查本机设备状态，请稍后重试。',
+                                              'device_state_unavailable')
         super().handle_messages()
 
-    def reject_device_message(self, status, message):
+    def verify_admitted_device(self):
+        if not self.device:
+            raise GatewayError('请在 Safe Code 完成本机设备配对后发起请求。', 403)
+        device = self.device['id']
+        proof = self.headers.get('X-SafeCode-Device-Proof')
+        try:
+            if SSH_DEVICE.fullmatch(device):
+                if paired_device(self.server.root, self.digest) != device:
+                    raise DeviceAlreadyBound('设备绑定已变更')
+                self.server.owner_hosts.authenticate(self.digest, self.platform, device, proof)
+            else:
+                row = self.server.devices.enrolled(self.digest, self.platform, device, proof)
+                if row['expires'] <= time.time():
+                    raise DeviceOffline('设备连接已超时')
+        except DeviceOffline as error:
+            raise GatewayError(str(error), 503) from None
+        except DeviceError:
+            raise GatewayError('设备授权已失效，请在 Safe Code 重新验证设备。', 403) from None
+
+    def reject_device_message(self, status, message, code=None):
         # Read a bounded request before closing TLS so the rejection body reaches the relay.
         try:
             remaining = int(self.headers.get('Content-Length', '0'))
-            if not self.headers.get('Transfer-Encoding') and 0 < remaining <= MAX_REQUEST:
+            if not self.headers.get('Transfer-Encoding') and 0 < remaining <= MAX_MESSAGES_REQUEST:
                 while remaining:
                     chunk = self.rfile.read(min(remaining, 65536))
                     if not chunk:
@@ -274,41 +426,69 @@ class PublicHandler(Handler):
                     remaining -= len(chunk)
         except (ValueError, OSError):
             pass
-        return self.device_error(status, message)
+        return self.device_error(status, message, code)
 
-    def device_error(self, status, message):
-        return self.reply(status, {'type': 'error', 'error': {'type': 'permission_error', 'message': message}})
+    def device_error(self, status, message, code=None):
+        kind = {400: 'invalid_request_error', 401: 'authentication_error', 403: 'permission_error'}.get(status, 'api_error')
+        error = {'type': kind, 'message': message}
+        if code:
+            error['code'] = code
+        return self.reply(status, {'type': 'error', 'error': error})
 
     def device_control(self):
-        if not self.authorized():
+        if not self.safecode_client():
+            return self.reject_device_message(403, '请通过 Safe Code 客户端配对设备。', 'safecode_client_required')
+        authorized = self.authorized()
+        if not authorized and self.credential_digest() is None:
             return self.device_error(401, 'SafeCode Key required')
         try:
             request = read_json(self)
+            if not authorized:
+                digest = self.credential_digest()
+                if request.get('action') == 'revoke' and digest and not self.server.registry.has_marker(digest):
+                    # No active credential exists. Acknowledge only local teardown, including retries after deletion.
+                    return self.reply(200, {'revoked': True})
+                return self.device_error(401, 'SafeCode Key required')
             action = request.get('action')
             device = request.get('deviceId')
             if action == 'revoke' and isinstance(device, str) and SSH_DEVICE.fullmatch(device):
                 self.server.owner_hosts.revoke(self.digest, self.platform, device, request.get('deviceProof'))
                 return self.reply(200, {'revoked':True})
             devices = self.server.devices
-            if devices is None or not devices.permitted(self.digest):
-                return self.device_error(403, 'Device control is unavailable for this Key')
+            if devices is None:
+                return self.device_error(403, 'Private device service is not configured', 'device_not_configured')
+            if not devices.permitted(self.digest):
+                return self.device_error(403, 'Device control is unavailable for this Key', 'device_not_allowed')
+            if action in ('capability','prepare'):
+                problem = device_service_problem(self.server.config)
+                if problem:
+                    return self.device_error(503, 'Private device service is unavailable', problem)
             if action == 'capability':
                 return self.reply(200, {'supported': True, 'transport': 'frp', 'httpsTunnel': True, 'port': self.server.frp_port,
-                                        'deviceRequired': devices.required(self.digest)})
+                                        'deviceRequired': True})
             if action == 'prepare':
                 if request.get('accepted') is not True:
                     raise DeviceError('Local control consent is required')
                 return self.reply(200, devices.prepare(self.digest, self.platform, request.get('hostname')))
-            row = devices.enrolled(self.digest, self.platform, request.get('deviceId'), request.get('deviceProof'))
+            row = devices.enrolled(self.digest, self.platform, request.get('deviceId'), request.get('deviceProof'),
+                                   require_current=action != 'revoke', missing_ok=action == 'revoke')
+            if action == 'revoke':
+                if row is not None:
+                    devices.revoke(row)
+                return self.reply(200, {'revoked': True})
             if action == 'verify':
-                return self.reply(200, {'command': devices.configure(row, request.get('username'), request.get('hostKey'))})
+                try:
+                    command = devices.configure(row, request.get('username'), request.get('hostKey'))
+                except DeviceError:
+                    return self.device_error(400, 'SafeCode could not verify the SSH return path',
+                                             'device_ssh_verification_failed')
+                return self.reply(200, {'command':command})
             if action == 'renew':
                 devices.renew(row)
                 return self.reply(200, {'ready': bool(row['ready'])})
-            if action == 'revoke':
-                devices.revoke(row)
-                return self.reply(200, {'revoked': True})
             raise DeviceError('Unknown device action')
+        except DeviceAlreadyBound as error:
+            return self.device_error(409, str(error), 'device_already_bound')
         except (DeviceError, ValueError, TypeError):
             return self.device_error(400, 'SafeCode could not apply the device request')
         except (OSError, sqlite3.Error):
@@ -321,17 +501,28 @@ class PublicHandler(Handler):
     def backend_required(self):
         return self.reply(503, {'type': 'error', 'error': {'type': 'api_error', 'message': CLOUDCLI_REQUIRED}})
 
+    def check_model(self, model):
+        allowed = self.server.registry.model_policy(self.digest)
+        if allowed is not None and model not in allowed:
+            raise CloudCliError('This model is not allowed for this API Key', 403)
+
     def execute_message(self, data, **options):
         if not isinstance(data,dict):
             raise GatewayError('Invalid Messages request',400)
         requested = data.get('model')
-        model = requested if isinstance(requested, str) and re.fullmatch(r'[A-Za-z0-9_.-]{1,80}(?:\[1m\])?', requested) else 'unknown'
+        model = requested if isinstance(requested, str) and CLOUDCLI_MODEL_ID.fullmatch(requested) else 'unknown'
         enqueued = time.monotonic()
         started = None
         record = {'model': model, 'outcome': 'success', 'status': 200, 'wait_ms': 0, 'duration_ms': None}
         diagnostic(stage='gateway_queue')
         try:
-            with self.server.queue.slot(self.digest, lambda: peer_disconnected(self.connection)):
+            stream = options.get('stream')
+            manager = self.server.account(self.digest, self.platform, self.device, create=False)
+            if manager is not None and manager.cloudcli is not None:
+                manager.cloudcli.request_previous_stop(data, options.get('session_header'))
+            with self.server.queue.slot(self.digest, lambda: peer_disconnected(self.connection),
+                                        on_wait=stream.queue_ping if stream is not None else None):
+                self.verify_admitted_device()
                 started = time.monotonic()
                 diagnostic(stage='gateway_validation', waitMs=round((started-enqueued)*1000))
                 manager = self.manager
@@ -339,7 +530,17 @@ class PublicHandler(Handler):
                 manager.accounting.model = model
                 manager.accounting.finished = None
                 try:
-                    return manager.run(data, **options)
+                    try:
+                        encoded = self.headers.get('X-SafeCode-Desktop-User','')
+                        user = base64.b64decode(encoded[:512], validate=True).decode() if encoded else ''
+                    except (ValueError, UnicodeError):
+                        user = ''
+                    device = self.device or {}
+                    user = user or device.get('username') or device.get('hostname') or self.platform
+                    origin = self.server.public_origin
+                    gateway = urlsplit(origin).hostname if origin else socket.gethostname()
+                    labels = (user, gateway) if (encoded or options.get('session_header') or data.get('metadata')) else None
+                    return manager.run({**data, '_safeCodeLabels':labels}, **options, check_model=self.check_model)
                 except GatewayError as error:
                     record.update(outcome='failed', status=error.status)
                     raise
@@ -383,11 +584,13 @@ class PublicServer(ThreadingHTTPServer):
 
     def __init__(self, root, config):
         cloudcli = load_cloudcli_config()
+        questions = cloudcli.get('desktopQuestions') if cloudcli else None
         if cloudcli and not ipaddress.ip_address(config['bind']).is_loopback and (
                 cloudcli.get('hostControl') or
-                cloudcli.get('desktopQuestions') and not cloudcli.get('desktopToolApprovals')):
+                questions and ('tokenFile' in questions or not cloudcli.get('desktopToolApprovals'))):
             raise ValueError('Direct CloudCLI gateways cannot use a shared workstation or disable configured Desktop tool approvals.')
         self.root, self.config = root, {**config, 'cloudcli': cloudcli}
+        self.review_prompt = PromptReviewer(root, cloudcli)
         self.frp_port = config.get('deviceFrpPort')
         if self.frp_port is not None and (type(self.frp_port) is not int or not 1024 <= self.frp_port <= 65535):
             raise ValueError('Invalid private FRP control port')
@@ -397,14 +600,21 @@ class PublicServer(ThreadingHTTPServer):
         self.lock = threading.Lock()
         self.usage_lock = threading.Lock()
         self.subscription = {'state': 'unavailable', 'windows': {}}
+        self.subscription_path = root/'subscription-snapshot.json'
+        try:
+            self.subscription = self.subscription_snapshot(json.loads(self.subscription_path.read_text()))
+        except (OSError, ValueError):
+            pass
         self.registry = KeyRegistry(root)
+        self.catalog_backend = None
         self.registry.prune_requests()
         self.next_log_cleanup = time.monotonic() + 3600
         try:
             concurrency = int((root/PUBLIC_CONCURRENCY).read_text())
         except (FileNotFoundError, ValueError):
             concurrency = 0
-        self.queue = RequestQueue(self.registry, concurrency=max(0, concurrency))
+        self.queue = RequestQueue(self.registry, concurrency=max(0, concurrency),
+                                  key_mode=(root/PUBLIC_KEY_QUEUE).is_file())
         # CLI turns can retain their processes between HTTP requests while awaiting tools.
         self.turns = Capacity(lambda: self.queue.concurrency + 2 if self.queue.concurrency else 0)
         self.webfetch_turns = Capacity(lambda: self.queue.concurrency)
@@ -413,6 +623,12 @@ class PublicServer(ThreadingHTTPServer):
         self.tls.minimum_version = ssl.TLSVersion.TLSv1_2
         self.tls.load_cert_chain(root/'cert.pem', root/'key.pem')
         super().__init__((config['bind'], config['port']), PublicHandler)
+        self.directory = GatewayDirectory(root, self.manage, lambda: self.public_enabled)
+
+    def server_close(self):
+        if hasattr(self, 'directory'):
+            self.directory.stop.set()
+        super().server_close()
 
     def process_request(self, request, address):
         if not self.workers.acquire(blocking=False):
@@ -460,20 +676,159 @@ class PublicServer(ThreadingHTTPServer):
         for chat in abandoned:
             chat.close()
 
-    def account(self, digest, platform, device=None):
+    def account(self, digest, platform, device=None, *, create=True):
         identity = digest+'-'+platform+('-'+device['id'] if device else '')
         with self.lock:
             if identity not in self.accounts:
+                if not create:
+                    return None
                 folder = self.root/'sessions'/identity
+                if device:
+                    folder = self.account_folder(digest, platform, device['id'], device.get('workspace_machine'))
                 folder.mkdir(mode=0o700, parents=True, exist_ok=True)
                 m = PublicManager(folder, {**self.config, 'instance':digest[:32], 'clientPlatform':platform,
-                                           'pairedDevice':device})
+                                           'pairedDevice':device}, review_prompt=self.review_prompt)
+                m.account_footer = lambda model, usage: self.account_footer(digest, model, usage)
                 if m.cloudcli:
                     m.cloudcli.parallel = True
+                    m.cloudcli.project_bindings = lambda: self.registry.project_bindings(digest)
+                    m.cloudcli.desktop_policy = lambda: self.registry.desktop_policy(digest)
+                    if device and device.get('workspace_machine'):
+                        m.cloudcli.desktop_key = digest
+                        m.cloudcli.desktop_key_note = lambda: self.registry.key_note(digest)
                 m.live_slots = self.turns
                 m.webfetch_slots = self.webfetch_turns
                 self.accounts[identity] = m
             return self.accounts[identity]
+
+    def account_folder(self, key_id, platform, device, machine):
+        anchor = self.registry.desktop_history_device(key_id, platform, machine, device)
+        return self.root/'sessions'/f'{key_id}-{platform}-{anchor}'
+
+    @staticmethod
+    def subscription_snapshot(sample):
+        if not isinstance(sample, dict) or type(sample.get('sampled_at')) is not int or not isinstance(sample.get('windows'), dict):
+            raise ValueError('无效的额度快照。')
+        windows = {}
+        for key in ('five_hour', 'seven_day'):
+            window = sample['windows'].get(key)
+            if not isinstance(window, dict):
+                continue
+            used = window.get('used')
+            if type(used) not in (int, float) or not 0 <= used <= 100:
+                continue
+            windows[key] = {'used': used}
+            if type(window.get('resets_at')) is int:
+                windows[key]['resets_at'] = window['resets_at']
+        if not windows:
+            raise ValueError('额度快照缺少有效窗口。')
+        return {'state': 'available', 'windows': windows, 'sampled_at': sample['sampled_at']}
+
+    def remember_subscription(self, sample):
+        value = self.subscription_snapshot(sample)
+        if value['sampled_at'] >= self.subscription.get('sampled_at', 0):
+            atomic_write(self.subscription_path, json.dumps(value))
+            self.subscription = value
+        return self.subscription
+
+    def account_footer(self, digest, model, usage):
+        # The response is saved for replay before the handler posts the charge.
+        # Include this turn once, using the same prices as the ledger.
+        amount = '暂不可用'
+        try:
+            balance = self.registry.balance(digest)
+            if balance is not None:
+                remaining = balance['remaining_nanos']
+                if remaining is None:
+                    amount = '不限额'
+                else:
+                    cost, _ = usage_price(model, usage)
+                    nanos = max(0, remaining - cost)
+                    amount = '< $0.0001' if 0 < nanos < 100_000 else f'${nanos / 1_000_000_000:.4f}'
+        except sqlite3.Error:
+            pass
+
+        sample = self.subscription
+        windows = sample['windows']
+        values = []
+        for key, label in (('five_hour', '5 小时'), ('seven_day', '7 天')):
+            window = windows.get(key, {})
+            used = window.get('used')
+            reset = window.get('resets_at')
+            if type(used) in (int, float) and 0 <= used <= 100 and (not reset or reset > time.time()):
+                values.append(f'{label}剩余 {int(100 - used + 0.5)}%')
+            else:
+                values.append(f'{label}暂无记录')
+        quota = ' · '.join(values) if windows else '暂无记录'
+        return (f'Key 余额 {amount}', f'账户额度（上次查询） · {quota}')
+
+    def manage_bound_gateway(self, request, operation):
+        target = request.get('gateway_target')
+        directory = operation in DIRECTORY
+        if directory and 'gateway_target' in request:
+            raise ValueError('绑定管理必须在本机网关操作。')
+        if not directory and (operation not in REMOTE_FIELDS or not isinstance(target, str)
+                              or not re.fullmatch(r'[a-f0-9]{32}', target)):
+            raise ValueError('不支持此远程网关操作。')
+        connector = 'multi-gateway.sock'
+        try:
+            if (self.root/connector).is_socket():
+                response = send_admin(self.root, json.dumps(request, ensure_ascii=False).encode(), socket_name=connector)
+            else:
+                response = installed_directory(self.root, request)
+                if response is None:
+                    response = self.directory.request(request)
+        except DirectoryError as error:
+            response = {'error': str(error), 'status': error.status}
+        except (ImportError, subprocess.TimeoutExpired, OSError, ValueError) as error:
+            response = {'error': '多网关服务暂不可用，请检查网关更新和授权连接。', 'status': 503}
+        if directory:
+            return response
+        if 'error' in response:
+            raise ValueError(response['error'])
+        return response['value']
+
+    def set_imported_sessions(self, key_id, request):
+        submitted = request.get('sessions')
+        if not isinstance(submitted, list) or len(submitted) > 32:
+            raise ValueError('每次最多登记 32 条导入的网页会话。')
+        if not self.registry.enabled(key_id):
+            raise ValueError('找不到已启用的 Key。')
+        bindings = {entry['project_id']: entry['path'] for entry in self.registry.project_bindings(key_id)}
+        if submitted:
+            self.manage({'action': 'project_catalog'})
+        imports = {}
+        for item in submitted:
+            try:
+                project = str(uuid.UUID(item['project']))
+                session = str(uuid.UUID(item['session']))
+                scope = str(uuid.uuid5(IMPORTED_SESSION_NAMESPACE, f'{project}/{session}'))
+                if item['desktop_session'] != f'local_{scope}' or scope in imports or project not in bindings:
+                    raise ValueError()
+            except (AttributeError, KeyError, TypeError, ValueError):
+                raise ValueError('请提供已绑定项目的有效桌面导入清单。') from None
+            try:
+                self.catalog_backend.verify_imported_session(project, bindings[project], session)
+            except CloudCliError as error:
+                raise ValueError(str(error)) from None
+            imports[scope] = {'project': project, 'session': session}
+        with pairing_lock(self.root, key_id):
+            device = paired_device(self.root, key_id)
+            if not device or device != request.get('deviceId') or not re.fullmatch(r'[a-zA-Z0-9_-]{1,128}', device):
+                raise ValueError('请刷新后选择已配对的 Mac。')
+            machine = None
+            if SSH_DEVICE.fullmatch(device):
+                try:
+                    _, _, _, login = self.owner_hosts.identity(device)
+                    machine = self.owner_hosts.workspace_machine(device, 'macos', login)
+                except DeviceError:
+                    raise ValueError('请重新连接已配对的 Mac 后再同步。') from None
+            elif self.devices is not None:
+                machine = self.devices.workspace_machine(key_id, 'macos', device)
+            account = self.account_folder(key_id, 'macos', device, machine)
+            account.mkdir(mode=0o700, parents=True, exist_ok=True)
+            atomic_write(account/IMPORTED_SESSIONS_FILE, json.dumps(imports))
+        return {'count': len(imports)}
 
     def manage(self, request):
         operation = request.get('action')
@@ -495,6 +850,41 @@ class PublicServer(ThreadingHTTPServer):
             return {'enabled': self.public_enabled, 'backend': 'cloudcli', 'gatewayRevision': GATEWAY_REVISION}
         if not self.public_enabled:
             raise ValueError(PUBLIC_DISABLED_MESSAGE)
+        if operation in DIRECTORY or 'gateway_target' in request:
+            return self.manage_bound_gateway(request, operation)
+        if operation == 'set_key_queue':
+            enabled = request.get('enabled')
+            if type(enabled) is not bool:
+                raise ValueError('请选择是否开启 API 排队。')
+            with self.lock:
+                if enabled:
+                    atomic_write(self.root/PUBLIC_KEY_QUEUE, '1\n')
+                else:
+                    (self.root/PUBLIC_KEY_QUEUE).unlink(missing_ok=True)
+                self.queue.set_key_mode(enabled)
+                return self.queue.key_status()
+        if operation == 'set_prompt_review':
+            with self.lock:
+                return self.review_prompt.update(request, atomic_write)
+        if operation in ('model_catalog', 'project_catalog'):
+            if self.config['cloudcli'] is None:
+                raise ValueError(CLOUDCLI_REQUIRED)
+            with self.lock:
+                if self.catalog_backend is None:
+                    folder = self.root/'model-catalog'
+                    folder.mkdir(mode=0o700, exist_ok=True)
+                    self.catalog_backend = CloudCliBackend(folder, self.config['cloudcli'])
+            if operation == 'project_catalog':
+                if not self.config['cloudcli'].get('desktopQuestions'):
+                    raise ValueError('请先在网关中接入 CloudCLI 网页账户。')
+                try:
+                    return {'projects': self.catalog_backend.managed_projects()}
+                except CloudCliError as error:
+                    raise ValueError(str(error)) from None
+            return {'models': self.catalog_backend.managed_models()}
+        if operation == 'remember_subscription':
+            with self.usage_lock:
+                return self.remember_subscription(request.get('sample'))
         if operation == 'refresh_subscription':
             if not self.usage_lock.acquire(blocking=False):
                 return {'state': 'loading', 'windows': self.subscription['windows']}
@@ -504,7 +894,7 @@ class PublicServer(ThreadingHTTPServer):
                 except (OSError, ValueError, AttributeError, TypeError):
                     windows = {}
                 if windows:
-                    self.subscription = {'state': 'available', 'windows': windows, 'sampled_at': int(time.time())}
+                    self.remember_subscription({'windows': windows, 'sampled_at': int(time.time())})
                 else:
                     self.subscription = {**self.subscription, 'state': 'stale' if self.subscription['windows'] else 'unavailable'}
                 return self.subscription
@@ -538,19 +928,24 @@ class PublicServer(ThreadingHTTPServer):
                     'busy': bool(active or waiting)}
         if operation=='list':
             active, waiters, concurrency = self.queue.snapshot()
-            keys = self.registry.list()
+            keys = self.registry.list(include_project_bindings=request.get('include_project_bindings') is True)
             for key in keys:
                 key['active_count'] = active.get(key['id'], 0)
                 key['active'] = bool(key['active_count'])
                 key['waiting'] = waiters.get(key['id'],0)
+                key['bound_device'] = paired_device(self.root, key['id'])
             result = {'keys':keys,'origin':self.public_origin,
                       'activation_required':any(key['enabled'] for key in keys),
-                      'can_delete_revoked_keys': True,
+                      'can_delete_revoked_keys': True, 'key_policy_supported': True,
+                      'project_bindings_supported': bool((self.config['cloudcli'] or {}).get('desktopQuestions')),
+                      'desktop_policy_supported': bool((self.config['cloudcli'] or {}).get('desktopQuestions')),
+                      'device_service_problem': device_service_problem(self.config),
                       'billing': {'cost_nanos': sum(key['cost_nanos'] for key in keys),
                                   'unpriced_tokens': sum(key['unpriced_tokens'] for key in keys)},
                       'active':bool(active),'active_count':sum(active.values()),'waiting':sum(waiters.values()),
                       'concurrency':concurrency,'concurrency_text':str(concurrency),'queue_limit':self.queue.max_queue,
-                      'wait_limit':self.queue.max_wait}
+                      'wait_limit':self.queue.max_wait,
+                      'key_queue':self.queue.key_status(), 'prompt_review':self.review_prompt.status()}
             if request.get('details') is True:
                 result.update(self.registry.overview(), recent=self.registry.recent_requests())
                 result['subscription'] = self.subscription
@@ -565,25 +960,97 @@ class PublicServer(ThreadingHTTPServer):
             budget = request.get('budget_cents')
             if budget is not None and (type(budget) is not int or not 0 <= budget <= 100_000_000):
                 raise ValueError('累计额度应为 0 到 1,000,000 美元，最多两位小数。')
-            billing = {'budget_nanos': None if budget is None else budget * 10_000_000} if 'budget_cents' in request else {}
+            settings = {'budget_nanos': None if budget is None else budget * 10_000_000} if 'budget_cents' in request else {}
+            for field in ('developer_mode', 'raw_messages'):
+                if field in request:
+                    if type(request[field]) is not bool:
+                        raise ValueError('请选择有效的开发者模式设置。')
+                    if request[field] and not (self.config['cloudcli'] or {}).get('desktopQuestions'):
+                        raise ValueError('CloudCLI 网页接入尚未启用。')
+                    settings[field] = request[field]
+            if operation == 'issue' and settings.get('raw_messages') and not settings.get('developer_mode'):
+                raise ValueError('请先启用开发者模式。')
+            if 'expires_at' in request:
+                expiry = request['expires_at']
+                if expiry is not None and (type(expiry) is not int or not 1 <= expiry <= 253402300799):
+                    raise ValueError('请选择有效的失效时间。')
+                settings['expires_at'] = expiry
+            if 'allowed_models' in request:
+                models = request['allowed_models']
+                if models is not None:
+                    if (not isinstance(models, list) or not models or
+                            any(not isinstance(model, str) or not CLOUDCLI_MODEL_ID.fullmatch(model) for model in models)):
+                        raise ValueError('请至少选择一个允许使用的模型。')
+                    models = json.dumps(list(dict.fromkeys(models)), separators=(',', ':'))
+                settings['allowed_models'] = models
+            if 'project_bindings' in request:
+                submitted = request['project_bindings']
+                if not isinstance(submitted, list) or len(submitted) > 16:
+                    raise ValueError('每个 Key 最多绑定 16 个 CloudCLI 项目。')
+                bindings = {}
+                if submitted:
+                    projects = {entry['project_id']: entry for entry in
+                                self.manage({'action': 'project_catalog'})['projects']}
+                    used_projects = set()
+                    for item in submitted:
+                        if (not isinstance(item, dict) or not isinstance(item.get('project_id'), str)
+                                or not valid_mac_workspace(item.get('directory'))):
+                            raise ValueError('请选择 CloudCLI 项目并填写 Mac 上 Code 环境的绝对路径。')
+                        project_id, directory = item['project_id'], item['directory']
+                        if directory in bindings or project_id in used_projects or project_id not in projects:
+                            raise ValueError('项目或本机目录重复，或者项目已归档，请重新选择。')
+                        project = projects[project_id]
+                        path = Path(project['path'])
+                        if not path.is_dir() or path.resolve() != path:
+                            raise ValueError('CloudCLI 项目目录不可用。')
+                        bindings[directory] = {**project, 'directory': directory}
+                        used_projects.add(project_id)
+                settings['project_bindings'] = json.dumps(list(bindings.values()), ensure_ascii=False) if bindings else None
             if operation=='issue':
                 if self.config['cloudcli'] is None:
                     raise ValueError(CLOUDCLI_REQUIRED)
+                if self.devices is None or device_service_problem(self.config):
+                    raise ValueError('设备服务尚未就绪，请先在网关设置中运行故障修复。')
                 origin = self.public_origin or request.get('origin')
                 if not origin:
                     raise ValueError('无法识别 VPS 的公网 IP，请从 Safe Code 的 SSH 会话创建密钥。')
                 ticket, key_id = make_key(self.root,origin)
-                self.registry.issue(key_id, note.strip(), rpm, activated=valid_activation_code(request.get('activation_code')), **billing)
+                self.registry.issue(key_id, note.strip(), rpm, activated=valid_activation_code(request.get('activation_code')), **settings)
                 return {'id':key_id,'ticket':ticket}
         key_id = request.get('id','')
         if not isinstance(key_id,str) or not KEY_ID.fullmatch(key_id):
             raise ValueError('Key ID 无效。')
+        if operation == 'set_imported_sessions':
+            return self.set_imported_sessions(key_id, request)
         if operation=='usage':
             return {'models':self.registry.usage(key_id), 'recent':self.registry.recent_requests(key_id)}
         if operation=='update':
-            self.registry.update(key_id,note.strip(),rpm,**billing)
+            self.registry.update(key_id,note.strip(),rpm,**settings)
+        elif operation == 'unbind':
+            expected = request.get('deviceId')
+            if not isinstance(expected, str) or not expected:
+                raise ValueError('请刷新列表后选择要解绑的设备。')
+            with pairing_lock(self.root, key_id):
+                current = paired_device(self.root, key_id)
+                if current is not None and current != expected:
+                    raise ValueError('设备绑定已变更，请刷新列表后重试。')
+                if current is not None:
+                    devices = self.devices
+                    if devices is None and (self.root/'device-bridge.sqlite3').exists():
+                        devices = Devices(self.root)
+                    if devices is not None:
+                        devices.clear_pairings(key_id)
+                    for path in (self.root/'ssh-devices').glob(key_id+'-ssh-*'):
+                        if SSH_DEVICE.fullmatch(path.name[len(key_id)+1:]):
+                            path.unlink(missing_ok=True)
         elif operation=='revoke':
-            self.registry.revoke(key_id)
+            with pairing_lock(self.root, key_id):
+                self.registry.revoke(key_id)
+                devices = self.devices
+                if devices is None and (self.root/'device-bridge.sqlite3').exists():
+                    devices = Devices(self.root)
+                if devices is not None:
+                    devices.clear_pairings(key_id)
         elif operation == 'delete':
             self.registry.delete(key_id)
         else:
@@ -741,6 +1208,8 @@ if __name__=='__main__':
             options = json.loads(sys.stdin.buffer.read(4096))
             binding = OwnerHosts(args.state).bind(options['keyId'], options['hostClientId'], options['hostname'])
             print(json.dumps({'value':binding}))
+        except DeviceAlreadyBound as error:
+            print(json.dumps({'error':str(error)},ensure_ascii=False))
         except (OSError, ValueError, KeyError, TypeError):
             print(json.dumps({'error':'无法将 Key 绑定到已验证的本机远程控制，请重新验证该设备。'}))
     elif args.command=='admin':

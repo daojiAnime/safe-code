@@ -6,7 +6,9 @@ const number = new Intl.NumberFormat('zh-CN');
 const dollars = new Intl.NumberFormat('en-US', {style: 'currency', currency: 'USD', maximumFractionDigits: 4});
 const compact = new Intl.NumberFormat('en', {notation: 'compact', maximumFractionDigits: 1});
 const dateTime = new Intl.DateTimeFormat('zh-CN', {month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23'});
+const expiryDateTime = new Intl.DateTimeFormat('zh-CN', {year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hourCycle: 'h23'});
 const outcomes = {success: '成功', failed: '失败', limited: '受限', canceled: '已取消'};
+const keyStates = {enabled: '已启用', expired: '已过期', revoked: '已撤销'};
 const viewButtons = [...document.querySelectorAll('[data-view]')];
 let snapshot;
 let editingKey;
@@ -48,7 +50,10 @@ function rpc(op, args = {}) {
     }
   });
 }
-const manage = (action, options = {}) => rpc('safeCodeApi.manage', {action, ...options});
+const gatewayTarget = /^#gateway=([a-f0-9]{32})$/.exec(location.hash)?.[1];
+const manage = (action, options = {}) => rpc('safeCodeApi.manage', {
+  action, ...options, ...(gatewayTarget && {gateway_target: gatewayTarget}),
+});
 const quotaCard = byId('gateway-claude-limits');
 let subscriptionQueried = false;
 let queriedSubscription;
@@ -66,6 +71,7 @@ const slotProgressMaximum = item => Math.min(item?.concurrency ?? 1, Number.MAX_
 const usd = nanos => nanos == null ? '—' : nanos > 0 && nanos < 100000 ? '< $0.0001' : dollars.format(nanos / 1e9);
 const costLabel = item => usd(item.cost_nanos);
 const timestamp = seconds => seconds ? dateTime.format(new Date(seconds * 1000)) : '—';
+const keyState = key => key.expired ? 'expired' : key.enabled ? 'enabled' : 'revoked';
 const duration = ms => ms == null ? '—' : ms >= 1000 ? (ms / 1000).toFixed(2) + ' 秒' : Math.round(ms) + ' 毫秒';
 const shortId = id => id.slice(0, 12);
 const keyName = key => key.note || shortId(key.id);
@@ -77,6 +83,7 @@ function notice(id, text, error = false) {
   node.hidden = !text;
   node.textContent = text;
   node.dataset.error = String(error);
+  if (id === 'editor-status' && error) node.scrollIntoView({block: 'nearest'});
 }
 function element(tag, text, className) {
   const node = document.createElement(tag);
@@ -103,16 +110,42 @@ function action(text, handler, className) {
   return button;
 }
 
+function renderGatewayVersion(state) {
+  const badge = byId('gateway-version');
+  const revision = state?.gatewayRevision;
+  const known = Number.isInteger(revision) && revision > 0;
+  const update = known && state.gatewayUpdateAvailable === true;
+  badge.textContent = known ? `网关版本 rev${revision}` : '网关版本 —';
+  badge.toggleAttribute('data-update', update);
+  badge.title = update ? '有新版网关，可在「网关设置」中更新' : '';
+  badge.setAttribute('aria-label', update ? badge.textContent + '，' + badge.title : badge.textContent);
+}
 function renderOverview() {
+  renderGatewayVersion(snapshot);
   renderClaudeSubscription(quotaCard, queriedSubscription ?? snapshot.subscription);
   const {keys, waiting, stats} = snapshot;
   const current = keys.find(key => key.active);
   const running = activeCount(snapshot);
+  const review = snapshot.prompt_review;
+  const reviewButton = byId('gateway-prompt-review');
+  const reviewState = byId('prompt-review-state');
+  reviewButton.disabled = !review;
+  reviewButton.title = review ? '' : '更新 VPS 网关后可配置前置审查';
+  reviewState.hidden = !review;
+  reviewState.textContent = review?.enabled ? '已开启' : '关闭';
+  reviewState.dataset.enabled = String(review?.enabled === true);
+  const keyQueue = snapshot.key_queue;
+  byId('gateway-key-queue').disabled = !keyQueue;
+  byId('gateway-key-queue').title = keyQueue ? '' : '更新 VPS 网关后可配置 API 排队';
+  const keyQueueState = byId('key-queue-state');
+  keyQueueState.hidden = !keyQueue;
+  keyQueueState.textContent = keyQueue?.enabled ? '已开启' : '关闭';
+  keyQueueState.dataset.enabled = String(keyQueue?.enabled === true);
   const concurrencyButton = byId('gateway-concurrency');
   concurrencyButton.disabled = !snapshot.concurrency_text;
   concurrencyButton.textContent = '处理槽位 ' + slotLabel(snapshot);
   concurrencyButton.title = concurrencyButton.disabled ? '更新 VPS 网关后可调整处理槽位' : '';
-  byId('metric-keys').textContent = fmt(keys.filter(key => key.enabled).length);
+  byId('metric-keys').textContent = fmt(keys.filter(key => keyState(key) === 'enabled').length);
   byId('metric-keys-detail').textContent = '共 ' + fmt(keys.length) + ' 把密钥';
   byId('metric-requests-label').textContent = stats ? '近 24 小时请求' : '累计请求';
   byId('metric-requests').textContent = fmt(stats?.requests ?? keys.reduce((sum, key) => sum + key.requests, 0));
@@ -132,8 +165,11 @@ function renderOverview() {
     : '并发上限 ' + slotLabel(snapshot);
   const queue = byId('queue-strip');
   queue.hidden = false;
-  queue.dataset.active = String(running > 0);
-  byId('queue-current').textContent = running === 1 && current ? '正在处理 · ' + keyName(current)
+  const owner = keyQueue?.enabled && keyQueue.key_id && keys.find(key => key.id === keyQueue.key_id);
+  const release = owner && keyQueue.release_in;
+  queue.dataset.active = String(running > 0 || release > 0);
+  byId('queue-current').textContent = release > 0 ? keyName(owner) + ' · ' + fmt(release) + ' 秒后释放'
+    : running === 1 && current ? '正在处理 · ' + keyName(current)
     : running ? '正在处理 ' + fmt(running) + ' 个请求' : '网关空闲';
   const unlimited = unlimitedSlots(snapshot);
   const progress = byId('queue-capacity');
@@ -152,7 +188,7 @@ function renderKeys() {
   const sort = byId('key-sort').value;
   const keys = (snapshot?.keys ?? []).filter(key =>
     (!query || key.id.includes(query) || key.note.toLowerCase().includes(query)) &&
-    (!status || key.enabled === (status === 'enabled')));
+    (!status || keyState(key) === status));
   keys.sort((left, right) => (right[sort] ?? 0) - (left[sort] ?? 0));
   const pages = Math.max(1, Math.ceil(keys.length / keysPerPage));
   keyPage = Math.min(keyPage, pages - 1);
@@ -174,12 +210,15 @@ function renderKeys() {
       const id = element('code', shortId(key.id) + '…');
       id.title = key.id;
       cell(row, name).append(id);
-      const state = key.enabled ? pill('已启用', 'enabled') : pill('已撤销', 'revoked');
+      const state = pill(keyStates[keyState(key)], keyState(key));
       const stateCell = cell(row, state);
       if (key.active || key.waiting) {
         const activity = [key.active && '执行中 ' + fmt(activeCount(key)), key.waiting && '排队 ' + fmt(key.waiting)].filter(Boolean).join(' · ');
         stateCell.append(element('small', activity, 'key-activity'));
       }
+      const models = cell(row, key.allowed_models ? fmt(key.allowed_models.length) + ' 个模型' : '全部模型');
+      if (key.allowed_models) models.title = key.allowed_models.join('、');
+      models.append(element('small', key.expires_at ? expiryDateTime.format(key.expires_at * 1000) : '永不过期', 'key-policy-detail'));
       cell(row, key.rpm ? fmt(key.rpm) + ' 次/分' : '不限频', 'number');
       const requests = cell(row, fmt(key.requests), 'number');
       if (key.failures != null) requests.title = '失败 ' + fmt(key.failures) + ' 次';
@@ -194,10 +233,13 @@ function renderKeys() {
       cell(row, timestamp(key.last_used));
       const actions = element('div', null, 'row-actions');
       actions.append(action('用量详情', () => showUsage(key)));
+      if (key.bound_device) {
+        if (!gatewayTarget) actions.append(action('解绑', () => showKeyRemoval(key, 'unbind')));
+      }
       if (key.enabled) {
-        actions.append(action('编辑', () => showEditor(key)), action('撤销', () => showKeyRemoval(key, false), 'revoke-link'));
+        actions.append(action('编辑', () => showEditor(key)), action('撤销', () => showKeyRemoval(key, 'revoke'), 'revoke-link'));
       } else if (snapshot.can_delete_revoked_keys) {
-        actions.append(action('彻底删除', () => showKeyRemoval(key, true), 'revoke-link'));
+        actions.append(action('彻底删除', () => showKeyRemoval(key, 'delete'), 'revoke-link'));
       }
       cell(row, actions);
       if (focused?.dataset.keyId === key.id && focusIndex >= 0) {
@@ -443,12 +485,16 @@ function refresh(showProgress = true) {
   return refreshTask;
 }
 async function loadSnapshot(showProgress) {
+  if (location.hash === '#gateways') return true;
   byId('refresh').disabled = true;
   if (showProgress) notice('status', '正在读取网关…');
   try {
     const fetchAnalytics = showProgress || loadedAnalyticsPeriod !== analyticsPeriod || Date.now() - analyticsRefreshedAt >= 10000;
     const period = activeView === 'analytics' && fetchAnalytics ? analyticsPeriod : undefined;
-    snapshot = await manage('list', {details: true, background: !showProgress, ...(period && {analytics: period})});
+    snapshot = await manage('list', {
+      details: true, background: !showProgress, ...(period && {analytics: period}),
+      ...(!gatewayTarget && {include_project_bindings: true}),
+    });
     if (period) {
       loadedAnalyticsPeriod = period;
       analyticsData = snapshot.analytics;
@@ -472,6 +518,7 @@ async function loadSnapshot(showProgress) {
     notice('status', '');
     return true;
   } catch (error) {
+    renderGatewayVersion(null);
     const subscription = queriedSubscription ?? snapshot?.subscription;
     renderClaudeSubscription(quotaCard, subscription ? {...subscription, state: 'stale'} : undefined);
     notice('status', error.message, true);
@@ -488,8 +535,172 @@ function renderActivationField() {
   input.required = required;
   if (!required) input.value = '';
 }
+const modelPolicy = byId('model-policy');
+const expiryPolicy = byId('expiry-policy');
+const expiryInput = byId('key-expiry');
+const modelOptions = byId('allowed-models');
+const editor = byId('key-editor');
+let editorEpoch = 0;
+let catalogLoaded = false;
+let catalogPending = false;
+
+function selectedModels() {
+  return [...modelOptions.querySelectorAll('input:checked')].map(input => input.value);
+}
+function showModelOptions(catalog, selected) {
+  const options = new Map(catalog.map(model => [model.id, model.name]));
+  for (const id of selected) if (!options.has(id)) options.set(id, id);
+  modelOptions.replaceChildren(...Array.from(options, ([id, name]) => {
+    const label = element('label');
+    const input = element('input');
+    input.type = 'checkbox';
+    input.value = id;
+    input.checked = selected.includes(id);
+    const text = element('span', name);
+    if (name !== id) text.append(element('small', id));
+    label.append(input, text);
+    return label;
+  }));
+}
+async function loadModelOptions() {
+  if (catalogPending) return;
+  const epoch = editorEpoch;
+  catalogPending = true;
+  byId('reload-models').hidden = true;
+  notice('model-status', '正在读取 CloudCLI 模型…');
+  try {
+    const {models} = await manage('model_catalog');
+    if (!editor.open || epoch !== editorEpoch) return;
+    showModelOptions(models, selectedModels());
+    catalogLoaded = models.length > 0;
+    notice('model-status', catalogLoaded ? '' : 'CloudCLI 当前没有返回可用模型。');
+    byId('reload-models').hidden = catalogLoaded;
+  } catch (error) {
+    if (!editor.open || epoch !== editorEpoch) return;
+    notice('model-status', '无法读取模型。' + error.message, true);
+    byId('reload-models').hidden = false;
+  } finally {
+    if (epoch === editorEpoch) catalogPending = false;
+  }
+}
+function localExpiry(seconds) {
+  const date = new Date(seconds * 1000);
+  return new Date(date.getTime() - date.getTimezoneOffset() * 60000).toISOString().slice(0, 16);
+}
+function renderPolicyFields() {
+  const limited = modelPolicy.value === 'selected';
+  byId('model-picker').hidden = !limited;
+  if (limited && !catalogLoaded) void loadModelOptions();
+  const scheduled = expiryPolicy.value === 'scheduled';
+  byId('expiry-field').hidden = expiryInput.disabled = !scheduled;
+  if (scheduled && !expiryInput.value) expiryInput.value = localExpiry(Date.now() / 1000 + 7 * 86400);
+}
+modelPolicy.onchange = expiryPolicy.onchange = renderPolicyFields;
+byId('reload-models').onclick = loadModelOptions;
+
+const projectSettings = byId('project-settings');
+const projectBindings = byId('project-bindings');
+const desktopPolicy = byId('desktop-policy');
+const developerMode = byId('developer-mode');
+const rawMessages = byId('raw-messages');
+developerMode.onchange = () => {
+  byId('raw-messages-field').hidden = !developerMode.checked;
+  if (!developerMode.checked) rawMessages.checked = false;
+};
+let projectCatalog = null;
+let projectCatalogPending = false;
+
+function bindingValues() {
+  return [...projectBindings.children].map(row => ({
+    project_id: row.querySelector('select').value,
+    directory: row.querySelector('input').value.trim(),
+  }));
+}
+
+function addProjectBinding(binding = {project_id: '', directory: ''}) {
+  const row = element('div', null, 'project-binding');
+  const choiceLabel = element('label', 'CloudCLI 项目');
+  const choice = element('select');
+  const options = new Map(projectCatalog?.map(project => [project.project_id, project.name + ' · ' + project.path]));
+  if (binding.project_id && !options.has(binding.project_id)) {
+    options.set(binding.project_id, binding.name || binding.project_id);
+  }
+  choice.add(new Option('选择已有项目', ''));
+  for (const [id, label] of options) choice.add(new Option(label, id));
+  choice.value = binding.project_id;
+  choiceLabel.append(choice);
+  const pathLabel = element('label', 'Mac 上的 Code 工作目录');
+  const path = element('input');
+  path.placeholder = '/Users/用户名/项目目录';
+  path.spellcheck = false;
+  path.value = binding.directory;
+  pathLabel.append(path);
+  const remove = element('button', '移除绑定');
+  remove.type = 'button';
+  remove.onclick = () => { row.remove(); };
+  row.append(choiceLabel, pathLabel, remove);
+  projectBindings.append(row);
+}
+
+async function loadProjectCatalog() {
+  if (projectCatalogPending) return;
+  const epoch = editorEpoch;
+  projectCatalogPending = true;
+  byId('reload-projects').hidden = true;
+  notice('project-status', '正在读取 CloudCLI 项目…');
+  try {
+    const {projects} = await manage('project_catalog');
+    if (!editor.open || epoch !== editorEpoch) return;
+    const current = bindingValues();
+    projectCatalog = projects;
+    projectBindings.replaceChildren();
+    for (const binding of current) {
+      addProjectBinding({...editingKey?.project_bindings?.find(item => item.project_id === binding.project_id), ...binding});
+    }
+    byId('add-project').hidden = !projects.length;
+    notice('project-status', projects.length ? '' : 'CloudCLI 当前没有可绑定的项目。');
+  } catch (error) {
+    if (!editor.open || epoch !== editorEpoch) return;
+    notice('project-status', '无法读取项目。' + error.message, true);
+    byId('reload-projects').hidden = false;
+  } finally {
+    if (epoch === editorEpoch) projectCatalogPending = false;
+  }
+}
+
+projectSettings.ontoggle = () => {
+  if (projectSettings.open && editor.open && projectCatalog === null) void loadProjectCatalog();
+};
+byId('reload-projects').onclick = loadProjectCatalog;
+byId('add-project').onclick = () => {
+  if (projectBindings.children.length < 16) addProjectBinding();
+};
+
 function showEditor(key) {
   editingKey = key;
+  editorEpoch++;
+  projectCatalog = null;
+  projectCatalogPending = false;
+  projectSettings.open = false;
+  projectSettings.hidden = Boolean(gatewayTarget) || snapshot.project_bindings_supported !== true;
+  desktopPolicy.hidden = Boolean(gatewayTarget) || snapshot.desktop_policy_supported !== true;
+  developerMode.checked = key?.developer_mode === true;
+  rawMessages.checked = developerMode.checked && key?.raw_messages === true;
+  developerMode.onchange();
+  projectBindings.replaceChildren();
+  byId('reload-projects').hidden = byId('add-project').hidden = true;
+  notice('project-status', '');
+  for (const binding of key?.project_bindings ?? []) addProjectBinding(binding);
+  catalogLoaded = catalogPending = false;
+  const policySupported = snapshot.key_policy_supported === true;
+  modelPolicy.disabled = expiryPolicy.disabled = !policySupported;
+  byId('key-policy-upgrade').hidden = policySupported;
+  modelPolicy.value = key?.allowed_models ? 'selected' : 'all';
+  expiryPolicy.value = key?.expires_at ? 'scheduled' : 'never';
+  expiryInput.value = key?.expires_at ? localExpiry(key.expires_at) : '';
+  notice('model-status', '');
+  byId('reload-models').hidden = true;
+  showModelOptions([], key?.allowed_models ?? []);
   byId('editor-title').textContent = key ? '编辑密钥' : '创建密钥';
   byId('save-key').textContent = key ? '保存修改' : '创建密钥';
   byId('note').value = key?.note ?? '';
@@ -503,17 +714,22 @@ function showEditor(key) {
     : '余额用完后暂停新请求，留空不限额。';
   renderActivationField();
   notice('editor-status', '');
-  byId('key-editor').showModal();
+  editor.showModal();
+  renderPolicyFields();
   byId('note').focus();
 }
-function showKeyRemoval(key, permanent) {
-  keyRemoval = {key, permanent};
-  const label = permanent ? '彻底删除' : '撤销密钥';
+function showKeyRemoval(key, operation) {
+  keyRemoval = {key, operation};
+  const permanent = operation === 'delete';
+  const label = {delete: '彻底删除', unbind: '解绑设备', revoke: '撤销密钥'}[operation];
   byId('revoke-title').textContent = label;
   byId('revoke-key').textContent = label;
   byId('revoke-message').textContent = permanent
     ? '将永久删除「' + keyName(key) + '」及其用量和请求记录。此操作无法撤销。'
     : '撤销「' + keyName(key) + '」后，使用这把密钥的设备将无法发起新请求。';
+  if (operation === 'unbind') {
+    byId('revoke-message').textContent = '解除「' + keyName(key) + '」的设备绑定？该 Key 的余额和用量记录将保留。';
+  }
   notice('revoke-status', '');
   byId('revoke-dialog').showModal();
   if (permanent) byId('revoke-dialog').querySelector('footer [data-close]').focus();
@@ -593,6 +809,81 @@ for (const dialog of document.querySelectorAll('dialog')) {
   dialog.addEventListener('cancel', event => { if (operationPending) event.preventDefault(); });
 }
 byId('refresh').onclick = () => refresh();
+
+const reviewDialog = byId('prompt-review-dialog');
+const reviewKey = byId('prompt-review-key');
+const reviewEnabled = byId('prompt-review-enabled');
+const reviewLanguage = byId('prompt-review-language');
+function renderReviewFields() {
+  const savedKey = snapshot.prompt_review.has_deepseek_key;
+  reviewKey.disabled = operationPending;
+  reviewKey.required = reviewEnabled.checked && !savedKey;
+  reviewKey.placeholder = savedKey ? '已保存 · 粘贴可替换' : '粘贴 DeepSeek API Key';
+  const languageSupported = typeof snapshot.prompt_review.language_replacement === 'boolean';
+  reviewLanguage.disabled = !languageSupported || !reviewEnabled.checked;
+  if (reviewLanguage.disabled) reviewLanguage.checked = false;
+  byId('prompt-review-language-note').textContent = !languageSupported ? '更新 VPS 网关后可使用。'
+    : reviewEnabled.checked ? '由上方模型把通过审查的提示词翻译成英文。' : '开启安全审查后可用。';
+}
+byId('gateway-prompt-review').onclick = () => {
+  const settings = snapshot.prompt_review;
+  reviewKey.value = '';
+  reviewEnabled.checked = settings.enabled;
+  reviewLanguage.checked = settings.language_replacement === true;
+  notice('prompt-review-status', '');
+  renderReviewFields();
+  reviewDialog.showModal();
+};
+reviewEnabled.onchange = renderReviewFields;
+reviewDialog.addEventListener('close', () => { reviewKey.value = ''; });
+byId('prompt-review-form').onsubmit = async event => {
+  event.preventDefault();
+  if (operationPending) return;
+  const button = byId('save-prompt-review');
+  const options = {enabled: reviewEnabled.checked, provider: 'deepseek', model: snapshot.prompt_review.model};
+  if (typeof snapshot.prompt_review.language_replacement === 'boolean') options.language_replacement = reviewLanguage.checked;
+  if (options.provider === 'deepseek' && reviewKey.value.trim()) options.deepseek_key = reviewKey.value.trim();
+  operationPending = true;
+  button.disabled = reviewKey.disabled = reviewEnabled.disabled = reviewLanguage.disabled = true;
+  notice('prompt-review-status', '正在保存…');
+  try {
+    await refreshTask;
+    snapshot.prompt_review = await manage('set_prompt_review', options);
+    reviewDialog.close();
+    await refresh(false);
+  } catch (error) {
+    notice('prompt-review-status', error.message, true);
+  } finally {
+    operationPending = false;
+    button.disabled = reviewEnabled.disabled = false;
+    renderReviewFields();
+  }
+};
+
+const keyQueueDialog = byId('key-queue-dialog');
+const keyQueueEnabled = byId('key-queue-enabled');
+byId('gateway-key-queue').onclick = () => {
+  keyQueueEnabled.checked = snapshot.key_queue.enabled;
+  notice('key-queue-status', '');
+  keyQueueDialog.showModal();
+};
+byId('key-queue-form').onsubmit = async event => {
+  event.preventDefault();
+  if (operationPending) return;
+  const save = byId('save-key-queue');
+  operationPending = save.disabled = keyQueueEnabled.disabled = true;
+  notice('key-queue-status', '正在保存…');
+  try {
+    await refreshTask;
+    await manage('set_key_queue', {enabled: keyQueueEnabled.checked});
+    keyQueueDialog.close();
+    await refresh(false);
+  } catch (error) {
+    notice('key-queue-status', error.message, true);
+  } finally {
+    operationPending = save.disabled = keyQueueEnabled.disabled = false;
+  }
+};
 byId('gateway-concurrency').onclick = () => {
   const input = byId('concurrency-value');
   input.value = snapshot.concurrency_text;
@@ -639,7 +930,7 @@ function showTicket(result, updated = false) {
   byId('issued-title').textContent = updated ? 'Key 已更新' : '密钥已创建';
   byId('issued-help').textContent = updated
     ? '请在使用这把 Key 的设备上选择「更换 Key」，粘贴下面的完整 Key。'
-    : '完整密钥仅在这里显示。请复制到新版 Safe Code 中使用。';
+    : '完整密钥仅在这里显示。请复制后回到 Safe Code 主界面的「API Key 接入」粘贴。';
   notice('issued-origin', result.origin ? '接入地址  ' + result.origin : '');
   byId('ticket').value = result.ticket;
   notice('copy-status', '');
@@ -669,8 +960,41 @@ byId('refresh-ticket-form').onsubmit = event => {
 byId('create-key').onclick = () => showEditor();
 byId('key-form').onsubmit = event => {
   event.preventDefault();
+  const options = {note: byId('note').value, rpm: byId('rpm').valueAsNumber};
+  if (!desktopPolicy.hidden) {
+    options.developer_mode = developerMode.checked;
+    options.raw_messages = developerMode.checked && rawMessages.checked;
+  }
+  if (!projectSettings.hidden) {
+    const bindings = bindingValues();
+    const previous = (editingKey?.project_bindings ?? []).map(({project_id, directory}) => ({project_id, directory}));
+    if (JSON.stringify(bindings) !== JSON.stringify(previous)) {
+      if (bindings.some(binding => !binding.project_id || !binding.directory.startsWith('/'))) {
+        notice('editor-status', '请选择 CloudCLI 项目并填写 Mac 上 Code 环境的绝对路径。', true);
+        return;
+      }
+      options.project_bindings = bindings;
+    }
+  }
+  if (!modelPolicy.disabled) {
+    options.allowed_models = modelPolicy.value === 'selected' ? selectedModels() : null;
+    if (options.allowed_models?.length === 0) {
+      notice('editor-status', '请至少选择一个允许使用的模型。', true);
+      return;
+    }
+    let expiry = null;
+    if (expiryPolicy.value === 'scheduled') {
+      const original = editingKey?.expires_at;
+      expiry = original && expiryInput.value === localExpiry(original)
+        ? original : new Date(expiryInput.value).getTime() / 1000;
+      if (!Number.isFinite(expiry) || (expiry !== original && expiry <= Date.now() / 1000)) {
+        notice('editor-status', '请选择晚于现在的失效时间。', true);
+        return;
+      }
+    }
+    options.expires_at = expiry;
+  }
   void changeKey(async () => {
-    const options = {note: byId('note').value, rpm: byId('rpm').valueAsNumber};
     const budget = byId('budget');
     if (!budget.disabled) options.budget_cents = budget.value === '' ? null : Math.round(budget.valueAsNumber * 100);
     if (editingKey) {
@@ -696,9 +1020,11 @@ byId('copy-key').onclick = async () => {
   }
 };
 byId('revoke-key').onclick = () => changeKey(async () => {
-  const {key, permanent} = keyRemoval;
-  await manage(permanent ? 'delete' : 'revoke', {id: key.id});
-  if (permanent) {
+  const {key, operation} = keyRemoval;
+  const args = {id: key.id};
+  if (operation === 'unbind') args.deviceId = key.bound_device;
+  await manage(operation, args);
+  if (operation === 'delete') {
     if (keyHistory?.key.id === key.id) keyHistory = undefined;
     if (usageKey?.id === key.id) usageKey = undefined;
     loadedAnalyticsPeriod = analyticsData = undefined;
@@ -730,4 +1056,5 @@ document.addEventListener('visibilitychange', () => {
 });
 
 window.safeCodeNativeReady = true;
+if (gatewayTarget) byId('refresh-ticket').hidden = true;
 void refresh().then(success => scheduleAutoRefresh(success ? refreshIntervalMs : retryIntervalMs));

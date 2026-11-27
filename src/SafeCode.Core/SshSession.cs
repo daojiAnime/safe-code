@@ -1,7 +1,9 @@
 using Renci.SshNet;
 using Renci.SshNet.Common;
+using Renci.SshNet.Messages.Transport;
 using System.Diagnostics;
 using System.Net.NetworkInformation;
+using System.Net.Sockets;
 using System.Reflection;
 using System.Security.Cryptography;
 using System.Text;
@@ -12,6 +14,7 @@ namespace SafeCode.Core;
 
 public sealed partial class SshSession : IDisposable
 {
+    private static readonly TimeSpan SshConnectTimeout=TimeSpan.FromSeconds(18);
     private SshClient? client;
     private string remoteDirectory = "";
     private string prefix = "";
@@ -44,7 +47,7 @@ public sealed partial class SshSession : IDisposable
             throw new ArgumentException("服务器地址或端口无效。");
         if (!Regex.IsMatch(settings.Username, @"^[a-zA-Z_][a-zA-Z0-9_.-]{0,31}$")) throw new ArgumentException("用户名格式无效。");
         connection = settings;
-        var info = new PasswordConnectionInfo(settings.Host, settings.Port, settings.Username, settings.Password) { Timeout = TimeSpan.FromSeconds(18), RetryAttempts = 2 };
+        var info = new PasswordConnectionInfo(settings.Host, settings.Port, settings.Username, settings.Password) { Timeout = SshConnectTimeout, RetryAttempts = 2 };
         client = new MountSshClient(info) { KeepAliveInterval = TimeSpan.FromSeconds(20) };
         HostTrustRequiredException? trustRequired=null;
         client.HostKeyReceived += (_, e) =>
@@ -86,13 +89,7 @@ public sealed partial class SshSession : IDisposable
             remoteDirectory = (await ExecuteTextAsync("mktemp -d /tmp/safe-code.XXXXXXXX", cancellationToken)).Trim();
             Log?.Invoke("准备远端部署模块…");
             using var sftp = MakeSftp(); await sftp.ConnectAsync(cancellationToken);
-            using var agent = Assembly.GetExecutingAssembly().GetManifestResourceStream("SafeCode.Core.Remote.agent.py") ?? throw new FileNotFoundException("缺少 Debian 13 部署模块。");
-            await sftp.UploadFileAsync(agent, remoteDirectory + "/agent.py",cancellationToken); sftp.ChangePermissions(remoteDirectory + "/agent.py", 600);
-            using var network = Assembly.GetExecutingAssembly().GetManifestResourceStream("SafeCode.Core.Remote.network.py")!;
-            await sftp.UploadFileAsync(network, remoteDirectory + "/network.py",cancellationToken); sftp.ChangePermissions(remoteDirectory + "/network.py", 600);
-            using var usage = Assembly.GetExecutingAssembly().GetManifestResourceStream("SafeCode.Core.PublicApi.claude_usage.py")!;
-            await sftp.UploadFileAsync(usage, remoteDirectory + "/claude_usage.py", cancellationToken);
-            sftp.ChangePermissions(remoteDirectory + "/claude_usage.py", 600);
+            await UploadManagementModulesAsync(sftp, remoteDirectory, cancellationToken);
             WriteKnownHost();
             Log?.Invoke("部署模块已就绪，检查服务器环境…");
             Server = await RequestAsync<ServerInfo>("inspect", null, cancellationToken);
@@ -109,6 +106,41 @@ public sealed partial class SshSession : IDisposable
         if (os.TryGetValue("VERSION_ID", out var ver) && !string.IsNullOrWhiteSpace(ver))
             return ver == "13" || ver.StartsWith("13.", StringComparison.Ordinal);
         return os.TryGetValue("VERSION_CODENAME", out var codename) && codename == "trixie";
+    }
+
+    private static async Task UploadManagementModulesAsync(SftpClient sftp, string directory, CancellationToken ct)
+    {
+        foreach (var name in new[] { "agent.py", "network.py", "socks_egress.py" })
+        {
+            using var resource = Assembly.GetExecutingAssembly().GetManifestResourceStream("SafeCode.Core.Remote." + name)
+                ?? throw new FileNotFoundException("缺少 Debian 13 部署模块。", name);
+            string path = directory + "/" + name;
+            await sftp.UploadFileAsync(resource, path, ct);
+            sftp.ChangePermissions(path, 600);
+        }
+        using var usage = Assembly.GetExecutingAssembly().GetManifestResourceStream("SafeCode.Core.PublicApi.claude_usage.py")!;
+        await sftp.UploadFileAsync(usage, directory + "/claude_usage.py", ct);
+        sftp.ChangePermissions(directory + "/claude_usage.py", 600);
+    }
+
+    public Task<SocksEgressProbe> ProbeSocksEgressAsync(string proxyUrl, CancellationToken ct = default) =>
+        RequestAsync<SocksEgressProbe>("socks_probe", new { proxyUrl }, ct);
+
+    public async Task<ServerInfo> SetSocksEgressAsync(string? proxyUrl, CancellationToken ct = default)
+    {
+        var server = Server ?? throw new InvalidOperationException("尚未连接服务器。");
+        var status = proxyUrl == null
+            ? await RequestAsync<SocksEgressStatus>("socks_disable", null, ct)
+            : await RequestAsync<SocksEgressStatus>("socks_enable", new { proxyUrl }, ct);
+        server.SocksEgress = status;
+        observedEgressIp = status.ObservedIp ?? "";
+        if (!status.Enabled)
+        {
+            try { observedEgressIp = (await RequestAsync<EgressProbe>("egress_probe", null, ct)).Ip; }
+            catch (RemoteOperationException) { Log?.Invoke("出口 IP 暂未确认。"); }
+        }
+        server.ObservedEgressIp = observedEgressIp;
+        return server;
     }
     private bool VerifyOrConfirm(ConnectionSettings settings, string fingerprint, Func<HostKeyInfo,bool> confirm)
     {
@@ -159,7 +191,7 @@ public sealed partial class SshSession : IDisposable
     {
         var status = await ReadPublicGatewayAsync(false, ct);
         if (!status.TryGetProperty("enabled", out var enabled) || enabled.ValueKind != JsonValueKind.True)
-            throw new InvalidOperationException("请先在 Safe Code 中确认「保证自用」并启用公网。");
+            throw new InvalidOperationException("请先在 Safe Code 的公网网关设置中点击「启用」。");
     }
 
     public async Task<T> RequestAsync<T>(string operation, object? options = null, CancellationToken ct = default)
@@ -173,7 +205,7 @@ public sealed partial class SshSession : IDisposable
             if (client?.IsConnected != true) throw new InvalidOperationException("SSH 连接已断开，请重新连接。");
             using (var sftp = MakeSftp())
             {
-                if (operation == "safe_code_api") sftp.OperationTimeout = TimeSpan.FromSeconds(12);
+                if (operation is "safe_code_api" or "safe_code_api_repair") sftp.OperationTimeout = TimeSpan.FromSeconds(12);
                 await sftp.ConnectAsync(ct);
                 using var bytes = new MemoryStream(Encoding.UTF8.GetBytes(JsonSerializer.Serialize(new { op = operation, options, background = IsLongOperation(operation) }, JsonDefaults.Options)));
                 await sftp.UploadFileAsync(bytes, requestPath, ct); sftp.ChangePermissions(requestPath, 600);
@@ -228,19 +260,106 @@ public sealed partial class SshSession : IDisposable
             if(!ct.IsCancellationRequested)_=Task.Run(()=>{try{using var sftp=MakeSftp();sftp.ConnectionInfo.Timeout=TimeSpan.FromSeconds(3);sftp.OperationTimeout=TimeSpan.FromSeconds(2);sftp.Connect();sftp.DeleteFile(requestPath);}catch{}});
         }
     }
-    private static bool IsLongOperation(string operation)=>operation is "account" or "localization" or "desktop" or "chrome" or "input" or "claude" or "ssh" or "cloud" or "mount_install";
+    private static bool IsLongOperation(string operation)=>operation is "account" or "localization" or "desktop" or "chrome" or "input" or "input_remove" or "claude" or "ssh" or "cloud" or "mount_install" or "safe_code_api_repair";
+
+    // Callers hold operations so a mount recovery cannot replace this connection concurrently.
+    private async Task RestoreManagementConnectionAsync(CancellationToken ct)
+    {
+        if (IsConnected) return;
+        DisposeMountResource(client);
+        client = null;
+        var replacement = NewMountConnection();
+        try
+        {
+            await replacement.ConnectAsync(ct);
+            using var check = replacement.CreateCommand("cat /etc/os-release");
+            check.CommandTimeout = TimeSpan.FromSeconds(10);
+            await check.ExecuteAsync(ct);
+            if (check.ExitStatus != 0 || !IsSupportedDebian13(ParseOsRelease(check.Result)))
+                throw new UnsupportedOsException("恢复目标不再是 Debian 13，已停止恢复 SSH 连接。");
+            using var create = replacement.CreateCommand("mktemp -d /tmp/safe-code.XXXXXXXX");
+            create.CommandTimeout = TimeSpan.FromSeconds(10);
+            await create.ExecuteAsync(ct);
+            string directory = create.Result.Trim();
+            if (create.ExitStatus != 0 || !Regex.IsMatch(directory, "^/tmp/safe-code[.][A-Za-z0-9]{8}$"))
+                throw new IOException("无法恢复服务器任务通道。");
+            using var sftp = MakeSftp();
+            sftp.ConnectionInfo.Timeout = TimeSpan.FromSeconds(12);
+            sftp.OperationTimeout = TimeSpan.FromSeconds(12);
+            await sftp.ConnectAsync(ct);
+            await UploadManagementModulesAsync(sftp, directory, ct);
+            remoteDirectory = directory;
+            client = replacement;
+        }
+        catch
+        {
+            DisposeMountResource(replacement);
+            throw;
+        }
+    }
+
+    private static bool IsJobConnectionError(Exception error) => error is SocketException or SshOperationTimeoutException
+        || error is SshConnectionException { DisconnectReason: not DisconnectReason.HostKeyNotVerifiable };
+
     private async Task<string> WatchJobJsonAsync(string jobId,CancellationToken ct)
     {
-        if(!Regex.IsMatch(jobId,"^[a-f0-9]{32}$"))throw new ArgumentException("后台任务标识无效。");
-        long offset=0;
-        while(true)
+        if (!Regex.IsMatch(jobId,"^[a-f0-9]{32}$")) throw new ArgumentException("后台任务标识无效。");
+        long offset = 0;
+        long? disconnectedAt = null;
+        while (true)
         {
-            string output=await ExecuteTextAsync(prefix+"python3 -u "+Quote(remoteDirectory+"/agent.py")+" --poll "+Quote(jobId)+" "+offset,ct);
-            string json=output.Split('\n').LastOrDefault(x=>x.StartsWith("SC_RESULT:"))?[10..]??throw new InvalidDataException("后台任务未返回监控结果。");
-            var poll=JsonSerializer.Deserialize<JobPoll>(json,JsonDefaults.Options)??throw new InvalidDataException("任务监控数据无效。");
-            foreach(string line in poll.Lines)Log?.Invoke(line);offset=poll.NextOffset;
-            if(poll.Error!=null)throw new RemoteOperationException(poll.Error,poll.ErrorCode);
-            if(poll.Done&&poll.Value is {} value)return value.GetRawText();
+            string output;
+            try
+            {
+                if (!IsConnected) throw new SshConnectionException("服务器任务通道已断开。");
+                using var command = client!.CreateCommand(prefix+"python3 -u "+Quote(remoteDirectory+"/agent.py")+" --poll "+Quote(jobId)+" "+offset);
+                command.CommandTimeout = TimeSpan.FromSeconds(15);
+                await command.ExecuteAsync(ct);
+                if (command.ExitStatus != 0)
+                    throw new InvalidOperationException((command.Error + "\n" + command.Result).Trim());
+                output = command.Result;
+            }
+            catch (Exception error) when (!ct.IsCancellationRequested && IsJobConnectionError(error))
+            {
+                if (disconnectedAt == null)
+                {
+                    disconnectedAt = Stopwatch.GetTimestamp();
+                    Log?.Invoke("SSH 暂时中断，正在重连并恢复原部署任务…");
+                }
+                TimeSpan remaining = TimeSpan.FromMinutes(5) - Stopwatch.GetElapsedTime(disconnectedAt.Value);
+                if (remaining <= TimeSpan.Zero)
+                    throw new TimeoutException("暂时无法读取部署结果。请重新连接查看服务器上的原任务。", error);
+                DisposeMountResource(client);
+                client = null;
+                using var reconnect = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                reconnect.CancelAfter(remaining);
+                try
+                {
+                    await RestoreManagementConnectionAsync(reconnect.Token);
+                }
+                catch (Exception retryError) when (!ct.IsCancellationRequested && IsJobConnectionError(retryError))
+                {
+                    await Task.Delay(TimeSpan.FromSeconds(3), ct);
+                }
+                catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+                {
+                    throw new TimeoutException("暂时无法读取部署结果。请重新连接查看服务器上的原任务。", error);
+                }
+                continue;
+            }
+            string json = output.Split('\n').LastOrDefault(x=>x.StartsWith("SC_RESULT:"))?[10..]
+                ?? throw new InvalidDataException("后台任务未返回监控结果。");
+            var poll = JsonSerializer.Deserialize<JobPoll>(json,JsonDefaults.Options)
+                ?? throw new InvalidDataException("任务监控数据无效。");
+            if (disconnectedAt != null)
+            {
+                Log?.Invoke("SSH 已重连，正在读取原部署任务的进度和结果。");
+                disconnectedAt = null;
+            }
+            foreach (string line in poll.Lines) Log?.Invoke(line);
+            offset = poll.NextOffset;
+            if (poll.Error != null) throw new RemoteOperationException(poll.Error,poll.ErrorCode);
+            if (poll.Done && poll.Value is {} value) return value.GetRawText();
             await Task.Delay(500,ct);
         }
     }

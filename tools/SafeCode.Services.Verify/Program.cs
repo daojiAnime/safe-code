@@ -65,6 +65,16 @@ try{
  Assert(login.Load()==newer,"recovered login could not be replaced");
  Assert(!Encoding.UTF8.GetString(File.ReadAllBytes(savedPath)).Contains(newer.Password),"saved password was written in clear text");
 
+ var unsupportedCount = """{"type":"error","error":{"type":"not_found_error","message":"Token counting is unavailable on this CLI bridge"}}""";
+ using(var response=new HttpResponseMessage(HttpStatusCode.NotFound)){
+  response.Content=new StringContent(unsupportedCount,Encoding.UTF8,"application/json");
+  var count=new GatewayDiagnostic("count_tokens");
+  Assert(await count.IsUnsupportedTokenCountAsync(response,default),"expected probe was reported as a failure");
+  Assert(await response.Content.ReadAsStringAsync()==unsupportedCount,"probe body was consumed");
+  Assert(!await new GatewayDiagnostic("messages").IsUnsupportedTokenCountAsync(response,default),"suppressed chat 404");
+  response.Content=new StringContent("""{"error":{"type":"not_found_error","message":"Unknown route"}}""",Encoding.UTF8,"application/json");
+  Assert(!await count.IsUnsupportedTokenCountAsync(response,default),"suppressed unrelated count 404");
+ }
  var relay=new GatewayDiagnostic("messages");
  relay.Response(200,null);
  var requestId=Guid.NewGuid().ToString();
@@ -112,9 +122,22 @@ try{
  using(var client=new ClientServices(Path.Combine(directory,"missing-asset"),new FakeHandler(MissingAssetFeed("Beta-9.9.9.9")),updateAssetSuffix:"Setup-x64.exe",currentVersion:"Beta-0.4.4.17"))
  {
   var update=await client.CheckUpdateAsync(true,default);
-  Assert(update.Version=="Beta-9.9.9.9"&&!update.CanInstall,"newer release without a verified asset was not reported safely");
-  Assert(update.Page=="https://github.com/Muchuaner/safe-code/releases/tag/Beta-9.9.9.9","missing-asset release did not use its official page");
+  Assert(update.Version==null&&!update.CanInstall,"release without a platform installer was shown as an update");
   bool refused=false;try{await client.DownloadUpdateAsync((_,_)=>{},default);}catch(InvalidOperationException){refused=true;}Assert(refused,"newer release without an asset enabled auto install");
+ }
+ var macOnly=Feed(sha).Replace("9.0.0","9.1.0").Replace("Setup-x64.exe","macOS-arm64.dmg");
+ foreach(var check in new[]{("0.4.4","Setup-x64.exe","9.0.0"),("Beta-0.4.4.34","Setup-x64.exe","9.0.0"),("0.4.4","macOS-arm64.dmg","9.1.0")})
+ {
+  using var client=new ClientServices(Path.Combine(directory,Guid.NewGuid().ToString()),new FakeHandler("["+macOnly+","+Feed(sha)+"]"),
+                                      updateAssetSuffix:check.Item2,currentVersion:check.Item1);
+  var update=await client.CheckUpdateAsync(true,default);
+  Assert(update.Version==check.Item3&&update.CanInstall,"update did not select the latest matching platform package");
+ }
+ var wrongPlatformFallback=new UpdateHandler{ApiStatus=HttpStatusCode.Forbidden,AtomFeed=AtomFeed("v0.4.4"),AssetAvailable=false};
+ using(var client=new ClientServices(Path.Combine(directory,"rate-wrong-platform"),wrongPlatformFallback,updateAssetSuffix:"Setup-x64.exe",currentVersion:"Beta-0.4.4.34"))
+ {
+  var update=await client.CheckUpdateAsync(true,default);
+  Assert(update.Version==null&&!update.CanInstall,"fallback advertised a release with no platform installer");
  }
  var stableLimited=new UpdateHandler{ApiStatus=HttpStatusCode.TooManyRequests,LatestLocation="/Muchuaner/safe-code/releases/tag/v0.4.5"};
  using(var client=new ClientServices(Path.Combine(directory,"rate-stable"),stableLimited,currentVersion:"0.4.4"))
@@ -195,14 +218,14 @@ try{
   Assert(latestBeta.AtomRequests==1,"latest fallback was not requested");
  }
  var formalRelease=new UpdateHandler{ApiStatus=HttpStatusCode.Forbidden,AtomFeed=AtomFeed("v0.4.4","Beta-0.4.4.18","Beta-0.4.4.17")};
- using(var client=new ClientServices(Path.Combine(directory,"rate-beta-to-formal"),formalRelease,currentVersion:"Beta-0.4.4.17"))
+ using(var client=new ClientServices(Path.Combine(directory,"rate-beta-to-formal"),formalRelease,updateAssetSuffix:"Setup-x64.exe",currentVersion:"Beta-0.4.4.17"))
  {
   var update=await client.CheckUpdateAsync(true,default);
   Assert(update.Version=="0.4.4"&&!update.CanInstall&&update.Page=="https://github.com/Muchuaner/safe-code/releases/tag/v0.4.4","beta fallback missed a newer formal release");
   Assert(await client.CheckUpdateAsync(true,default)==update&&formalRelease.AtomRequests==1,"beta fallback success was not cached");
   typeof(ClientServices).GetField("apiBlockedUntil",BindingFlags.Instance|BindingFlags.NonPublic)!.SetValue(client,DateTimeOffset.UtcNow-TimeSpan.FromSeconds(1));
   formalRelease.ApiStatus=HttpStatusCode.OK;
-  formalRelease.ApiFeed=MissingAssetFeed("Beta-0.4.5.1");
+  formalRelease.ApiFeed="["+ReleaseFeed("Beta-0.4.5.1",true,sha)+"]";
   var recovered=await client.CheckUpdateAsync(false,default);
   Assert(recovered.Version=="Beta-0.4.5.1"&&formalRelease.ApiRequests==2,"fallback cache prevented the API from recovering");
  }
@@ -389,7 +412,7 @@ try{
 sealed class FakeHandler(string? feed=null,byte[]? bytes=null,bool redirect=false):HttpMessageHandler
 {
  public List<string> Bodies{get;}=[];
- protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request,CancellationToken ct){if(request.Content!=null)Bodies.Add(await request.Content.ReadAsStringAsync(ct));if(redirect){var response=new HttpResponseMessage(HttpStatusCode.Found);response.Headers.Location=new Uri("https://evil.invalid/payload.exe");return response;}return new HttpResponseMessage(HttpStatusCode.OK){Content=bytes!=null?new ByteArrayContent(bytes):new StringContent(feed??"{}")};}
+ protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request,CancellationToken ct){if(request.Content!=null)Bodies.Add(await request.Content.ReadAsStringAsync(ct));if(redirect){var response=new HttpResponseMessage(HttpStatusCode.Found);response.Headers.Location=new Uri("https://evil.invalid/payload.exe");return response;}return new HttpResponseMessage(HttpStatusCode.OK){Content=bytes!=null?new ByteArrayContent(bytes):new StringContent(feed!=null&&request.RequestUri?.Host=="api.github.com"&&feed.StartsWith('{')?"["+feed+"]":feed??"{}")};}
 }
 sealed class BlockingHandler:HttpMessageHandler
 {
@@ -400,9 +423,11 @@ sealed class UpdateHandler:HttpMessageHandler
 {
  public int ApiRequests,AtomRequests,LatestRequests;public HttpStatusCode ApiStatus{get;set;}=HttpStatusCode.OK;public string ApiFeed{get;set;}="{}";public string AtomFeed{get;set;}="";public string? RetryAfter{get;set;}
  public string? LatestLocation{get;set;}
+ public bool AssetAvailable{get;set;}=true;
  protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request,CancellationToken ct)
  {
   if(request.RequestUri!.Host=="api.github.com"){ApiRequests++;if(ApiStatus==HttpStatusCode.OK)return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK){Content=new StringContent(ApiFeed)});var response=new HttpResponseMessage(ApiStatus);if(RetryAfter!=null)response.Headers.TryAddWithoutValidation("Retry-After",RetryAfter);return Task.FromResult(response);}
+  if(request.Method==HttpMethod.Head&&request.RequestUri.AbsolutePath.StartsWith("/Muchuaner/safe-code/releases/download/"))return Task.FromResult(new HttpResponseMessage(AssetAvailable?HttpStatusCode.OK:HttpStatusCode.NotFound));
   if(request.RequestUri.AbsoluteUri=="https://github.com/Muchuaner/safe-code/releases.atom"){AtomRequests++;return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK){Content=new StringContent(AtomFeed,Encoding.UTF8,"application/atom+xml")});}
   if(request.RequestUri.AbsoluteUri=="https://github.com/Muchuaner/safe-code/releases/latest"&&LatestLocation!=null){LatestRequests++;var response=new HttpResponseMessage(HttpStatusCode.Found);response.Headers.Location=new Uri(LatestLocation,UriKind.RelativeOrAbsolute);return Task.FromResult(response);}
   return Task.FromResult(new HttpResponseMessage(HttpStatusCode.NotFound));

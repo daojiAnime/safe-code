@@ -15,7 +15,7 @@ internal sealed class MacClients(string directory)
     }
     public static async Task<string> OpenLocalClientAsync(string name,CancellationToken ct)
     {
-        if(name is not ("Codex" or "Claude"))throw new ArgumentException("未知客户端。");
+        if(name != "Codex")throw new ArgumentException("未知客户端。");
         try{await Run("/usr/bin/open",["-a",name],ct);return "已请求打开 "+name+" 客户端。";}
         catch(IOException){throw new InvalidOperationException("未能打开 "+name+"，请先安装官方客户端，或从应用程序目录启动。");}
     }
@@ -322,6 +322,14 @@ internal sealed class MacClients(string directory)
                 StandardErrorEncoding=Encoding.UTF8
             };
             RdpLaunchBuilder.ApplyFreeRdpEnvironment(start.Environment,directory);
+            string bundledDir=Path.GetFullPath(Path.Combine(AppContext.BaseDirectory,"..","RDP"));
+            if(Path.GetFullPath(freeRdp).StartsWith(bundledDir+Path.DirectorySeparatorChar,StringComparison.Ordinal))
+            {
+                start.Environment["OPENSSL_CONF"]="/dev/null";
+                string resourceDirectory=Path.GetDirectoryName(freeRdp)!;
+                start.Environment["OPENSSL_MODULES"]=resourceDirectory;
+                start.Environment["OPENSSL_ENGINES"]=resourceDirectory;
+            }
             start.ArgumentList.Add("/args-from:stdin");
             var proc=Process.Start(start)??throw new IOException("无法启动 FreeRDP 客户端（sdl-freerdp）。");
             proc.OutputDataReceived+=(_,_)=>{};

@@ -28,6 +28,8 @@ PROMPT = re.compile(r'(?m)^\s*[❯›]\s*(?:Try [^\n]*|Ask [^\n]*|Type [^\n]*)?$
 USAGE_COMMAND = re.compile(r'(?im)^[ \t]*(?:[❯›][ \t]*)?/usage[ \t]+(?:[–-][ \t]*)?(?:show|display|view|check)\b')
 TRUST_YES = re.compile(r'(?im)^[ \t]*[❯›][ \t]*(?:1\.[ \t]*)?Yes,[ \t]+I trust this folder[ \t]*$')
 TRUST_NO = re.compile(r'(?im)^[ \t]*[❯›][ \t]*(?:2\.[ \t]*)?No,[ \t]+exit[ \t]*\n[ \t]*Yes,[ \t]+I trust this folder[ \t]*$')
+TRUST_OPTION = re.compile(r'(?:[❯›]\s*)?(?:[12]\.\s*)?(?:No,\s+exit|Yes,\s+I trust this folder)', re.IGNORECASE)
+
 
 
 class UsageUnavailable(ValueError):
@@ -57,6 +59,7 @@ def usage_windows(text):
 
 
 def read_subscription(timeout=12):
+    # TODO: Replace this direct CLI probe with a CloudCLI-backed source and remove the launcher.
     if any(os.environ.get(name) for name in (
         'ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_BASE_URL',
         'CLAUDE_CODE_USE_BEDROCK', 'CLAUDE_CODE_USE_VERTEX', 'CLAUDE_CODE_USE_FOUNDRY',
@@ -117,6 +120,7 @@ def query_usage(terminal, deadline, workspace):
     output = b''
     trust_confirmations = 0
     selecting_trust = False
+    workspace_line = re.compile(r'(?m)^[ \t]*' + re.escape(workspace) + r'[ \t]*$')
     with selectors.DefaultSelector() as selector:
         selector.register(terminal, selectors.EVENT_READ)
         while time.monotonic() < deadline and selector.select(max(0, deadline - time.monotonic())):
@@ -133,14 +137,19 @@ def query_usage(terminal, deadline, workspace):
             output = (output + chunk)[-128*1024:]
             text = terminal_text(output.decode('utf-8', errors='replace'))
             if phase == 'startup':
-                if trust_confirmations < 2 and (selecting_trust or workspace in text) and TRUST_YES.search(text):
+                # After selecting the private temporary folder the CLI can repaint only
+                # the menu. A different path or any unrelated text requires fresh verification.
+                redraw = (selecting_trust or trust_confirmations > 0) and all(
+                    TRUST_OPTION.fullmatch(line.strip()) for line in text.splitlines() if line.strip())
+                verified = trust_confirmations < 2 and (workspace_line.search(text.rsplit('Accessing workspace:', 1)[-1]) or redraw)
+                if verified and TRUST_YES.search(text):
                     # The CLI is in the fresh empty directory created only for this query.
                     if selecting_trust:
                         time.sleep(0.12)
                     os.write(terminal, b'\r')
                     trust_confirmations += 1
                     selecting_trust, output = False, b''
-                elif trust_confirmations < 2 and not selecting_trust and workspace in text and TRUST_NO.search(text):
+                elif verified and not selecting_trust and TRUST_NO.search(text):
                     os.write(terminal, b'\x1b[B')
                     selecting_trust, output = True, b''
                 elif PROMPT.search(text):
@@ -157,7 +166,10 @@ def query_usage(terminal, deadline, workspace):
     if phase == 'usage' and (windows := usage_windows(output.decode('utf-8', errors='replace'))):
         return windows
     if phase == 'startup':
-        raise UsageUnavailable('Claude Code 未进入交互界面。请检查 VPS 上的登录或首次启动提示。')
+        text = terminal_text(output.decode('utf-8', errors='replace'))
+        if re.search(r'\b(?:ENOSPC|no space left on device)\b', text, re.I):
+            raise UsageUnavailable('VPS 磁盘空间不足，Claude Code 无法启动用量查询。')
+        raise UsageUnavailable('订阅已登录，但 Claude Code 未在限时内显示提示符。请在 VPS 终端启动 Claude Code，检查启动提示后运行 /usage。')
     if phase == 'preview':
         raise UsageUnavailable('Claude Code 未显示内置 /usage 命令。请检查 VPS 上的 Claude Code 版本。')
     raise UsageUnavailable('Claude Code /usage 未返回订阅额度，请稍后手动刷新。')
@@ -169,5 +181,8 @@ if __name__ == '__main__':
         print(json.dumps({'state': 'available', 'windows': windows, 'sampled_at': int(time.time())}))
     except UsageUnavailable as error:
         print(json.dumps({'state': 'unavailable', 'windows': {}, 'reason': str(error)}))
-    except (OSError, subprocess.SubprocessError):
-        print(json.dumps({'state': 'unavailable', 'windows': {}, 'reason': 'VPS 上的 Claude Code 用量查询未完成。'}))
+    except (OSError, subprocess.SubprocessError) as error:
+        reason = ('VPS 磁盘空间不足，Claude Code 无法启动用量查询。'
+                  if isinstance(error, OSError) and error.errno == errno.ENOSPC
+                  else 'VPS 上的 Claude Code 用量查询未完成。')
+        print(json.dumps({'state': 'unavailable', 'windows': {}, 'reason': reason}))

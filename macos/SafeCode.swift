@@ -1,9 +1,10 @@
 import AppKit
 import WebKit
 import Security
+import UserNotifications
 
 private let bundleID = "org.safecode.desktop"
-private let safeCodeVersion = "Beta-0.4.4.32"
+private let safeCodeVersion = "0.4.21"
 private enum AppError: LocalizedError {
     case message(String)
     case keychainCancelled
@@ -17,7 +18,6 @@ private enum AppError: LocalizedError {
 private enum NativeDiagnosticOperation: String {
     case loginRestore="login_restore", accountCustomization="account_customization"
     case desktopKeyEnable="desktop_key_enable", desktopKeyDisable="desktop_key_disable", desktopKeyRestore="desktop_key_restore"
-    case claudeDesktopStart="claude_desktop_start", claudeDesktopStop="claude_desktop_stop"
     case desktopLaunch="desktop_launch"
 }
 private func json(_ value: Any) -> String {
@@ -62,18 +62,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKSc
     private var readBuffer = Data()
     private var completions: [String:(Result<Any,Error>)->Void] = [:]
     private var statusItem: NSStatusItem!
-    private let balanceText=NSTextField(wrappingLabelWithString:"")
-    private var balanceButton: NSButton!
-    private var keyRunning=false
-    private var popover = NSPopover()
-    private let statusContent = NSStackView()
-    private var stateText: NSTextField!
-    private var durationText: NSTextField!
-    private var values: [NSTextField] = []
-    private var busy = false, guarding = false, quitting = false, ready = false
+    private let popover = NSPopover()
+    private var trayWeb: WKWebView!
+    private var gatewayWeb: WKWebView?
+    private var gatewayPage: URL { resources.appendingPathComponent("Web/web/gateway.html").absoluteURL }
+    private var capturingTray = false
+    private var trayReady = false
+    private var trayState: [String:Any] = ["apiMode":false]
+    private var trayPage: URL { resources.appendingPathComponent("Web/web/tray.html") }
+    private var quitting = false, shutdownPending = false, ready = false
+    private let notifications = DesktopNotifications()
     private var directory = URL(fileURLWithPath:NSHomeDirectory()).appendingPathComponent("Library/Application Support/Safe Code", isDirectory:true)
     private var resources: URL { Bundle.main.resourceURL! }
     private var index: URL { resources.appendingPathComponent("Web/web/index.html") }
+    private func isAppPage(_ url: URL) -> Bool {
+        url.isFileURL && url.standardizedFileURL.path == index.standardizedFileURL.path
+    }
     private var smokeOutput: URL?
     private var captureSmokeScreenshots: Bool { ProcessInfo.processInfo.arguments.contains("--smoke-screenshots") }
     private var servicesWindow: NSWindow?
@@ -98,7 +102,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKSc
     private var hasSavedLogin: Bool { hasLocalFile("login.aes") || hasLocalFile("login.aes.previous") }
     private var hasDesktopKey: Bool { hasLocalFile("desktop-key.state") }
     private var hasEncryptedData: Bool {
-        if hasSavedLogin || hasDesktopKey || hasLocalFile("desktop-ssh.aes") { return true }
+        if hasSavedLogin || hasDesktopKey || hasLocalFile("desktop-key-list.state") || hasLocalFile("desktop-ssh.aes") { return true }
         let drafts = directory.appendingPathComponent("account-drafts",isDirectory:true)
         return (try? FileManager.default.contentsOfDirectory(atPath:drafts.path))?.contains(where:{$0.hasSuffix(".aes")}) == true
     }
@@ -117,7 +121,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKSc
             if let i=args.firstIndex(of:"--preview-sandbox"),args.count>i+1 {isolated=true;directory=URL(fileURLWithPath:args[i+1],isDirectory:true)}
             if !isolated, let existing=NSRunningApplication.runningApplications(withBundleIdentifier:bundleID).first(where:{$0.processIdentifier != ProcessInfo.processInfo.processIdentifier}) { existing.activate(options:[.activateAllWindows]); NSApp.terminate(nil);return }
             try FileManager.default.createDirectory(at:directory,withIntermediateDirectories:true,attributes:[.posixPermissions:0o700])
+            for event in [NSWorkspace.willSleepNotification,NSWorkspace.didWakeNotification] {
+                NSWorkspace.shared.notificationCenter.addObserver(forName:event,object:nil,queue:.main) { [weak self] _ in
+                    Task { @MainActor in self?.request("desktopKey.invalidate") { _ in } }
+                }
+            }
             makeMenu(); makeWindow(); makeStatus()
+            if !isolated { notifications.configure { [weak self] in self?.showMain() } }
             if !isolated {
                 encryptionKey=try? keychainSecret(allowPrompt:false,allowCreate:!hasEncryptedData)
             }
@@ -133,7 +143,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKSc
         app.addItem(.separator());app.addItem(withTitle:"显示主界面",action:#selector(showMain),keyEquivalent:"0")
         app.addItem(withTitle:"关闭窗口",action:#selector(closeKeyWindow),keyEquivalent:"w").target=self
         app.addItem(withTitle:"隐藏 Safe Code",action:#selector(NSApplication.hide(_:)),keyEquivalent:"h")
-        app.addItem(.separator());app.addItem(withTitle:"安全退出",action:#selector(quit),keyEquivalent:"q")
+        app.addItem(.separator());app.addItem(withTitle:"安全退出",action:#selector(quit),keyEquivalent:"q").target=self
         let edit=NSMenu(title:"编辑");let editItem=NSMenuItem(title:"编辑",action:nil,keyEquivalent:"");editItem.submenu=edit;main.addItem(editItem)
         for (name,selector,key) in [("撤销",Selector(("undo:")),"z"),("剪切",#selector(NSText.cut(_:)),"x"),("复制",#selector(NSText.copy(_:)),"c"),("粘贴",#selector(NSText.paste(_:)),"v"),("全选",#selector(NSText.selectAll(_:)),"a")] {edit.addItem(withTitle:name,action:selector,keyEquivalent:key)}
         NSApp.mainMenu=main
@@ -162,31 +172,71 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKSc
     }
     private func makeStatus() {
         statusItem=NSStatusBar.system.statusItem(withLength:NSStatusItem.squareLength)
-        statusItem.button?.image=NSImage(systemSymbolName:"externaldrive.connected.to.line.below",accessibilityDescription:"Safe Code 挂载状态")
-        statusItem.button?.target=self;statusItem.button?.action=#selector(toggleStatus)
-        let controller=NSViewController();controller.view=NSView(frame:NSRect(x:0,y:0,width:276,height:196))
-        let main=statusContent;main.orientation = .vertical;main.spacing=10;main.alignment = .leading;main.translatesAutoresizingMaskIntoConstraints=false
-        controller.view.addSubview(main);NSLayoutConstraint.activate([main.leadingAnchor.constraint(equalTo:controller.view.leadingAnchor,constant:16),main.trailingAnchor.constraint(equalTo:controller.view.trailingAnchor,constant:-16),main.topAnchor.constraint(equalTo:controller.view.topAnchor,constant:14)])
-        let heading=NSTextField(labelWithString:"Safe Code");heading.font = .systemFont(ofSize:SafeCodeType.medium,weight:.semibold);main.addArrangedSubview(heading)
-        stateText=NSTextField(labelWithString:"未挂载目录");stateText.font = .systemFont(ofSize:SafeCodeType.small);stateText.textColor = .secondaryLabelColor;main.addArrangedSubview(stateText)
-        durationText=NSTextField(labelWithString:"0 个目录  ·  0:00:00");durationText.font = .monospacedDigitSystemFont(ofSize:SafeCodeType.small,weight:.regular);main.addArrangedSubview(durationText)
-        let metrics=NSStackView();metrics.orientation = .horizontal;metrics.distribution = .fillEqually;metrics.spacing=12
-        for title in ["发送","接收","读写"] {let column=NSStackView();column.orientation = .vertical;column.alignment = .leading;column.spacing=3;let label=NSTextField(labelWithString:title);label.font = .systemFont(ofSize:SafeCodeType.small);label.textColor = .secondaryLabelColor;let value=NSTextField(labelWithString:title=="读写" ? "0 次":"0 B");value.font = .monospacedDigitSystemFont(ofSize:SafeCodeType.small,weight:.medium);values.append(value);column.addArrangedSubview(label);column.addArrangedSubview(value);metrics.addArrangedSubview(column)}
-        main.addArrangedSubview(metrics);metrics.widthAnchor.constraint(equalTo:main.widthAnchor).isActive=true
-        balanceButton=NSButton(title:"查询 Key 余额",target:self,action:#selector(refreshKeyBalance))
-        balanceButton.bezelStyle = .rounded
-        balanceButton.controlSize = .small
-        balanceButton.font = .systemFont(ofSize:SafeCodeType.small)
-        balanceButton.isHidden=true
-        balanceText.font = .systemFont(ofSize:SafeCodeType.small)
-        balanceText.isHidden=true
-        main.addArrangedSubview(balanceButton)
-        main.addArrangedSubview(balanceText)
-        balanceText.widthAnchor.constraint(equalTo:main.widthAnchor).isActive=true
-        let buttons=NSStackView();buttons.orientation = .horizontal;buttons.spacing=7;buttons.distribution = .fillEqually
-        for (title,selector) in [("主界面",#selector(showMain)),("重连",#selector(reconnect)),("安全退出",#selector(quit))] {let b=NSButton(title:title,target:self,action:selector);b.bezelStyle = .rounded;b.controlSize = .small;b.font = .systemFont(ofSize:SafeCodeType.small);buttons.addArrangedSubview(b)}
-        main.addArrangedSubview(buttons);buttons.widthAnchor.constraint(equalTo:main.widthAnchor).isActive=true
-        popover.contentViewController=controller;popover.behavior = .transient;updateStatusSize()
+        if let button = statusItem.button {
+            if let icon = NSImage(systemSymbolName:"terminal",accessibilityDescription:"Safe Code") {
+                icon.isTemplate = true
+                button.image = icon
+            } else {
+                button.title = "SC"
+            }
+            button.toolTip = "Safe Code"
+            button.setAccessibilityLabel("Safe Code")
+            button.target = self
+            button.action = #selector(toggleStatus)
+            button.sendAction(on:[.leftMouseUp, .rightMouseUp])
+        }
+        let config = WKWebViewConfiguration()
+        config.websiteDataStore = .nonPersistent()
+        config.userContentController.add(self,name:"tray")
+        trayWeb = WKWebView(frame:NSRect(x:0,y:0,width:388,height:220),configuration:config)
+        trayWeb.navigationDelegate = self
+        let controller = NSViewController()
+        controller.view = trayWeb
+        popover.contentViewController = controller
+        popover.behavior = .transient
+        popover.contentSize = trayWeb.frame.size
+        trayWeb.loadFileURL(trayPage,allowingReadAccessTo:trayPage)
+    }
+    private func renderTray(opened:Bool = false) {
+        guard !capturingTray, trayReady, popover.isShown else { return }
+        trayWeb.evaluateJavaScript("window.trayStatus("+json(trayState)+","+(opened ? "true":"false")+")")
+    }
+    private func trayAction(_ args:[String:Any]) {
+        switch args["op"] as? String {
+        case "ready": trayReady = true; renderTray(opened:true)
+        case "size":
+            if let h = args["height"] as? CGFloat, h.isFinite {
+                popover.contentSize = NSSize(width:388,height:min(max(120,h),NSScreen.main?.visibleFrame.height ?? 655))
+            }
+        case "home": showMain()
+        case "close": popover.performClose(nil)
+        case "quit": quit()
+        case "reconnect": reconnect()
+        case "keys","balance":
+            guard !capturingTray, popover.isShown, trayState["apiMode"] as? Bool == true, let generation = args["generation"] as? Int else { return }
+            let listing = args["op"] as? String == "keys"
+            let index = args["index"] as? Int ?? -1
+            let key = args["id"] as? String ?? ""
+            let reply: (Result<Any,Error>)->Void = { [weak self] result in
+                guard let self else { return }
+                let callback = listing ? "trayKeys(\(generation),":"trayBalance(\(generation),\(index),"
+                let value: Any
+                switch result {
+                case .success(let data): value=data
+                case .failure: value=listing && self.encryptionKey == nil && !self.isolated
+                    ? ["locked":true] as Any : NSNull()
+                }
+                self.trayWeb.evaluateJavaScript(callback+json(value)+")")
+            }
+            if listing && args["interactive"] as? Bool == true && !isolated {
+                withUnlockedSecrets(diagnostic:.desktopKeyRestore,reply:reply) {
+                    self.request("desktopKey.list",completion:$0)
+                }
+            } else {
+                request(listing ? "desktopKey.list":"desktopKey.savedBalance",listing ? [:]:["id":key],completion:reply)
+            }
+        default: break
+        }
     }
     private func startBackend() throws {
         let process=Process();process.executableURL=Bundle.main.bundleURL.appendingPathComponent("Contents/Resources/Core/SafeCode.MacBackend")
@@ -220,8 +270,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKSc
         do {guard backend?.isRunning==true,let stdin=stdin else{throw AppError.message("客户端核心未运行。")};try stdin.write(contentsOf:Data((json(message)+"\n").utf8))}
         catch {if let id=message["id"] as? String {if let reply=completions.removeValue(forKey:id){reply(.failure(error))}else{answer(id,error:error.localizedDescription)}}}
     }
-    private func request(_ op:String,_ args:[String:Any]=[:],completion:@escaping(Result<Any,Error>)->Void) {
+    private func request(_ op:String,_ args:[String:Any]=[:],deadline:(seconds:TimeInterval,message:String)?=nil,completion:@escaping(Result<Any,Error>)->Void) {
         let id="native-"+UUID().uuidString;completions[id]=completion;send(["id":id,"op":op,"args":args])
+        if let deadline {
+            DispatchQueue.main.asyncAfter(deadline:.now()+deadline.seconds){[weak self] in
+                self?.completions.removeValue(forKey:id)?(.failure(AppError.message(deadline.message)))
+            }
+        }
     }
     private func receive(_ data:Data) {
         readBuffer.append(data)
@@ -238,6 +293,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKSc
             case "logs":web.evaluateJavaScript("window.safeCodeNativeLogs?.("+json(message["lines"] ?? [])+")",completionHandler:nil)
             case "status":updateStatus(message)
             case "updateProgress":(servicesWeb ?? web).evaluateJavaScript("window.safeCodeUpdateProgress?.(\(message["done"] ?? 0),\(message["total"] ?? 0))",completionHandler:nil)
+            case "bashDetail":
+                if let session=message["session"] as? String, let call=message["call"] as? String {
+                    showMain()
+                    web.evaluateJavaScript("window.safeCodeBashDetail?.("+jsString(session)+","+jsString(call)+")",completionHandler:nil)
+                }
             case "openUrl":if let raw=message["url"] as? String{openURL(raw)}
             case "openFile":if let raw=message["path"] as? String{openFile(raw)}
             default:break
@@ -249,8 +309,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKSc
         (view ?? web).evaluateJavaScript("window.safeCodeNativeResponse?.("+json(response)+")",completionHandler:nil)
     }
     func userContentController(_ userContentController: WKUserContentController,didReceive message:WKScriptMessage) {
-        guard message.frameInfo.isMainFrame,let source=message.frameInfo.request.url,source.isFileURL,let body=message.body as? [String:Any] else{return}
-        guard source.standardizedFileURL.path==index.path,let id=body["id"] as? String,let op=body["op"] as? String,let args=body["args"] as? [String:Any] else{return}
+        if message.webView === trayWeb {
+            if message.name == "tray", message.frameInfo.isMainFrame, message.frameInfo.request.url?.standardizedFileURL == trayPage.standardizedFileURL,
+               let args = message.body as? [String:Any] { trayAction(args) }
+            return
+        }
+        if let view=message.webView,view===gatewayWeb {
+            guard message.frameInfo.isMainFrame,let url=message.frameInfo.request.url,isGatewayPage(url),
+                  let body=message.body as? [String:Any],let id=body["id"] as? String,
+                  let op=body["op"] as? String,let args=body["args"] as? [String:Any] else{return}
+            if op=="copy",let value=args["text"] as? String {
+                NSPasteboard.general.clearContents()
+                answer(id,NSPasteboard.general.setString(value,forType:.string),in:view)
+            } else if op=="safeCodeApi.manage",let action=args["action"] as? String {
+                manageGateway(action,args){[weak self,weak view] result in
+                    guard let self,let view,view===self.gatewayWeb else{return}
+                    switch result {
+                    case .success(let value):self.answer(id,value,in:view)
+                    case .failure(let error):self.answer(id,error:error.localizedDescription,in:view)
+                    }
+                }
+            }
+            return
+        }
+        guard message.frameInfo.isMainFrame,let source=message.frameInfo.request.url,isAppPage(source),let body=message.body as? [String:Any] else{return}
+        guard let id=body["id"] as? String,let op=body["op"] as? String,let args=body["args"] as? [String:Any] else{return}
         if let view=message.webView,view===servicesWeb {
             let allowed=["services.preferences","services.consent","diagnostics.consent","updates.check","updates.download","updates.install","feedback.send"]
             guard allowed.contains(op) else{return}
@@ -270,18 +353,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKSc
                     self.withUnlockedSecrets(replyID:id,diagnostic:.accountCustomization){self.request(op,args,completion:$0)}
                 }else{self.answer(id,with:result)}
             }
-        case "claudeDesktop.start":
-            guard !hasDesktopKey else{answer(id,error:"请先停用 API Key 接入，再启用 SSH 接入。");return}
-            guard args["accepted"] as? Bool == true else{answer(id,error:"请先确认 SSH 接入说明。");return}
-            withUnlockedSecrets(replyID:id,diagnostic:.claudeDesktopStart){self.request(op,args,completion:$0)}
-        case "claudeDesktop.stop" where hasLocalFile("desktop-ssh.aes"):
-            withUnlockedSecrets(replyID:id,diagnostic:.claudeDesktopStop){self.request(op,args,completion:$0)}
+        case "desktopKey.list","desktopKey.save":
+            withUnlockedSecrets(replyID:id,diagnostic:.desktopKeyRestore){self.request(op,args,completion:$0)}
         case "account.draft.save","desktopKey.enable":
             withUnlockedSecrets(replyID:id,diagnostic:op=="desktopKey.enable" ? .desktopKeyEnable : .accountCustomization){self.request(op,args,completion:$0)}
+        case "desktopKey.status" where smokeOutput != nil:
+            answer(id,["configured":false,"running":false])
         case "desktopKey.status","desktopKey.disable":
             if hasDesktopKey && (op=="desktopKey.disable" || args["interactive"] as? Bool == true) {
                 withUnlockedSecrets(replyID:id,diagnostic:op=="desktopKey.disable" ? .desktopKeyDisable : .desktopKeyRestore){self.request(op,args,completion:$0)}
             }else{send(body)}
+        case "claudeDesktop.open","claudeDesktop.reopen":
+            openClaudeDesktop(replyID:id,restart:op=="claudeDesktop.reopen")
         case "secrets.initialize":answer(id,error:"仅原生客户端可解锁本机数据。")
         case "diagnostics.native-failure":answer(id,error:"该操作仅供原生客户端内部调用。")
         case "window.smoke.dialog" where smokeOutput != nil:
@@ -329,16 +412,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKSc
             }
             reconcileDialogs()
             answer(id,true)
-        case "window.resize":let wide=args["wide"] as? Bool ?? false;window.setContentSize(NSSize(width:wide ? 740:360,height:wide ? 634:536));window.center();answer(id,true)
+        case "window.resize":
+            let wide=args["wide"] as? Bool ?? false
+            let api=args["layout"] as? String == "api"
+            window.setContentSize(NSSize(width:api ? 660:(wide ? 740:360),height:api ? 495:(wide ? 634:536)))
+            window.center();answer(id,true)
         case "window.drag":if let event=NSApp.currentEvent,event.type == .leftMouseDown {window.performDrag(with:event)};answer(id,true)
         case "window.minimize":window.miniaturize(nil);answer(id,true)
         case "window.maximize":window.zoom(nil);answer(id,true)
         case "window.close":answer(id,true);window.performClose(nil)
+        case "window.quit":answer(id,true);quit()
         case "copy":NSPasteboard.general.clearContents();NSPasteboard.general.setString(args["text"] as? String ?? "",forType:.string);answer(id,true)
         case "pickFolder":let picker=NSOpenPanel();picker.title="选择要挂载到 VPS 的本机目录";picker.canChooseFiles=false;picker.canChooseDirectories=true;picker.allowsMultipleSelection=false;picker.beginSheetModal(for:dialogHost){[weak self] result in self?.answer(id,result == .OK ? picker.url?.path ?? "":NSNull())}
         case "services.open":openServices();answer(id,true)
         case "window.gateway.open":openGateway(id)
-        case "connect","preview.begin":
+        case "connect","preview.begin","connection.disconnect":
             guard !gatewayMutationPending && !gatewayOpening else{answer(id,error:"请等待当前网关操作完成。");return}
             gatewayWindow?.close()
             send(body)
@@ -373,6 +461,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKSc
         let shared=zip(dialogWindows,requestedDialogs).prefix(while:{$0.id==$1.id}).count
         guard shared != dialogWindows.count || shared != requestedDialogs.count else{return}
         let previous=dialogHost
+        let focusGateway=requestedDialogs.isEmpty && dialogWindows.last?.id=="claude-desktop-dialog" && gatewayWindow?.isVisible==true
         let previousRemains=shared==dialogWindows.count
         if previousRemains {
             // A snapshot stays only in memory and does not take focus or receive input.
@@ -410,9 +499,67 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKSc
         active.ignoresMouseEvents=false
         let front=dialogWindows.last?.id ?? ""
         web.evaluateJavaScript("window.safeCodePresentNativeDialog?.("+jsString(front)+")",completionHandler:nil)
-        active.makeKeyAndOrderFront(nil)
-        active.makeFirstResponder(web)
+        if focusGateway { gatewayWindow?.makeKeyAndOrderFront(nil) }
+        else {
+            active.makeKeyAndOrderFront(nil)
+            active.makeFirstResponder(web)
+        }
     }
+    private func openClaudeDesktop(replyID id:String,restart:Bool) {
+        let bundleID="com.anthropic.claudefordesktop"
+        let workspace=NSWorkspace.shared
+        let candidates=[workspace.urlForApplication(withBundleIdentifier:bundleID),
+                        URL(fileURLWithPath:"/Applications/Claude.app"),
+                        FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Applications/Claude.app")]
+        guard let url=candidates.compactMap({$0}).first(where:{Bundle(url:$0)?.bundleIdentifier==bundleID}) else {
+            let download=URL(string:"https://claude.com/download")!
+            if workspace.open(download) {
+                answer(id,["installationRequired":true,"message":"未找到 Claude Desktop，已打开官方下载页。安装后请回到 SafeCode 再次打开。"])
+            } else {answer(id,error:"未找到 Claude Desktop，请在浏览器打开 https://claude.com/download")}
+            return
+        }
+
+        func launch() {
+            let freshLaunch = NSRunningApplication.runningApplications(withBundleIdentifier:bundleID).allSatisfy { $0.isTerminated }
+            request("claudeDesktop.prepare",["syncHistory":freshLaunch],
+                    deadline:(freshLaunch ? 660 : 30,"桌面启动检查或历史同步超时，请确认 SafeCode 接入状态。")){result in
+                guard case .success(let value)=result,let since=value as? NSNumber else {
+                    if case .failure(let error)=result {self.answer(id,error:error.localizedDescription)}
+                    else {self.answer(id,error:"未能确认 SafeCode 网关状态。")}
+                    return
+                }
+                let ready=Date(timeIntervalSince1970:since.doubleValue/1000)
+                let apps=NSRunningApplication.runningApplications(withBundleIdentifier:bundleID).filter{!$0.isTerminated}
+                if apps.contains(where:{($0.launchDate ?? .distantPast)<ready}) {
+                    self.answer(id,error:"Claude Desktop 在本次网关启用前就已运行。请按 ⌘Q 完全退出，再点击打开以载入当前配置。")
+                    return
+                }
+                workspace.openApplication(at:url,configuration:NSWorkspace.OpenConfiguration()){app,error in
+                    DispatchQueue.main.async {
+                        guard error==nil,app?.bundleIdentifier==bundleID,app?.isTerminated==false else {
+                            self.answer(id,error:"已找到 Claude Desktop，但 macOS 未能启动它。请在 Finder 中检查应用是否可打开。")
+                            return
+                        }
+                        self.answer(id,"已打开 Claude Desktop。")
+                    }
+                }
+            }
+        }
+        let apps=NSRunningApplication.runningApplications(withBundleIdentifier:bundleID).filter{!$0.isTerminated}
+        guard restart && !apps.isEmpty else {launch();return}
+        request("claudeDesktop.prepare",deadline:(30,"检查本机网关超时，请确认 SafeCode 接入状态。")){result in
+            guard case .success=result else {self.answer(id,with:result);return}
+            for app in apps {_=app.terminate()}
+            let deadline=Date().addingTimeInterval(15)
+            @MainActor func waitForExit() {
+                if apps.allSatisfy({$0.isTerminated}) {launch()}
+                else if Date()>=deadline {self.answer(id,error:"请按 ⌘Q 完全退出 Claude Desktop，再点击「打开 Claude Desktop」。")}
+                else {DispatchQueue.main.asyncAfter(deadline:.now()+0.25){waitForExit()}}
+            }
+            waitForExit()
+        }
+    }
+
     private func answer(_ id:String,with result:Result<Any,Error>) {
         switch result {
         case .success(let value):answer(id,value)
@@ -426,18 +573,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKSc
         }
     }
     private func withUnlockedSecrets(replyID:String,diagnostic: NativeDiagnosticOperation,perform: @escaping (@escaping (Result<Any,Error>)->Void)->Void) {
-        guard !isolated else {answer(replyID,error:"隔离预览不会访问钥匙串。");return}
-        let reply: (Result<Any,Error>)->Void = { [weak self] in self?.answer(replyID,with:$0) }
+        withUnlockedSecrets(diagnostic:diagnostic,reply:{ [weak self] in self?.answer(replyID,with:$0) },perform:perform)
+    }
+    private func withUnlockedSecrets(diagnostic: NativeDiagnosticOperation,reply:@escaping (Result<Any,Error>)->Void,perform: @escaping (@escaping (Result<Any,Error>)->Void)->Void) {
+        guard !isolated else {reply(.failure(AppError.message("隔离预览不会访问钥匙串。")));return}
         let replyToUnlockFailure: (Error)->Void = { [weak self] error in
             guard let self=self else{return}
             let cancelled: Bool
             if case .keychainCancelled = error as? AppError {cancelled=true}else{cancelled=false}
-            self.reportNativeFailure(diagnostic,cancelled:cancelled){[weak self] issue in
-                self?.answer(replyID,error:error.localizedDescription+(issue.map{"\n问题编号："+$0} ?? ""))
+            self.reportNativeFailure(diagnostic,cancelled:cancelled){ issue in
+                reply(.failure(AppError.message(error.localizedDescription+(issue.map{"\n问题编号："+$0} ?? ""))))
             }
         }
         if encryptionKey != nil {perform(reply);return}
-        guard !unlockingSecrets else {answer(replyID,error:"正在等待钥匙串授权。");return}
+        guard !unlockingSecrets else {reply(.failure(AppError.message("正在等待钥匙串授权。")));return}
         do {
             unlockingSecrets=true
             let key=try keychainSecret(allowPrompt:true,allowCreate:!hasEncryptedData)
@@ -473,10 +622,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKSc
     }
     private func openGateway(_ id:String) {
         if let panel=gatewayWindow {panel.makeKeyAndOrderFront(nil);answer(id,true);return}
-        guard !gatewayOpening else{answer(id,true);return}
+        guard !gatewayOpening else{answer(id,error:"网关管理正在打开，请稍候。");return}
         if smokeOutput != nil {presentGateway(context:nil);answer(id,true);return}
         gatewayOpening=true
-        request("safeCodeApi.context"){[weak self] result in
+        request("safeCodeApi.context",deadline:(33,"打开网关管理超时。")){[weak self] result in
             guard let self=self else{return}
             self.gatewayOpening=false
             switch result {
@@ -497,7 +646,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKSc
         panel.contentMinSize=NSSize(width:min(805,size.width),height:min(400,size.height))
         panel.isReleasedWhenClosed=false
         panel.delegate=self
-        let content=GatewayPanel { [weak self] action,args,reply in
+        let content=GatewayPanel(openDirectory:{[weak self] in self?.showGatewayDirectory()}) { [weak self] action,args,reply in
             guard let self else {return}
             self.manageGateway(action,args,reply:reply)
         }
@@ -510,16 +659,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKSc
         panel.makeFirstResponder(nil)
         content.start()
     }
+    private func isGatewayPage(_ url:URL) -> Bool {
+        guard url.isFileURL,url.standardizedFileURL.path==gatewayPage.standardizedFileURL.path,url.query==nil else{return false}
+        guard let fragment=url.fragment else{return true}
+        return fragment=="directory" || fragment=="gateways" || fragment.range(of:"^gateway=[a-f0-9]{32}$",options:.regularExpression) != nil
+    }
+    private func showGatewayDirectory() {
+        guard let panel=gatewayWindow,!gatewayMutationPending else{return}
+        let view=WKWebView(frame:.zero,configuration:configuration())
+        view.navigationDelegate=self
+        gatewayPanel?.stop()
+        gatewayPanel=nil
+        gatewayWeb=view
+        panel.contentViewController=nil
+        panel.contentView=view
+        var address=URLComponents(url:gatewayPage,resolvingAgainstBaseURL:true)!
+        address.fragment="directory"
+        view.loadFileURL(address.url!,allowingReadAccessTo:gatewayPage.deletingLastPathComponent())
+    }
     private func manageGateway(_ action:String,_ args:[String:Any],reply:@escaping GatewayPanel.Reply) {
         if smokeOutput != nil {
             switch action {
+            case "multi.list":
+                reply(.success(["value":["self":["id":String(repeating:"a",count:32),"address":"192.0.2.1"],"children":[]]]))
             case "list":
                 let key: [String: Any] = ["id":String(repeating:"a",count:64),"note":"工作笔记本","enabled":true,"rpm":0,
                     "requests":42,"tokens":243810,"cost_nanos":104_300_000,"last_used":1795225500]
                 let event: [String: Any] = ["key_id":key["id"] ?? "", "model":"claude-example", "at":1795225500,
                     "outcome":"success", "status":200, "wait_ms":82, "duration_ms":1600, "tokens":18]
                 let model: [String: Any] = ["model":"claude-example", "requests":42, "failures":2, "tokens":243810, "cost_nanos":104_300_000]
-                var fixture: [String: Any] = ["keys":[key],"active_count":0,"waiting":0,"concurrency":0,"concurrency_text":"0",
+                var fixture: [String: Any] = ["gatewayRevision":27,"gatewayUpdateAvailable":true,"keys":[key],"key_policy_supported":true,"active_count":0,"waiting":0,"concurrency":0,"concurrency_text":"0",
                     "billing":["cost_nanos":104_300_000],"origin":"https://gateway.example.test","recent":[event],"models":[model]]
                 if let period=args["analytics"] as? String {
                     let step=["1h":300,"24h":3600,"7d":86400][period] ?? 300
@@ -542,7 +711,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKSc
         }
         guard let context=gatewayContext else{reply(.failure(AppError.message("SSH 会话已变更，请重新打开网关管理。")));return}
         guard !gatewayMutationPending else{reply(.failure(AppError.message("请等待当前网关操作完成。")));return}
-        let modifies=["issue","update","revoke","delete","set_port","set_origin","set_concurrency","refresh_ticket"].contains(action)
+        let modifies=["issue","update","unbind","revoke","delete","set_port","set_origin","set_concurrency","set_prompt_review","set_key_queue","refresh_ticket","multi.create","multi.claim","multi.remove"].contains(action)
         if modifies {gatewayMutationPending=true}
         var options=args
         options["action"]=action
@@ -553,12 +722,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKSc
         }
     }
     private func inspectGatewayWindow(_ id:String,args:[String:Any]) {
-        guard let panel=gatewayWindow,let content=gatewayPanel else{answer(id,["visible":false]);return}
+        guard let panel=gatewayWindow else{answer(id,["visible":false]);return}
         if args["close"] as? Bool == true {panel.performClose(nil);answer(id,gatewayWindow==nil);return}
+        if args["directory"] as? Bool == true {showGatewayDirectory();answer(id,true);return}
+        if args["bindingChoices"] as? Bool == true, let view=gatewayWeb {
+            let check = "document.querySelector('dialog.mg-dialog[open] [data-step=home]:not([hidden])')?.querySelectorAll('[data-next]').length === 2"
+            view.evaluateJavaScript(check) { [weak self] value,_ in self?.answer(id,value as? Bool ?? false) }
+            return
+        }
+        guard let content=gatewayPanel else{answer(id,["visible":panel.isVisible]);return}
+        if args["createKey"] as? Bool == true {content.createKey()}
+        if args["cancelKey"] as? Bool == true,let sheet=panel.attachedSheet {panel.endSheet(sheet,returnCode:.alertSecondButtonReturn)}
         let previous=dialogHost.frame
         let gatewayOrigin=panel.frame.origin
         if args["move"] as? Bool == true {panel.setFrameOrigin(NSPoint(x:panel.frame.minX+20,y:panel.frame.minY))}
-        answer(id,["visible":panel.isVisible,"ready":content.ready,
+        answer(id,["visible":panel.isVisible,"ready":content.ready,"keyEditor":panel.attachedSheet != nil,
                    "native":panel.styleMask.contains(.titled)&&panel.isMovable&&panel.contentViewController===content,
                    "landscape":panel.frame.width>panel.frame.height,"moved":panel.frame.origin != gatewayOrigin,
                    "parentUnmoved":dialogHost.frame==previous])
@@ -636,13 +814,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKSc
             }else{active.window.makeKeyAndOrderFront(nil)}
             return false
         }
-        if guarding || busy {window.orderOut(nil);return false}
-        quit();return false
+        guard sender === window else { return true }
+        window.orderOut(nil)
+        if !isolated {
+            notifications.post(id:"main-window-hidden", title:"Safe Code 已转入后台",
+                               body:"点击菜单栏中的 Safe Code 图标，可查看状态或打开主界面。")
+        }
+        return false
     }
     func windowWillClose(_ notification:Notification) {
         guard let panel=notification.object as? NSWindow,panel===gatewayWindow else{return}
         gatewayPanel?.stop()
         gatewayPanel=nil
+        gatewayWeb?.configuration.userContentController.removeScriptMessageHandler(forName:"native")
+        gatewayWeb=nil
         gatewayWindow=nil
         gatewayContext=nil
     }
@@ -652,71 +837,47 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKSc
     }
     @objc private func closeKeyWindow(){NSApp.keyWindow?.performClose(nil)}
     @objc private func showMain(){popover.performClose(nil);window.orderFront(nil);dialogHost.makeKeyAndOrderFront(nil);NSApp.activate(ignoringOtherApps:true)}
-    private func updateStatusSize(){
-        guard let content=popover.contentViewController?.view else{return}
-        content.layoutSubtreeIfNeeded()
-        let minimum: CGFloat = balanceButton.isHidden ? 168 : 232
-        let size=NSSize(width:276,height:max(minimum,ceil(statusContent.fittingSize.height)+28))
-        popover.contentSize=size
-        if !popover.isShown {content.setFrameSize(size)}
-    }
     @objc private func toggleStatus(){
         guard let button=statusItem.button else{return}
-        if popover.isShown{popover.performClose(nil)}else{
+        if popover.isShown { popover.performClose(nil) }
+        else {
             popover.show(relativeTo:button.bounds,of:button,preferredEdge:.minY)
-            if keyRunning{refreshKeyBalance()}
-        }
-    }
-    @objc private func refreshKeyBalance(){
-        guard keyRunning,balanceButton.isEnabled else{return}
-        balanceButton.isEnabled=false
-        balanceText.stringValue="正在查询余额…"
-        updateStatusSize()
-        request("desktopKey.balance"){[weak self] result in
-            guard let self=self else{return}
-            self.balanceButton.isEnabled=true
-            guard self.keyRunning else{return}
-            switch result {
-            case .success(let result):
-                let balance=result as? [String:Any]
-                self.balanceText.stringValue=[balance?["remaining"] as? String,balance?["used"] as? String].compactMap{$0}.joined(separator:" · ")
-            case .failure(let error):self.balanceText.stringValue=error.localizedDescription
-            }
-            self.updateStatusSize()
+            renderTray(opened:true)
         }
     }
     @objc private func reconnect(){request("mount.reconnect"){[weak self] result in if case .failure(let error)=result{self?.fail(error.localizedDescription)}}}
     @objc private func about(){NSApp.orderFrontStandardAboutPanel(options:[.applicationName:"Safe Code",.applicationVersion:safeCodeVersion,.credits:NSAttributedString(string:"macOS 客户端 · SSH、部署与目录挂载\n第三方适配器保持关闭")])}
     @objc private func quit(){
-        guard !quitting else{return}
+        guard !quitting && !shutdownPending else{return}
         if gatewayMutationPending {gatewayWindow?.makeKeyAndOrderFront(nil);return}
-        request("app.shutdown"){[weak self] result in guard let self=self else{return};switch result{case .success:self.quitting=true;self.stdin?.closeFile();self.backend?.terminate();NSApp.terminate(nil);case .failure(let error):self.showMain();self.fail("尚未安全退出："+error.localizedDescription)}}
+        shutdownPending = true
+        request("app.shutdown"){[weak self] result in guard let self=self else{return};self.shutdownPending=false;switch result{case .success:self.quitting=true;self.stdin?.closeFile();self.backend?.terminate();NSApp.terminate(nil);case .failure(let error):self.showMain();self.fail("尚未安全退出："+error.localizedDescription)}}
     }
     private func updateStatus(_ message:[String:Any]) {
-        busy=message["busy"] as? Bool ?? false;let mount=message["mount"] as? [String:Any] ?? [:];let host=message["host"] as? [String:Any] ?? [:]
-        let count=mount["count"] as? Int ?? 0
-        let running=message["desktopKeyRunning"] as? Bool == true
-        if running != keyRunning {
-            keyRunning=running
-            balanceButton.isHidden = !running
-            balanceText.isHidden = !running
-            balanceText.stringValue=""
-            updateStatusSize()
-            if running && popover.isShown {refreshKeyBalance()}
-        }
-        guarding=count>0 || (host["enabled"] as? Bool ?? false) || running || (message["desktopSshRunning"] as? Bool ?? false)
-        stateText.stringValue=(host["enabled"] as? Bool ?? false) ? "本机控制已启用":mount["message"] as? String ?? "未挂载目录"
-        let seconds=Int((mount["durationSeconds"] as? Double ?? 0));durationText.stringValue="\(count) 个目录  ·  \(seconds/3600):\(String(format:"%02d",seconds/60%60)):\(String(format:"%02d",seconds%60))"
-        values[0].stringValue=bytes(mount["bytesToServer"] as? Double ?? 0);values[1].stringValue=bytes(mount["bytesToLocal"] as? Double ?? 0);values[2].stringValue="\(mount["completedFiles"] as? Int ?? 0) 次"
-        statusItem.button?.toolTip=running ? "Safe Code · API Key 接入":"Safe Code · "+stateText.stringValue
+        let mount=message["mount"] as? [String:Any] ?? [:]
+        let host=message["host"] as? [String:Any] ?? [:]
+        let apiMode=message["apiMode"] as? Bool ?? false
+        trayState=["mount":mount,"host":["enabled":host["enabled"] as? Bool ?? false],
+                  "running":message["desktopKeyRunning"] as? Bool ?? false,"apiMode":apiMode,"connection":message["connection"] ?? NSNull(),
+                  "startedAt":message["startedAt"] ?? NSNull(),"exiting":shutdownPending]
+        statusItem.button?.toolTip=apiMode ? "Safe Code · API Key 接入":"Safe Code · "+(mount["message"] as? String ?? "未挂载目录")
+        renderTray()
         web.evaluateJavaScript("window.safeCodeMountStatus?.("+json(mount)+")",completionHandler:nil)
     }
-    private func bytes(_ n:Double)->String {if n<1024{return "\(Int(n)) B"};if n<1048576{return String(format:"%.1f KB",n/1024)};if n<1073741824{return String(format:"%.1f MB",n/1048576)};return String(format:"%.1f GB",n/1073741824)}
     private func fail(_ message:String){if let smoke=smokeOutput {try? Data(json(["success":false,"error":message]).utf8).write(to:smoke);return};let alert=NSAlert();alert.messageText="Safe Code";alert.informativeText=message;alert.alertStyle = .warning;alert.runModal()}
     func webView(_ webView:WKWebView,decidePolicyFor action:WKNavigationAction,decisionHandler:@escaping(WKNavigationActionPolicy)->Void) {
         guard let url=action.request.url else{decisionHandler(.cancel);return}
-        let expected=index
-        if url.isFileURL && url.standardizedFileURL.path==expected.path {decisionHandler(.allow)}else{decisionHandler(.cancel);if action.navigationType == .linkActivated{openURL(url.absoluteString)}}
+        if webView===gatewayWeb {decisionHandler(isGatewayPage(url) ? .allow:.cancel);return}
+        if webView === trayWeb {
+            decisionHandler(url.standardizedFileURL == trayPage.standardizedFileURL ? .allow:.cancel)
+            return
+        }
+        if isAppPage(url) {
+            decisionHandler(.allow)
+        } else {
+            decisionHandler(.cancel)
+            if action.navigationType == .linkActivated { openURL(url.absoluteString) }
+        }
     }
     func webView(_ webView:WKWebView,createWebViewWith configuration:WKWebViewConfiguration,for navigationAction:WKNavigationAction,windowFeatures:WKWindowFeatures)->WKWebView?{if let url=navigationAction.request.url{openURL(url.absoluteString)};return nil}
     func webView(_ webView:WKWebView,didStartProvisionalNavigation navigation:WKNavigation!) {
@@ -730,7 +891,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKSc
         DispatchQueue.main.asyncAfter(deadline:.now()+0.5){[weak self] in self?.runSmoke()}
     }
     private func saveSmokeScreenshot(_ name: String, replyID: String) {
-        let views=["notice","login","deployment","maintenance","homepage","desktop-access","gateway","gateway-analysis","gateway-requests","status","status-key"]
+        let views=["notice","login","deployment","maintenance","homepage","desktop-access","gateway","gateway-analysis","gateway-requests","gateway-binding","status","status-key"]
         guard let output=smokeOutput, views.contains(name) ||
             (name.hasPrefix("dialog-") && name.count <= 48 && name.utf8.allSatisfy { $0 == 45 || (97...122).contains($0) }) else {
             answer(replyID,error:"Invalid smoke screenshot name");return
@@ -743,24 +904,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKSc
             do {try data.write(to:target);self.answer(replyID,true)}
             catch {self.answer(replyID,error:error.localizedDescription)}
         }
-        if name.hasPrefix("status"),let content=popover.contentViewController?.view {
-            if name=="status-key" {
-                balanceButton.isHidden=false
-                balanceText.isHidden=false
-                balanceText.stringValue="余额 $4.98 · 已用 $0.02"
-                updateStatusSize()
+        if name == "gateway-binding", let view=gatewayWeb {
+            view.takeSnapshot(with:nil) { image,_ in
+                save(image?.tiffRepresentation.flatMap(NSBitmapImageRep.init(data:)))
             }
-            defer {
-                if name=="status-key" {
-                    balanceButton.isHidden=true
-                    balanceText.isHidden=true
-                    updateStatusSize()
+        } else if name.hasPrefix("status") {
+            if !popover.isShown { toggleStatus() }
+            capturingTray = true
+            let fixture=output.deletingLastPathComponent().appendingPathComponent(name+".json")
+            let sample=(try? Data(contentsOf:fixture)).flatMap { try? JSONSerialization.jsonObject(with:$0) } as? [String:Any]
+            let script = """
+                window.trayStatus(\(json(sample?["state"] ?? trayState)),true);
+                if(apiMode){
+                    window.trayKeys(generation,\(json(sample?["keys"] ?? [])));
+                    \(json(sample?["balances"] ?? [])).forEach((b,i)=>window.trayBalance(generation,i,b));
+                }
+                """
+            trayWeb.evaluateJavaScript(script){[weak self] _,err in
+                guard let self else {return}
+                if let err {self.capturingTray=false;self.answer(replyID,error:err.localizedDescription);return}
+                DispatchQueue.main.asyncAfter(deadline:.now()+0.15) {
+                    self.trayWeb.takeSnapshot(with:nil){image,_ in
+                        self.popover.performClose(nil)
+                        self.capturingTray=false
+                        save(image?.tiffRepresentation.flatMap(NSBitmapImageRep.init(data:)))
+                    }
                 }
             }
-            content.layoutSubtreeIfNeeded()
-            let bitmap=content.bitmapImageRepForCachingDisplay(in:content.bounds)
-            if let bitmap {content.cacheDisplay(in:content.bounds,to:bitmap)}
-            save(bitmap)
         } else if name.hasPrefix("gateway"),let window=gatewayWindow,let content=window.contentView {
             let original = window.frame
             defer {window.setFrame(original,display:true)}
@@ -776,6 +946,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKSc
         }
     }
     private func runSmoke() {
+        window.performClose(nil)
+        guard !window.isVisible, !shutdownPending, backend?.isRunning == true, let button = statusItem.button else {
+            fail("关闭主窗口后未保留菜单栏或后台核心。"); quit(); return
+        }
+        button.performClick(nil)
+        guard popover.isShown else { fail("菜单栏面板未打开。"); quit(); return }
+        showMain()
+        guard window.isVisible else { fail("未能从菜单栏恢复主窗口。"); quit(); return }
         let script="""
         if(!window.safeCodeNativeReady)throw Error('Native bridge did not load');
         const rpc=(op,args={})=>new Promise((resolve,reject)=>{const id=crypto.randomUUID();const original=window.safeCodeNativeResponse;window.safeCodeNativeResponse=m=>{if(m.id===id){window.safeCodeNativeResponse=original;m.error?reject(Error(m.error)):resolve(m.result)}else original(m)};chrome.webview.postMessage({id,op,args})});
@@ -844,16 +1022,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKSc
           showScreen('workspace');switchMode('maintenance');
           document.querySelector('#server-ingress').textContent='192.0.2.42';
           document.querySelector('#server-address').textContent='198.51.100.27';
-          const username=document.querySelector('#server-user');
-          username.textContent='demo';
-          document.querySelector('.server-metadata').replaceChildren(username,document.createTextNode(' / Ubuntu 24.04 / SSH'));
           document.querySelector('#resource-cpu').textContent='2.6 %';
           document.querySelector('#resource-memory').textContent='1.2 / 1.9 G';
           document.querySelector('#resource-disk').textContent='18.3 / 29.4 G';
           document.querySelector('#update-login-password').hidden=false;
+          document.querySelector('#disconnect-server').hidden=false;
           document.querySelector('#host-state').textContent='已连接';
-          document.querySelector('#claude-desktop-state').textContent='已接入';
-          document.querySelector('#claude-gateway-status').textContent='Claude网关已启用';
+          document.querySelector('#claude-gateway-status').textContent='Claude 已接入';
           document.querySelector('#claude-gateway-status').classList.remove('inactive');
           await waitFor(()=>innerWidth===740,'home window width');
           if(getComputedStyle(document.querySelector('.window'),'::after').content!=='none')throw Error('Duplicate macOS border shown');
@@ -862,27 +1037,54 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKSc
           switchMode('deployment');
           await rpc('window.smoke.screenshot',{name:'deployment'});
           switchMode('maintenance');
+          const entry=document.querySelector('#claude-desktop-manage');
+          entry.disabled=false;
+          entry.textContent='网关设置 · 有更新';
           document.querySelector('.maintenance-panel').scrollTop=10000;
           await rpc('window.smoke.screenshot',{name:'homepage'});
         }
         const desktopDialog=document.querySelector('#claude-desktop-dialog');
+        const gatewayForm=document.querySelector('#safe-code-api-form');
+        const gatewayButtons=[...gatewayForm.querySelectorAll('.config-footer button')];
+        if(gatewayButtons.map(button=>button.textContent.trim()).join(',')!=='故障修复,更新网关,启用,管理网关')
+          throw Error('Unexpected gateway actions');
         if(capture){
-          document.querySelector('#claude-desktop-key-note').textContent='本机只保存回环通道凭据。已有的 Claude Desktop 配置会保留，启用前需先停用当前接入。';
-          document.querySelector('#claude-desktop-progress').textContent='请先停用 API Key 接入，再启用 SSH 接入。';
-          const status=document.querySelector('#safe-code-api-progress');
-          status.textContent='正在读取公网状态…';status.hidden=false;
-          document.querySelector('#claude-desktop-install').hidden=true;
-          document.querySelector('#claude-desktop-open').hidden=false;
+          gatewayForm.querySelector('#claude-desktop-dialog-state').textContent='公网已启用';
+          gatewayForm.querySelector('#safe-code-api-progress').textContent='当前客户端包含新版网关。点击「更新网关」更新 VPS，保留已有 API Key。';
+          gatewayButtons[1].hidden=false;
+          gatewayButtons[1].disabled=false;
+          gatewayButtons[2].textContent='已启用';
+          gatewayButtons[2].disabled=true;
+          gatewayButtons[3].disabled=false;
         }
         desktopDialog.showModal();
         await waitPanel('claude-desktop-dialog',1);
         await waitFor(async()=>{
           const state=await rpc('window.smoke.dialog');
-          return Math.abs(state.contentHeight-Math.max(120,Math.ceil(document.querySelector('#claude-desktop-form').getBoundingClientRect().height)))<=1;
-        },'Claude Desktop window content height');
+          return Math.abs(state.contentHeight-Math.max(120,Math.ceil(gatewayForm.getBoundingClientRect().height)))<=1;
+        },'Public gateway window content height');
+        gatewayButtons[0].disabled=false;
         if(capture)await rpc('window.smoke.screenshot',{name:'desktop-access'});
+        gatewayButtons[0].click();
+        await waitPanel('gateway-repair-dialog',2);
+        const cloudRepair=document.querySelector('#gateway-repair-cloudcli');
+        if(cloudRepair.checked)throw Error('CloudCLI repair must be opt-in');
+        if(capture)await rpc('window.smoke.screenshot',{name:'dialog-gateway-repair'});
+        cloudRepair.click();
+        if(!cloudRepair.checked)throw Error('CloudCLI repair cannot be selected');
+        document.querySelector('#gateway-repair-back').click();
+        await waitPanel('claude-desktop-dialog',1);
+        gatewayButtons[0].click();
+        await waitPanel('gateway-repair-dialog',2);
+        if(cloudRepair.checked)throw Error('Repair selection was reused');
+        document.querySelector('#gateway-repair-back').click();
+        await waitPanel('claude-desktop-dialog',1);
         await rpc('window.gateway.open');
         await waitFor(async()=>{const state=await rpc('window.smoke.gateway');return state.ready&&state.visible;},'gateway window');
+        await rpc('window.smoke.gateway',{createKey:true});
+        await waitFor(async()=>{const state=await rpc('window.smoke.gateway');return state.keyEditor;},'gateway key editor');
+        await rpc('window.smoke.gateway',{cancelKey:true});
+        await waitFor(async()=>{const state=await rpc('window.smoke.gateway');return !state.keyEditor;},'gateway key editor closed');
         if(capture){
           await rpc('window.smoke.screenshot',{name:'gateway'});
           await rpc('window.smoke.gatewayTab',{index:1});
@@ -893,6 +1095,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKSc
         }
         const gateway=await rpc('window.smoke.gateway',{move:true});
         if(!gateway.native||!gateway.landscape||!gateway.moved||!gateway.parentUnmoved)throw Error('Gateway window is not independently movable');
+        await rpc('window.smoke.gateway',{directory:true});
+        await waitFor(()=>rpc('window.smoke.gateway',{bindingChoices:true}),'both gateway binding actions');
+        if(capture)await rpc('window.smoke.screenshot',{name:'gateway-binding'});
         if(!await rpc('window.smoke.gateway',{close:true}))throw Error('Gateway window did not close');
         await waitPanel('claude-desktop-dialog',1);
         await rpc('window.smoke.closeDialog');

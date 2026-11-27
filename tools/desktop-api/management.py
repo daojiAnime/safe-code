@@ -12,7 +12,7 @@ import threading
 import time
 
 from desktop_gateway import GatewayError
-from pricing import TOKEN_FIELDS, estimate
+from pricing import TOKEN_FIELDS, estimate, usage_price
 
 
 KEY_ID = re.compile(r'[a-f0-9]{64}')
@@ -45,10 +45,18 @@ class KeyRegistry:
                 );
                 CREATE INDEX IF NOT EXISTS request_log_time ON request_log(at, id);
                 CREATE INDEX IF NOT EXISTS request_log_key ON request_log(key_id, at, id);
+                CREATE TABLE IF NOT EXISTS desktop_history_devices (
+                    key_id TEXT NOT NULL, platform TEXT NOT NULL, machine TEXT NOT NULL, device TEXT NOT NULL,
+                    PRIMARY KEY (key_id, platform, machine)
+                );
             """)
             db.execute('BEGIN IMMEDIATE')
-            if 'budget_nanos' not in {row['name'] for row in db.execute('PRAGMA table_info(keys)')}:
-                db.execute('ALTER TABLE keys ADD COLUMN budget_nanos INTEGER')
+            columns = {row['name'] for row in db.execute('PRAGMA table_info(keys)')}
+            for column, kind in (('budget_nanos', 'INTEGER'), ('expires_at', 'INTEGER'), ('allowed_models', 'TEXT'),
+                                 ('project_bindings', 'TEXT'), ('developer_mode', 'INTEGER NOT NULL DEFAULT 0'),
+                                 ('raw_messages', 'INTEGER NOT NULL DEFAULT 0')):
+                if column not in columns:
+                    db.execute(f'ALTER TABLE keys ADD COLUMN {column} {kind}')
             if 'cost_nanos' not in {row['name'] for row in db.execute('PRAGMA table_info(usage)')}:
                 db.execute('ALTER TABLE usage ADD COLUMN cost_nanos INTEGER NOT NULL DEFAULT 0')
                 db.execute('ALTER TABLE usage ADD COLUMN unpriced_tokens INTEGER NOT NULL DEFAULT 0')
@@ -71,27 +79,46 @@ class KeyRegistry:
         finally:
             db.close()
 
-    def enabled(self, key_id):
+    def has_marker(self, key_id):
         return (self.root/'keys'/key_id).is_file()
+
+    def active_policy(self, key_id):
+        if not self.has_marker(key_id):
+            return None
+        with self.connect() as db:
+            return db.execute('SELECT allowed_models FROM keys WHERE id=? AND revoked=0 '
+                              'AND (expires_at IS NULL OR expires_at>?)', (key_id, time.time())).fetchone()
+
+    def enabled(self, key_id):
+        return self.active_policy(key_id) is not None
+
+    def model_policy(self, key_id):
+        policy = self.active_policy(key_id)
+        if policy is None:
+            raise GatewayError('API Key has expired or been revoked', 401)
+        return None if policy['allowed_models'] is None else frozenset(json.loads(policy['allowed_models']))
 
     def register(self, key_id, note='', rpm=0, budget_nanos=None):
         with self.connect() as db:
             db.execute('INSERT OR IGNORE INTO keys(id,note,rpm,created,budget_nanos) VALUES(?,?,?,?,?)',
                        (key_id, note, rpm, int(time.time()), budget_nanos))
 
-    def issue(self, key_id, note='', rpm=0, budget_nanos=None, *, activated=False):
+    def issue(self, key_id, note='', rpm=0, budget_nanos=None, *, activated=False,
+              expires_at=None, allowed_models=None, project_bindings=None, developer_mode=False, raw_messages=False):
         marker = self.root/'keys'/key_id
         created = False
         try:
             with self.connect() as db:
                 db.execute('BEGIN IMMEDIATE')
                 ids = db.execute('SELECT id FROM keys').fetchall()
-                if not activated and any(self.enabled(row['id']) for row in ids):
+                if not activated and any(self.has_marker(row['id']) for row in ids):
                     raise ValueError('添加更多 API Key 需要正确的激活码。')
                 if len(ids) >= 500:
                     raise ValueError('Key 记录已达到 500 条上限。')
-                db.execute('INSERT INTO keys(id,note,rpm,created,budget_nanos) VALUES(?,?,?,?,?)',
-                           (key_id, note, rpm, int(time.time()), budget_nanos))
+                db.execute('INSERT INTO keys(id,note,rpm,created,budget_nanos,expires_at,allowed_models,project_bindings,'
+                           'developer_mode,raw_messages) VALUES(?,?,?,?,?,?,?,?,?,?)',
+                           (key_id, note, rpm, int(time.time()), budget_nanos, expires_at, allowed_models,
+                            project_bindings, developer_mode, developer_mode and raw_messages))
                 marker.touch(mode=0o600, exist_ok=False)
                 created = True
         except BaseException:
@@ -112,20 +139,60 @@ class KeyRegistry:
 
     def balance(self, key_id):
         with self.connect() as db:
-            row = db.execute('''SELECT k.budget_nanos, COALESCE(SUM(u.cost_nanos),0) AS used_nanos
-                FROM keys k LEFT JOIN usage u ON u.key_id=k.id WHERE k.id=? GROUP BY k.id''', (key_id,)).fetchone()
-        if row is None:
-            return None
-        budget, used = row['budget_nanos'], row['used_nanos']
+            db.execute('BEGIN')
+            row = db.execute('SELECT budget_nanos FROM keys WHERE id=?', (key_id,)).fetchone()
+            if row is None:
+                return None
+            models = [dict(model) for model in db.execute(
+                'SELECT model,input,output,cache_read,cache_write,cost_nanos,unpriced_tokens FROM usage '
+                'WHERE key_id=? ORDER BY requests DESC,model', (key_id,))]
+        budget = row['budget_nanos']
+        used = sum(model['cost_nanos'] for model in models)
         return {'budget_nanos': budget, 'used_nanos': used,
-                'remaining_nanos': None if budget is None else max(0, budget-used)}
+                'remaining_nanos': None if budget is None else max(0, budget-used), 'models': models}
 
-    def update(self, key_id, note, rpm, *, budget_nanos=...):
+    def project_bindings(self, key_id):
+        with self.connect() as db:
+            row = db.execute('SELECT project_bindings FROM keys WHERE id=? AND revoked=0', (key_id,)).fetchone()
+        return json.loads(row['project_bindings']) if row and row['project_bindings'] else []
+
+    def desktop_history_device(self, key_id, platform, machine, device):
+        # Keep the first verified pairing's state directory for existing sessions and imports.
+        if not machine:
+            return device
+        with self.connect() as db:
+            db.execute('INSERT OR IGNORE INTO desktop_history_devices VALUES (?, ?, ?, ?)',
+                       (key_id, platform, machine, device))
+            return db.execute('SELECT device FROM desktop_history_devices WHERE key_id=? AND platform=? AND machine=?',
+                              (key_id, platform, machine)).fetchone()['device']
+
+    def key_note(self, key_id):
+        with self.connect() as db:
+            row = db.execute('SELECT note FROM keys WHERE id=? AND revoked=0', (key_id,)).fetchone()
+        return row['note'] if row else ''
+
+    def desktop_policy(self, key_id):
+        with self.connect() as db:
+            row = db.execute('SELECT developer_mode,raw_messages FROM keys WHERE id=? AND revoked=0 '
+                             'AND (expires_at IS NULL OR expires_at>?)', (key_id, time.time())).fetchone()
+        developer = bool(row and row['developer_mode'])
+        return developer, developer and bool(row['raw_messages'])
+
+    def update(self, key_id, note, rpm, *, budget_nanos=..., expires_at=..., allowed_models=...,
+               project_bindings=..., developer_mode=..., raw_messages=...):
         with self.connect() as db:
             if not db.execute('UPDATE keys SET note=?, rpm=? WHERE id=?', (note,rpm,key_id)).rowcount:
                 raise ValueError('找不到该 Key。')
-            if budget_nanos is not ...:
-                db.execute('UPDATE keys SET budget_nanos=? WHERE id=?', (budget_nanos, key_id))
+            for column, value in (('budget_nanos', budget_nanos), ('expires_at', expires_at),
+                                  ('allowed_models', allowed_models), ('project_bindings', project_bindings),
+                                  ('developer_mode', developer_mode), ('raw_messages', raw_messages)):
+                if value is not ...:
+                    db.execute(f'UPDATE keys SET {column}=? WHERE id=?', (value, key_id))
+            if developer_mode is not ... or raw_messages is not ...:
+                if raw_messages is True and not db.execute(
+                        'SELECT developer_mode FROM keys WHERE id=?', (key_id,)).fetchone()[0]:
+                    raise ValueError('请先启用开发者模式。')
+                db.execute('UPDATE keys SET raw_messages=0 WHERE id=? AND developer_mode=0', (key_id,))
 
     def revoke(self, key_id):
         with self.connect() as db:
@@ -136,7 +203,7 @@ class KeyRegistry:
     def delete(self, key_id):
         with self.connect() as db:
             db.execute('BEGIN IMMEDIATE')
-            if self.enabled(key_id):
+            if self.has_marker(key_id):
                 raise ValueError('请先撤销密钥，再彻底删除。')
             db.execute('DELETE FROM request_log WHERE key_id=?', (key_id,))
             db.execute('DELETE FROM usage WHERE key_id=?', (key_id,))
@@ -144,8 +211,7 @@ class KeyRegistry:
 
     def record(self, key_id, model, failed, tokens, *, request=None):
         counts = [tokens.get(k, 0) for k in TOKEN_FIELDS]
-        cost, unpriced = estimate(model, [max(0, count) for count in counts],
-                                  one_hour_writes=max(0, tokens.get('one_hour_cache_writes', 0)))
+        cost, unpriced = usage_price(model, tokens)
         now = int(time.time())
         with self.connect() as db:
             db.execute("""
@@ -178,10 +244,11 @@ class KeyRegistry:
         with self.connect() as db:
             db.execute('DELETE FROM request_log WHERE at < ?', (int(time.time()) - LOG_RETENTION_SECONDS,))
 
-    def list(self):
+    def list(self, *, include_project_bindings=False):
         with self.connect() as db:
             rows = db.execute('''
-                SELECT k.id,k.note,k.rpm,k.created,k.budget_nanos,
+                SELECT k.id,k.note,k.rpm,k.created,k.budget_nanos,k.expires_at,k.allowed_models,k.project_bindings,k.revoked,
+                       k.developer_mode,k.raw_messages,
                        COALESCE(SUM(u.cost_nanos),0) AS cost_nanos,
                        COALESCE(SUM(u.unpriced_tokens),0) AS unpriced_tokens,
                        COALESCE(SUM(u.requests),0) AS requests,COALESCE(SUM(u.failures),0) AS failures,
@@ -190,7 +257,25 @@ class KeyRegistry:
                 FROM keys k LEFT JOIN usage u ON u.key_id=k.id GROUP BY k.id
                 ORDER BY k.created DESC,k.id
             ''').fetchall()
-        return [{**dict(row),'enabled':self.enabled(row['id'])} for row in rows]
+        now = time.time()
+        keys = []
+        for row in rows:
+            key = dict(row)
+            enabled = not key.pop('revoked') and self.has_marker(key['id'])
+            key['enabled'] = enabled
+            key['expired'] = enabled and key['expires_at'] is not None and key['expires_at'] <= now
+            key['developer_mode'] = bool(key['developer_mode'])
+            key['raw_messages'] = key['developer_mode'] and bool(key['raw_messages'])
+            if key['allowed_models'] is not None:
+                key['allowed_models'] = json.loads(key['allowed_models'])
+            stored_bindings = key.pop('project_bindings')
+            if include_project_bindings and stored_bindings:
+                key['project_bindings'] = [
+                    {'project_id': item['project_id'], 'directory': item['directory'], 'name': item['name']}
+                    for item in json.loads(stored_bindings)
+                ]
+            keys.append(key)
+        return keys
 
     def usage(self, key_id):
         with self.connect() as db:
@@ -304,7 +389,9 @@ class Capacity:
 
 class RequestQueue:
     """Shared Messages capacity, FIFO waiters, per-key and global queue bounds."""
-    def __init__(self, registry, max_wait=45, max_queue=12, per_key=2, concurrency=1):
+    key_idle_seconds = 60
+
+    def __init__(self, registry, max_wait=None, max_queue=12, per_key=2, concurrency=1, key_mode=False):
         self.registry = registry
         self.max_wait, self.max_queue, self.per_key = max_wait, max_queue, per_key
         self.changed = threading.Condition()
@@ -312,6 +399,9 @@ class RequestQueue:
         self.active = {}
         self.concurrency = concurrency
         self.recent = defaultdict(deque)
+        self.key_mode = key_mode
+        self.key_owner = None
+        self.key_release = None
 
     def snapshot(self):
         with self.changed:
@@ -326,27 +416,64 @@ class RequestQueue:
         with self.changed:
             self.changed.notify_all()
 
+    def set_key_mode(self, enabled):
+        with self.changed:
+            if self.key_mode == enabled:
+                return
+            self.key_mode = enabled
+            owners = set(self.active.values())
+            self.key_owner = next(iter(owners)) if enabled and len(owners) == 1 else None
+            self.key_release = None
+            self.changed.notify_all()
+
+    def expire_key_owner(self, now):
+        if self.key_release is not None and now >= self.key_release:
+            self.key_owner = self.key_release = None
+
+    def key_status(self):
+        with self.changed:
+            now = time.monotonic()
+            self.expire_key_owner(now)
+            return {
+                'enabled': self.key_mode, 'key_id': self.key_owner, 'idle_seconds': self.key_idle_seconds,
+                'release_in': max(0, int(self.key_release-now+0.999)) if self.key_release is not None else None,
+            }
+
+    def eligible(self, ticket, now):
+        if self.concurrency and len(self.active) >= self.concurrency:
+            return False
+        if not self.key_mode:
+            return self.waiters[0] == ticket
+        self.expire_key_owner(now)
+        if self.key_owner is None:
+            # When enabled during concurrent traffic, let the existing batch drain.
+            return not self.active and self.waiters[0] == ticket
+        key = ticket[1]
+        return key == self.key_owner and next(queued for queued in self.waiters if queued[1] == key) == ticket
+
     @contextmanager
-    def slot(self, key, disconnected=lambda:False):
+    def slot(self, key, disconnected=lambda:False, *, on_wait=None):
         ticket = (object(), key)
         with self.changed:
             threshold = time.monotonic()-60
             self.recent = defaultdict(deque, ((k,t) for k,t in self.recent.items() if t and t[-1]>threshold))
-            if self.concurrency and (len(self.waiters) >= self.max_queue or
+            if (self.concurrency or self.key_mode) and (len(self.waiters) >= self.max_queue or
                                      sum(k == key for _, k in self.waiters) >= self.per_key):
                 raise GatewayError('Safe Code API queue is full; retry later', 429)
             self.waiters.append(ticket)
-            deadline = time.monotonic() + self.max_wait
-            try:
-                while True:
+            queued = time.monotonic()
+        try:
+            while True:
+                with self.changed:
                     now = time.monotonic()
+                    deadline = queued + self.max_wait if self.max_wait is not None else None
                     if not self.registry.enabled(key):
-                        raise GatewayError('API Key was revoked', 401)
+                        raise GatewayError('API Key has expired or been revoked', 401)
                     if disconnected():
                         raise ConnectionAbortedError()
-                    if now>=deadline:
+                    if deadline is not None and now >= deadline:
                         raise GatewayError('Safe Code API queue wait timed out; retry later', 429)
-                    if (not self.concurrency or len(self.active) < self.concurrency) and self.waiters[0] == ticket:
+                    if self.eligible(ticket, now):
                         if self.registry.balance_exhausted(key):
                             raise GatewayError('Safe Code API Key balance exhausted', 402)
                         recent = self.recent[key]
@@ -358,10 +485,16 @@ class RequestQueue:
                         recent.append(now)
                         if len(recent)>600:
                             recent.popleft()
+                        if self.key_mode:
+                            self.key_owner = key
+                            self.key_release = None
                         self.active[ticket] = key
                         break
-                    self.changed.wait(min(0.5, deadline-now))
-            finally:
+                    self.changed.wait(min(0.5, deadline-now) if deadline is not None else 0.5)
+                if on_wait is not None:
+                    on_wait()
+        finally:
+            with self.changed:
                 self.waiters.remove(ticket)
                 self.changed.notify_all()
         try:
@@ -369,6 +502,9 @@ class RequestQueue:
         finally:
             with self.changed:
                 del self.active[ticket]
+                if self.key_mode and not self.active:
+                    self.key_owner = key
+                    self.key_release = time.monotonic() + self.key_idle_seconds
                 self.changed.notify_all()
 
 
@@ -397,16 +533,16 @@ def read_admin_line(stream):
     return value
 
 
-def send_admin(root, request):
+def send_admin(root, request, *, socket_name='admin.sock'):
     if len(request)>8192:
         raise ValueError('管理请求过长。')
     try:
         with socket.socket(socket.AF_UNIX) as connection:
-            connection.settimeout(8)
-            connection.connect(str(Path(root)/'admin.sock'))
+            connection.settimeout(25)
+            connection.connect(str(Path(root)/socket_name))
             connection.sendall(request.rstrip(b'\n')+b'\n')
             with connection.makefile('rb') as stream:
-                response=stream.readline(2*1024*1024)
+                response=stream.readline(6*1024*1024)
     except OSError as error:
         raise ValueError('无法连接 Safe Code API 管理服务。请确认该 VPS 已更新并启动 Safe Code API。') from error
     if not response.endswith(b'\n'):
